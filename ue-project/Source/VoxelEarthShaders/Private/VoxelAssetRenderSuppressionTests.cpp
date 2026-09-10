@@ -30,6 +30,16 @@ bool FVoxelAssetRenderSuppressionAdmissionTest::RunTest(const FString& Parameter
     Instance.SuppressTerrainRender = 1;
     Request.BricksZ = 33;
     TestFalse(TEXT("scratch overflow rejected"), VoxelGpuWorldGen::ValidateRegionRequest(Request, Error));
+    // The two public inputs share winner semantics, but retain their original
+    // admission contracts: only the upstream suppression API has a 4 MiB cap.
+    Instance.RenderOwned = 1;
+    TestFalse(TEXT("combined flags retain suppression scratch cap"), VoxelGpuWorldGen::ValidateRegionRequest(Request, Error));
+    Instance.SuppressTerrainRender = 0;
+    TestTrue(TEXT("large RenderOwned-only request remains supported"), VoxelGpuWorldGen::ValidateRegionRequest(Request, Error));
+    Instance.RenderOwned = 2;
+    TestFalse(TEXT("unknown RenderOwned marker rejected"), VoxelGpuWorldGen::ValidateRegionRequest(Request, Error));
+    Instance.RenderOwned = 0;
+    Instance.SuppressTerrainRender = 1;
     Request.DispatchColumns = FUintVector2(0xfffffff8u, 0xfffffff8u);
     Request.BricksZ = 0xffffffffu;
     TestFalse(TEXT("budget arithmetic cannot wrap"), VoxelGpuWorldGen::ValidateRegionRequest(Request, Error));

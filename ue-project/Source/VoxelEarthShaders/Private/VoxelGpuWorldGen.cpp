@@ -1919,10 +1919,11 @@ bool VoxelGpuWorldGen::ValidateRegionRequest(const FVoxelGpuRegionRequest& Req, 
 		// rather than truncated into a hole at the top of a tall asset.
 		for (const FVoxelGpuRegionRequest::FAssetInstance& Inst : Req.AssetInstances)
 		{
-			// Bounded optional scratch: at most 4 MiB per classic request.
+			// SuppressTerrainRender retains its upstream 4 MiB scratch contract.
+			// RenderOwned-only requests retain their existing region-size admission.
 			// RDG owns lifetime, including cancellation; no retained ownership resource.
 			if (Inst.RenderOwned > 1u || Inst.SuppressTerrainRender > 1u ||
-			    ((Inst.RenderOwned != 0u || Inst.SuppressTerrainRender != 0u) && uint64(Req.BricksZ) > 1048576ull / Cx / Cy / 8u))
+			    (Inst.SuppressTerrainRender != 0u && uint64(Req.BricksZ) > 1048576ull / Cx / Cy / 8u))
 			{
 				OutError = TEXT("Asset render suppression flag invalid or claim scratch exceeds 4 MiB");
 				return false;

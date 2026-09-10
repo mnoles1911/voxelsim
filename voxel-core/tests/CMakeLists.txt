@@ -1,4 +1,6 @@
-add_executable(vxc_assetecology_tests test_main.cpp test_assetecology.cpp test_assetfield.cpp)
+# Ecology keeps the stricter conversion gate. Legacy AssetField/World integration
+# tests remain in vxc_tests under that target's established warning policy.
+add_executable(vxc_assetecology_tests test_main.cpp test_assetecology.cpp)
 target_link_libraries(vxc_assetecology_tests PRIVATE voxelcore)
 target_compile_definitions(vxc_assetecology_tests PRIVATE VXC_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
 if(MSVC)

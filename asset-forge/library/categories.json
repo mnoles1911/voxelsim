@@ -7932,7 +7932,7 @@
   },
   "environment": {
    "blurb": "Static world content. The engine composes it into terrain chunks on both the CPU and GPU paths and the deterministic per-chunk scatter decides where it goes. Trees and rocks join the world voxel grid at 10 cm and are destructible as terrain is; the rest carry their own finer grid and are drawn as instances in the detail ring.",
-   "count": 448,
+   "count": 446,
    "in_manifest": true,
    "kinds": [
     "tree",
@@ -7981,7 +7981,7 @@
      "voxel_mm": 50.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "tree",
      "name": "american-beech",
      "via": "kind",
@@ -8002,11 +8002,11 @@
      "voxel_mm": 50.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "flower",
      "name": "arrowhead",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -8107,43 +8107,120 @@
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "tree",
      "name": "bigleaf-maple",
      "via": "kind",
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "grass",
      "name": "bilberry-mat",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
      "grids": [
       {
-       "bytes": 100598,
+       "bytes": 133428,
        "extent_vox": [
-        60,
-        61,
-        146
+        88,
+        80,
+        114
        ],
-       "seed": 101,
-       "voxels": 42851,
-       "vxa": "library/birch/birch-0101/tree.vxa"
+       "seed": 4,
+       "voxels": 17865,
+       "vxa": "library/birch/birch-0004/tree.vxa"
       },
       {
-       "bytes": 142803,
+       "bytes": 355953,
        "extent_vox": [
-        68,
-        63,
-        186
+        106,
+        91,
+        149
        ],
-       "seed": 102,
-       "voxels": 68880,
-       "vxa": "library/birch/birch-0102/tree.vxa"
+       "seed": 7,
+       "voxels": 49584,
+       "vxa": "library/birch/birch-0007/tree.vxa"
+      },
+      {
+       "bytes": 27343,
+       "extent_vox": [
+        34,
+        35,
+        53
+       ],
+       "seed": 12,
+       "voxels": 4537,
+       "vxa": "library/birch/birch-0012/tree.vxa"
+      },
+      {
+       "bytes": 116798,
+       "extent_vox": [
+        79,
+        74,
+        106
+       ],
+       "seed": 13,
+       "voxels": 15841,
+       "vxa": "library/birch/birch-0013/tree.vxa"
+      },
+      {
+       "bytes": 344758,
+       "extent_vox": [
+        108,
+        100,
+        143
+       ],
+       "seed": 16,
+       "voxels": 47396,
+       "vxa": "library/birch/birch-0016/tree.vxa"
+      },
+      {
+       "bytes": 426893,
+       "extent_vox": [
+        99,
+        114,
+        173
+       ],
+       "seed": 18,
+       "voxels": 61353,
+       "vxa": "library/birch/birch-0018/tree.vxa"
+      },
+      {
+       "bytes": 33733,
+       "extent_vox": [
+        41,
+        35,
+        51
+       ],
+       "seed": 19,
+       "voxels": 4912,
+       "vxa": "library/birch/birch-0019/tree.vxa"
+      },
+      {
+       "bytes": 29748,
+       "extent_vox": [
+        36,
+        40,
+        51
+       ],
+       "seed": 21,
+       "voxels": 4716,
+       "vxa": "library/birch/birch-0021/tree.vxa"
+      },
+      {
+       "bytes": 97988,
+       "extent_vox": [
+        69,
+        63,
+        98
+       ],
+       "seed": 22,
+       "voxels": 13563,
+       "vxa": "library/birch/birch-0022/tree.vxa"
       }
      ],
      "kind": "tree",
@@ -8152,14 +8229,14 @@
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "flower",
      "name": "birdsfoot-trefoil",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "tree",
      "name": "black-cherry",
      "via": "kind",
@@ -8187,11 +8264,11 @@
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "bush",
      "name": "blackthorn-scrub",
      "via": "kind",
-     "voxel_mm": 100.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -8201,11 +8278,11 @@
      "voxel_mm": 50.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "grass",
      "name": "blanket-weed",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -8222,11 +8299,11 @@
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "flower",
      "name": "bogbean",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -8250,18 +8327,18 @@
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "bush",
      "name": "box",
      "via": "kind",
-     "voxel_mm": 100.0
+     "voxel_mm": 25.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "grass",
      "name": "bracken",
      "via": "kind",
-     "voxel_mm": 100.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -8271,53 +8348,18 @@
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
-     "grids": [
-      {
-       "bytes": 30033,
-       "extent_vox": [
-        52,
-        55,
-        29
-       ],
-       "seed": 1,
-       "voxels": 9453,
-       "vxa": "library/bramble-thicket/bramble-thicket-0001/tree.vxa"
-      },
-      {
-       "bytes": 4118,
-       "extent_vox": [
-        17,
-        17,
-        18
-       ],
-       "seed": 101,
-       "voxels": 840,
-       "vxa": "library/bramble-thicket/bramble-thicket-0101/tree.vxa"
-      },
-      {
-       "bytes": 4908,
-       "extent_vox": [
-        19,
-        21,
-        13
-       ],
-       "seed": 102,
-       "voxels": 920,
-       "vxa": "library/bramble-thicket/bramble-thicket-0102/tree.vxa"
-      }
-     ],
+     "curation": "draft",
      "kind": "bush",
      "name": "bramble-thicket",
      "via": "kind",
-     "voxel_mm": 100.0
+     "voxel_mm": 25.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "reed",
      "name": "branched-bur-reed",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -8334,18 +8376,18 @@
      "voxel_mm": 50.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "reed",
      "name": "broadleaf-cattail",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "grass",
      "name": "brook-moss-cushion",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -8369,11 +8411,11 @@
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "flower",
      "name": "bugle",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -8383,25 +8425,25 @@
      "voxel_mm": 50.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "reed",
      "name": "bulrush",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "tree",
      "name": "bur-oak",
      "via": "kind",
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "bush",
      "name": "butchers-broom",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -8411,11 +8453,11 @@
      "voxel_mm": 50.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "grass",
      "name": "canadian-waterweed",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -8467,7 +8509,7 @@
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "tree",
      "name": "cherry-blossom",
      "via": "kind",
@@ -8509,11 +8551,11 @@
      "voxel_mm": 50.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "grass",
      "name": "cocksfoot",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -8530,39 +8572,39 @@
      "voxel_mm": 50.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "tree",
      "name": "columnar-cypress",
      "via": "kind",
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "tree",
      "name": "common-alder",
      "via": "kind",
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "tree",
      "name": "common-ash",
      "via": "kind",
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "flower",
      "name": "common-bluebell",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "bush",
      "name": "common-broom",
      "via": "kind",
-     "voxel_mm": 100.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -8572,53 +8614,53 @@
      "voxel_mm": 50.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "reed",
      "name": "common-cottongrass",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "flower",
      "name": "common-dog-violet",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "bush",
      "name": "common-dogwood",
      "via": "kind",
-     "voxel_mm": 100.0
+     "voxel_mm": 25.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "flower",
      "name": "common-knapweed",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "flower",
      "name": "common-milkweed",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "flower",
      "name": "common-poppy",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "grass",
      "name": "common-stonewort",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -8656,7 +8698,7 @@
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "tree",
      "name": "cork-oak",
      "via": "kind",
@@ -8670,14 +8712,14 @@
      "voxel_mm": 50.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "flower",
      "name": "cowslip",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "tree",
      "name": "crab-apple",
      "via": "kind",
@@ -8705,18 +8747,18 @@
      "voxel_mm": 50.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "grass",
      "name": "curled-pondweed",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "flower",
      "name": "cyclamen",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -8817,21 +8859,21 @@
      "voxel_mm": 50.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "bush",
      "name": "dog-rose",
      "via": "kind",
-     "voxel_mm": 100.0
+     "voxel_mm": 25.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "grass",
      "name": "dogs-mercury",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "tree",
      "name": "douglas-fir",
      "via": "kind",
@@ -8887,14 +8929,14 @@
      "voxel_mm": 50.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "tree",
      "name": "eastern-cottonwood",
      "via": "kind",
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "tree",
      "name": "eastern-hemlock",
      "via": "kind",
@@ -8915,11 +8957,11 @@
      "voxel_mm": 50.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "bush",
      "name": "elder",
      "via": "kind",
-     "voxel_mm": 100.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -8950,14 +8992,14 @@
      "voxel_mm": 50.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "tree",
      "name": "european-beech",
      "via": "kind",
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "tree",
      "name": "european-yew",
      "via": "kind",
@@ -9006,11 +9048,11 @@
      "voxel_mm": 50.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "grass",
      "name": "feather-moss",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -9020,25 +9062,25 @@
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "tree",
      "name": "field-elm",
      "via": "kind",
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "tree",
      "name": "field-maple",
      "via": "kind",
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "flower",
      "name": "field-scabious",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -9055,11 +9097,11 @@
      "voxel_mm": 50.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "flower",
      "name": "fireweed",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -9069,18 +9111,18 @@
      "voxel_mm": 50.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "tree",
      "name": "flowering-dogwood",
      "via": "kind",
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "flower",
      "name": "flowering-rush",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -9090,11 +9132,11 @@
      "voxel_mm": 50.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "flower",
      "name": "foxglove",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -9104,11 +9146,11 @@
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "flower",
      "name": "fringed-water-lily",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -9174,11 +9216,11 @@
      "voxel_mm": 50.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "bush",
      "name": "gorse",
      "via": "kind",
-     "voxel_mm": 100.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -9244,11 +9286,11 @@
      "voxel_mm": 50.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "bush",
      "name": "guelder-rose",
      "via": "kind",
-     "voxel_mm": 100.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -9258,11 +9300,11 @@
      "voxel_mm": 50.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "grass",
      "name": "hair-cap-moss",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -9272,32 +9314,32 @@
      "voxel_mm": 50.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "flower",
      "name": "harebell",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "grass",
      "name": "harts-tongue-fern",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "tree",
      "name": "hawthorn-scrub",
      "via": "kind",
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "bush",
      "name": "hazel-coppice",
      "via": "kind",
-     "voxel_mm": 100.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -9307,18 +9349,18 @@
      "voxel_mm": 50.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "flower",
      "name": "hellebore",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "flower",
      "name": "herb-robert",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -9369,7 +9411,7 @@
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "tree",
      "name": "hero-sequoia",
      "via": "kind",
@@ -9390,21 +9432,21 @@
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "bush",
      "name": "holly-understorey",
      "via": "kind",
-     "voxel_mm": 100.0
+     "voxel_mm": 25.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "tree",
      "name": "holm-oak",
      "via": "kind",
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "tree",
      "name": "honey-locust",
      "via": "kind",
@@ -9425,7 +9467,7 @@
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "tree",
      "name": "hornbeam",
      "via": "kind",
@@ -9439,11 +9481,11 @@
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "flower",
      "name": "impatiens",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -9453,11 +9495,11 @@
      "voxel_mm": 50.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "grass",
      "name": "ivy-ground-layer",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -9467,7 +9509,7 @@
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "tree",
      "name": "japanese-maple",
      "via": "kind",
@@ -9495,18 +9537,18 @@
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "grass",
      "name": "jungle-groundcover",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "flower",
      "name": "jungle-understory-flower",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -9551,11 +9593,11 @@
      "voxel_mm": 50.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "grass",
      "name": "lady-fern",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -9565,11 +9607,11 @@
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "flower",
      "name": "large-trillium",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -9607,11 +9649,11 @@
      "voxel_mm": 50.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "grass",
      "name": "lesser-pond-sedge",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -9621,11 +9663,11 @@
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "flower",
      "name": "lily-of-the-valley",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -9670,11 +9712,11 @@
      "voxel_mm": 50.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "grass",
      "name": "male-fern",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -9691,7 +9733,7 @@
      "voxel_mm": 50.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "tree",
      "name": "maritime-pine",
      "via": "kind",
@@ -9712,18 +9754,18 @@
      "voxel_mm": 50.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "flower",
      "name": "marsh-cinquefoil",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "flower",
      "name": "marsh-marigold",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -9733,88 +9775,18 @@
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
-     "grids": [
-      {
-       "bytes": 503,
-       "extent_vox": [
-        9,
-        8,
-        9
-       ],
-       "seed": 1,
-       "voxels": 106,
-       "vxa": "library/meadow-daisy/meadow-daisy-0001/tree.vxa"
-      },
-      {
-       "bytes": 578,
-       "extent_vox": [
-        9,
-        11,
-        11
-       ],
-       "seed": 101,
-       "voxels": 121,
-       "vxa": "library/meadow-daisy/meadow-daisy-0101/tree.vxa"
-      },
-      {
-       "bytes": 618,
-       "extent_vox": [
-        11,
-        10,
-        10
-       ],
-       "seed": 102,
-       "voxels": 121,
-       "vxa": "library/meadow-daisy/meadow-daisy-0102/tree.vxa"
-      }
-     ],
+     "curation": "draft",
      "kind": "flower",
      "name": "meadow-daisy",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
-     "curation": "approved",
-     "grids": [
-      {
-       "bytes": 593,
-       "extent_vox": [
-        12,
-        10,
-        9
-       ],
-       "seed": 1,
-       "voxels": 124,
-       "vxa": "library/meadow-grass/meadow-grass-0001/tree.vxa"
-      },
-      {
-       "bytes": 783,
-       "extent_vox": [
-        13,
-        14,
-        9
-       ],
-       "seed": 101,
-       "voxels": 155,
-       "vxa": "library/meadow-grass/meadow-grass-0101/tree.vxa"
-      },
-      {
-       "bytes": 753,
-       "extent_vox": [
-        10,
-        13,
-        11
-       ],
-       "seed": 102,
-       "voxels": 155,
-       "vxa": "library/meadow-grass/meadow-grass-0102/tree.vxa"
-      }
-     ],
+     "curation": "draft",
      "kind": "grass",
      "name": "meadow-grass",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -9824,7 +9796,7 @@
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "tree",
      "name": "monterey-cypress",
      "via": "kind",
@@ -9845,11 +9817,11 @@
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "grass",
      "name": "moss-cushion",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -9873,18 +9845,18 @@
      "voxel_mm": 50.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "bush",
      "name": "mountain-laurel",
      "via": "kind",
-     "voxel_mm": 100.0
+     "voxel_mm": 25.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "grass",
      "name": "needle-spike-rush",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -9894,7 +9866,7 @@
      "voxel_mm": 50.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "tree",
      "name": "norway-spruce",
      "via": "kind",
@@ -9929,11 +9901,11 @@
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "flower",
      "name": "oxeye-daisy",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -9964,11 +9936,11 @@
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "flower",
      "name": "pickerelweed",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -10013,18 +9985,18 @@
      "voxel_mm": 50.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "flower",
      "name": "prairie-lupine",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "flower",
      "name": "primrose",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -10034,11 +10006,11 @@
      "voxel_mm": 50.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "flower",
      "name": "purple-loosestrife",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -10048,7 +10020,7 @@
      "voxel_mm": 50.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "tree",
      "name": "quaking-aspen",
      "via": "kind",
@@ -10062,18 +10034,18 @@
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "grass",
      "name": "quillwort",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "flower",
      "name": "ramsons",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -10083,18 +10055,18 @@
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "flower",
      "name": "red-campion",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "flower",
      "name": "red-clover",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -10104,11 +10076,11 @@
      "voxel_mm": 50.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "bush",
      "name": "red-huckleberry",
      "via": "kind",
-     "voxel_mm": 100.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -10125,11 +10097,11 @@
      "voxel_mm": 50.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "reed",
      "name": "reed-sweet-grass",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -10153,11 +10125,11 @@
      "voxel_mm": 50.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "bush",
      "name": "rhododendron-thicket",
      "via": "kind",
-     "voxel_mm": 100.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -10167,11 +10139,11 @@
      "voxel_mm": 50.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "grass",
      "name": "ribwort-plantain",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -10181,14 +10153,14 @@
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "grass",
      "name": "rigid-hornwort",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "tree",
      "name": "river-broadleaf",
      "via": "kind",
@@ -10202,11 +10174,11 @@
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "flower",
      "name": "river-water-crowfoot",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -10230,7 +10202,7 @@
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "tree",
      "name": "rowan",
      "via": "kind",
@@ -10265,11 +10237,11 @@
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "bush",
      "name": "salal",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -10328,7 +10300,7 @@
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "tree",
      "name": "scots-pine",
      "via": "kind",
@@ -10503,11 +10475,11 @@
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "grass",
      "name": "sedge-tussock",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -10517,7 +10489,7 @@
      "voxel_mm": 50.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "tree",
      "name": "shagbark-hickory",
      "via": "kind",
@@ -10559,14 +10531,14 @@
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "tree",
      "name": "sitka-spruce",
      "via": "kind",
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "tree",
      "name": "small-leaved-lime",
      "via": "kind",
@@ -10587,32 +10559,32 @@
      "voxel_mm": 50.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "bush",
      "name": "snowberry",
      "via": "kind",
-     "voxel_mm": 100.0
+     "voxel_mm": 25.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "reed",
      "name": "soft-rush",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "grass",
      "name": "sphagnum-hummock",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "grass",
      "name": "spiked-water-milfoil",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -10622,11 +10594,11 @@
      "voxel_mm": 50.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "bush",
      "name": "spindle",
      "via": "kind",
-     "voxel_mm": 100.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -10706,7 +10678,7 @@
      "voxel_mm": 50.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "tree",
      "name": "sugar-maple",
      "via": "kind",
@@ -10727,18 +10699,18 @@
      "voxel_mm": 50.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "tree",
      "name": "sweet-chestnut",
      "via": "kind",
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "reed",
      "name": "sweet-flag",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -10748,14 +10720,14 @@
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "grass",
      "name": "sword-fern",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "tree",
      "name": "sycamore-maple",
      "via": "kind",
@@ -10777,13 +10749,6 @@
     },
     {
      "curation": "approved",
-     "kind": "tree",
-     "name": "temperate-oak",
-     "via": "kind",
-     "voxel_mm": 100.0
-    },
-    {
-     "curation": "draft",
      "grids": [
       {
        "bytes": 40073,
@@ -10794,18 +10759,7 @@
        ],
        "seed": 1,
        "voxels": 9947,
-       "vxa": "library/temperate-oak-family/temperate-oak-family-0001/tree.vxa"
-      },
-      {
-       "bytes": 8758,
-       "extent_vox": [
-        25,
-        26,
-        42
-       ],
-       "seed": 2,
-       "voxels": 4340,
-       "vxa": "library/temperate-oak-family/temperate-oak-family-0002/tree.vxa"
+       "vxa": "library/temperate-oak/temperate-oak-0001/tree.vxa"
       },
       {
        "bytes": 20578,
@@ -10816,7 +10770,7 @@
        ],
        "seed": 3,
        "voxels": 7000,
-       "vxa": "library/temperate-oak-family/temperate-oak-family-0003/tree.vxa"
+       "vxa": "library/temperate-oak/temperate-oak-0003/tree.vxa"
       },
       {
        "bytes": 411703,
@@ -10827,7 +10781,7 @@
        ],
        "seed": 4,
        "voxels": 96962,
-       "vxa": "library/temperate-oak-family/temperate-oak-family-0004/tree.vxa"
+       "vxa": "library/temperate-oak/temperate-oak-0004/tree.vxa"
       },
       {
        "bytes": 68268,
@@ -10838,18 +10792,7 @@
        ],
        "seed": 5,
        "voxels": 33876,
-       "vxa": "library/temperate-oak-family/temperate-oak-family-0005/tree.vxa"
-      },
-      {
-       "bytes": 141318,
-       "extent_vox": [
-        73,
-        73,
-        83
-       ],
-       "seed": 6,
-       "voxels": 51517,
-       "vxa": "library/temperate-oak-family/temperate-oak-family-0006/tree.vxa"
+       "vxa": "library/temperate-oak/temperate-oak-0005/tree.vxa"
       },
       {
        "bytes": 1189698,
@@ -10860,7 +10803,7 @@
        ],
        "seed": 7,
        "voxels": 248190,
-       "vxa": "library/temperate-oak-family/temperate-oak-family-0007/tree.vxa"
+       "vxa": "library/temperate-oak/temperate-oak-0007/tree.vxa"
       },
       {
        "bytes": 158718,
@@ -10871,7 +10814,7 @@
        ],
        "seed": 8,
        "voxels": 84558,
-       "vxa": "library/temperate-oak-family/temperate-oak-family-0008/tree.vxa"
+       "vxa": "library/temperate-oak/temperate-oak-0008/tree.vxa"
       },
       {
        "bytes": 499778,
@@ -10882,29 +10825,7 @@
        ],
        "seed": 9,
        "voxels": 158597,
-       "vxa": "library/temperate-oak-family/temperate-oak-family-0009/tree.vxa"
-      },
-      {
-       "bytes": 47608,
-       "extent_vox": [
-        65,
-        67,
-        45
-       ],
-       "seed": 10,
-       "voxels": 11159,
-       "vxa": "library/temperate-oak-family/temperate-oak-family-0010/tree.vxa"
-      },
-      {
-       "bytes": 8103,
-       "extent_vox": [
-        24,
-        25,
-        40
-       ],
-       "seed": 11,
-       "voxels": 3888,
-       "vxa": "library/temperate-oak-family/temperate-oak-family-0011/tree.vxa"
+       "vxa": "library/temperate-oak/temperate-oak-0009/tree.vxa"
       },
       {
        "bytes": 19473,
@@ -10915,7 +10836,7 @@
        ],
        "seed": 12,
        "voxels": 6509,
-       "vxa": "library/temperate-oak-family/temperate-oak-family-0012/tree.vxa"
+       "vxa": "library/temperate-oak/temperate-oak-0012/tree.vxa"
       },
       {
        "bytes": 426198,
@@ -10926,7 +10847,7 @@
        ],
        "seed": 13,
        "voxels": 97917,
-       "vxa": "library/temperate-oak-family/temperate-oak-family-0013/tree.vxa"
+       "vxa": "library/temperate-oak/temperate-oak-0013/tree.vxa"
       },
       {
        "bytes": 99548,
@@ -10937,7 +10858,7 @@
        ],
        "seed": 14,
        "voxels": 43190,
-       "vxa": "library/temperate-oak-family/temperate-oak-family-0014/tree.vxa"
+       "vxa": "library/temperate-oak/temperate-oak-0014/tree.vxa"
       },
       {
        "bytes": 105868,
@@ -10948,51 +10869,7 @@
        ],
        "seed": 15,
        "voxels": 42884,
-       "vxa": "library/temperate-oak-family/temperate-oak-family-0015/tree.vxa"
-      },
-      {
-       "bytes": 1239303,
-       "extent_vox": [
-        189,
-        182,
-        138
-       ],
-       "seed": 16,
-       "voxels": 263168,
-       "vxa": "library/temperate-oak-family/temperate-oak-family-0016/tree.vxa"
-      },
-      {
-       "bytes": 262638,
-       "extent_vox": [
-        77,
-        79,
-        137
-       ],
-       "seed": 17,
-       "voxels": 115213,
-       "vxa": "library/temperate-oak-family/temperate-oak-family-0017/tree.vxa"
-      },
-      {
-       "bytes": 481063,
-       "extent_vox": [
-        110,
-        110,
-        121
-       ],
-       "seed": 18,
-       "voxels": 153559,
-       "vxa": "library/temperate-oak-family/temperate-oak-family-0018/tree.vxa"
-      },
-      {
-       "bytes": 21723,
-       "extent_vox": [
-        45,
-        41,
-        39
-       ],
-       "seed": 19,
-       "voxels": 6940,
-       "vxa": "library/temperate-oak-family/temperate-oak-family-0019/tree.vxa"
+       "vxa": "library/temperate-oak/temperate-oak-0015/tree.vxa"
       },
       {
        "bytes": 9113,
@@ -11003,208 +10880,16 @@
        ],
        "seed": 20,
        "voxels": 4580,
-       "vxa": "library/temperate-oak-family/temperate-oak-family-0020/tree.vxa"
-      },
-      {
-       "bytes": 20973,
-       "extent_vox": [
-        38,
-        39,
-        46
-       ],
-       "seed": 21,
-       "voxels": 7179,
-       "vxa": "library/temperate-oak-family/temperate-oak-family-0021/tree.vxa"
-      },
-      {
-       "bytes": 448423,
-       "extent_vox": [
-        135,
-        140,
-        100
-       ],
-       "seed": 22,
-       "voxels": 100951,
-       "vxa": "library/temperate-oak-family/temperate-oak-family-0022/tree.vxa"
-      },
-      {
-       "bytes": 70028,
-       "extent_vox": [
-        55,
-        55,
-        81
-       ],
-       "seed": 23,
-       "voxels": 32914,
-       "vxa": "library/temperate-oak-family/temperate-oak-family-0023/tree.vxa"
-      },
-      {
-       "bytes": 311983,
-       "extent_vox": [
-        109,
-        98,
-        106
-       ],
-       "seed": 24,
-       "voxels": 83088,
-       "vxa": "library/temperate-oak-family/temperate-oak-family-0024/tree.vxa"
-      },
-      {
-       "bytes": 1238268,
-       "extent_vox": [
-        177,
-        179,
-        144
-       ],
-       "seed": 25,
-       "voxels": 264707,
-       "vxa": "library/temperate-oak-family/temperate-oak-family-0025/tree.vxa"
-      },
-      {
-       "bytes": 242068,
-       "extent_vox": [
-        88,
-        76,
-        131
-       ],
-       "seed": 26,
-       "voxels": 107848,
-       "vxa": "library/temperate-oak-family/temperate-oak-family-0026/tree.vxa"
-      },
-      {
-       "bytes": 629223,
-       "extent_vox": [
-        125,
-        129,
-        124
-       ],
-       "seed": 27,
-       "voxels": 175883,
-       "vxa": "library/temperate-oak-family/temperate-oak-family-0027/tree.vxa"
-      },
-      {
-       "bytes": 22938,
-       "extent_vox": [
-        42,
-        45,
-        39
-       ],
-       "seed": 28,
-       "voxels": 7178,
-       "vxa": "library/temperate-oak-family/temperate-oak-family-0028/tree.vxa"
-      },
-      {
-       "bytes": 8138,
-       "extent_vox": [
-        25,
-        25,
-        43
-       ],
-       "seed": 29,
-       "voxels": 4208,
-       "vxa": "library/temperate-oak-family/temperate-oak-family-0029/tree.vxa"
-      },
-      {
-       "bytes": 16618,
-       "extent_vox": [
-        38,
-        36,
-        41
-       ],
-       "seed": 30,
-       "voxels": 5987,
-       "vxa": "library/temperate-oak-family/temperate-oak-family-0030/tree.vxa"
-      },
-      {
-       "bytes": 271538,
-       "extent_vox": [
-        106,
-        102,
-        85
-       ],
-       "seed": 31,
-       "voxels": 73663,
-       "vxa": "library/temperate-oak-family/temperate-oak-family-0031/tree.vxa"
-      },
-      {
-       "bytes": 120723,
-       "extent_vox": [
-        68,
-        69,
-        103
-       ],
-       "seed": 32,
-       "voxels": 48906,
-       "vxa": "library/temperate-oak-family/temperate-oak-family-0032/tree.vxa"
-      },
-      {
-       "bytes": 190638,
-       "extent_vox": [
-        85,
-        81,
-        104
-       ],
-       "seed": 33,
-       "voxels": 63823,
-       "vxa": "library/temperate-oak-family/temperate-oak-family-0033/tree.vxa"
-      },
-      {
-       "bytes": 995618,
-       "extent_vox": [
-        166,
-        164,
-        123
-       ],
-       "seed": 34,
-       "voxels": 226911,
-       "vxa": "library/temperate-oak-family/temperate-oak-family-0034/tree.vxa"
-      },
-      {
-       "bytes": 221123,
-       "extent_vox": [
-        85,
-        80,
-        119
-       ],
-       "seed": 35,
-       "voxels": 102744,
-       "vxa": "library/temperate-oak-family/temperate-oak-family-0035/tree.vxa"
-      },
-      {
-       "bytes": 578008,
-       "extent_vox": [
-        123,
-        120,
-        130
-       ],
-       "seed": 36,
-       "voxels": 171659,
-       "vxa": "library/temperate-oak-family/temperate-oak-family-0036/tree.vxa"
+       "vxa": "library/temperate-oak/temperate-oak-0020/tree.vxa"
       }
      ],
      "kind": "tree",
-     "name": "temperate-oak-family",
+     "name": "temperate-oak",
      "via": "kind",
      "voxel_mm": 100.0
     },
     {
      "curation": "draft",
-     "grids": [
-      {
-       "bytes": 512033,
-       "extent_vox": null,
-       "seed": 1,
-       "voxels": 148505,
-       "vxa": "library/temperate-oak-pilot/temperate-oak-pilot-0001/tree.vxa"
-      }
-     ],
-     "kind": "tree",
-     "name": "temperate-oak-pilot",
-     "via": "kind",
-     "voxel_mm": 100.0
-    },
-    {
-     "curation": "approved",
      "kind": "tree",
      "name": "temperate-sapling",
      "via": "kind",
@@ -11239,11 +10924,11 @@
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "grass",
      "name": "timothy",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -11253,18 +10938,18 @@
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "tree",
      "name": "tree-fern",
      "via": "kind",
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "flower",
      "name": "trout-lily",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -11302,27 +10987,14 @@
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "tree",
      "name": "tulip-tree",
      "via": "kind",
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
-     "grids": [
-      {
-       "bytes": 69328,
-       "extent_vox": [
-        49,
-        49,
-        80
-       ],
-       "seed": 2,
-       "voxels": 14314,
-       "vxa": "library/tundra-pine/tundra-pine-0002/tree.vxa"
-      }
-     ],
+     "curation": "draft",
      "kind": "tree",
      "name": "tundra-pine",
      "via": "kind",
@@ -11357,11 +11029,11 @@
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "grass",
      "name": "understory-fern",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -11392,32 +11064,32 @@
      "voxel_mm": 50.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "grass",
      "name": "water-chestnut",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "grass",
      "name": "water-earwort",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "flower",
      "name": "water-forget-me-not",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "reed",
      "name": "water-horsetail",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -11434,81 +11106,46 @@
      "voxel_mm": 50.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "flower",
      "name": "water-mint",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "flower",
      "name": "water-plantain",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
-     "curation": "approved",
-     "grids": [
-      {
-       "bytes": 2668,
-       "extent_vox": [
-        21,
-        23,
-        47
-       ],
-       "seed": 1,
-       "voxels": 1261,
-       "vxa": "library/water-reed/water-reed-0001/tree.vxa"
-      },
-      {
-       "bytes": 2513,
-       "extent_vox": [
-        22,
-        26,
-        61
-       ],
-       "seed": 101,
-       "voxels": 1294,
-       "vxa": "library/water-reed/water-reed-0101/tree.vxa"
-      },
-      {
-       "bytes": 2333,
-       "extent_vox": [
-        21,
-        20,
-        39
-       ],
-       "seed": 102,
-       "voxels": 1024,
-       "vxa": "library/water-reed/water-reed-0102/tree.vxa"
-      }
-     ],
+     "curation": "draft",
      "kind": "reed",
      "name": "water-reed",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "grass",
      "name": "water-soldier",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "grass",
      "name": "water-starwort",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "grass",
      "name": "watercress",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -11532,39 +11169,39 @@
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "tree",
      "name": "weeping-willow",
      "via": "kind",
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "tree",
      "name": "western-hemlock",
      "via": "kind",
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "tree",
      "name": "western-red-cedar",
      "via": "kind",
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "tree",
      "name": "white-poplar",
      "via": "kind",
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "flower",
      "name": "white-water-lily",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -11595,25 +11232,25 @@
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "tree",
      "name": "wild-pear",
      "via": "kind",
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "bush",
      "name": "wild-privet",
      "via": "kind",
-     "voxel_mm": 100.0
+     "voxel_mm": 25.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "reed",
      "name": "wild-rice",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -11630,74 +11267,74 @@
      "voxel_mm": 50.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "grass",
      "name": "willow-moss",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "bush",
      "name": "witch-hazel",
      "via": "kind",
-     "voxel_mm": 100.0
+     "voxel_mm": 25.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "flower",
      "name": "wood-anemone",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "grass",
      "name": "wood-horsetail",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "grass",
      "name": "wood-sedge",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "flower",
      "name": "wood-sorrel",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "grass",
      "name": "woolly-fringe-moss",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "tree",
      "name": "wych-elm",
      "via": "kind",
      "voxel_mm": 100.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "flower",
      "name": "yarrow",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "flower",
      "name": "yellow-flag-iris",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
@@ -11707,11 +11344,11 @@
      "voxel_mm": 50.0
     },
     {
-     "curation": "approved",
+     "curation": "draft",
      "kind": "flower",
      "name": "yellow-water-lily",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     }
    ]
   }
