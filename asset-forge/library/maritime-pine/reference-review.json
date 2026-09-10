@@ -1,0 +1,88 @@
+{
+  "species": "maritime-pine",
+  "status": "passed pilot review",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "findings": [
+    "High clear bole and irregular elevated crown follow coastal and woodland photographs. Coarse terminal needle tufts are attached to divided shoots; warm-coastal habitat is explicit."
+  ],
+  "reviewed_images": [
+    {
+      "image_id": "42515",
+      "source": "https://plants.ces.ncsu.edu/plants/pinus-pinaster/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    },
+    {
+      "image_id": "37209",
+      "source": "https://plants.ces.ncsu.edu/plants/pinus-pinaster/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    }
+  ],
+  "taxon": "pinus-pinaster",
+  "sources": [
+    "https://plants.ces.ncsu.edu/plants/pinus-pinaster/"
+  ],
+  "habitat": "warm-coastal",
+  "art_baseline": {
+    "season": "spring",
+    "foliage": "Species-appropriate spring foliage and fresh growth; flowering only where appropriate to the species.",
+    "reference_policy": "Use spring photographs for finished color and foliage. Other seasons may inform branch structure only.",
+    "out_of_scope": [
+      "seasonal transitions",
+      "seasonal recoloring"
+    ]
+  },
+  "generator_digest": "6d0b2c04db2c83b942e5b228219a87f514e03cf06752831f8ac02256fa4cfa85",
+  "review_date": "2026-09-07",
+  "review_scope": "Stylized spring vertical slice; source acceptance is separate from world variant endorsement.",
+  "pilot_artifacts": {
+    "1": "e3f3b0789ff21a1e38a10daa8fd0173c9a7e0daef35056bdf5a2417de3da68a4",
+    "4": "d666f69e650d96f7ddc88c7fb77828958bdef001a31293ed94c86257cb9bf85a",
+    "7": "5ef9faa5bc989ac4ecf3e10b5533347b2a6ff7effcd8f2f6dab74d9f10d072e7"
+  },
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "0de49b8366f6805ae92e695299bc1c6187196d3c744568a3897b60d11069d5a5"
+  }
+}

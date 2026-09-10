@@ -341,8 +341,10 @@ namespace VoxelGpuWorldGen
 		FRDGBufferRef ColStarts = nullptr;     // rebased per-column span starts
 		FRDGBufferRef Spans = nullptr;         // rebased packed spans
 		// P2: async-compute pipe -- see FWorklistColumnDispatch::bAsyncCompute.
+		bool bHasOwnedWinners = false; // derived from the complete staged instance blob
 		bool bAsyncCompute = false;
 	};
+	void AddClassicAssetStampPasses(FRDGBuilder& GraphBuilder,const FVoxelGpuRegionRequest& Request,FRDGBufferRef Cells);
 	void AddWorklistAssetStampPass(FRDGBuilder& GraphBuilder, const FWorklistAssetStampDispatch& Dispatch);
 
 	// The Pack stage's once-per-tick indirect dispatch (P3 stage 5), added to

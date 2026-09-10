@@ -1,0 +1,13 @@
+{
+  "file": "tree-appearance-runtime.vac",
+  "version": 2,
+  "pitch_encoding": "integer-micrometres",
+  "geometry_md5": "79d9d6bc6da79c953f6db8bd81feb3a7",
+  "geometry_sha256": "0520053ae6f0dc6fddb9000ad1918498b22486265cccb2313e6e269867fdf510",
+  "sha256": "3aeb1f42e0d21a07012ee19996c780b416224b1b1d3e77f36707ea5436d78477",
+  "voxels": 4636,
+  "voxel_mm": 100.0,
+  "voxel_um": 100000,
+  "preview_sha256": "edd678c675706b04ce47ca3d0c0f53a1b37683f281ca37133535f2bd9c5cfdab",
+  "foliage_mask": false
+}

@@ -1,0 +1,88 @@
+{
+  "species": "black-cherry",
+  "status": "passed pilot review",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "findings": [
+    "Divided ascending branches support an irregular oval canopy; low garden reference forms inform forks, while the authored canopy variant retains a taller bole."
+  ],
+  "reviewed_images": [
+    {
+      "image_id": "35756",
+      "source": "https://plants.ces.ncsu.edu/plants/prunus-serotina/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    },
+    {
+      "image_id": "11677",
+      "source": "https://plants.ces.ncsu.edu/plants/prunus-serotina/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    }
+  ],
+  "taxon": "prunus-serotina",
+  "sources": [
+    "https://plants.ces.ncsu.edu/plants/prunus-serotina/"
+  ],
+  "habitat": "canopy",
+  "art_baseline": {
+    "season": "spring",
+    "foliage": "Species-appropriate spring foliage and fresh growth; flowering only where appropriate to the species.",
+    "reference_policy": "Use spring photographs for finished color and foliage. Other seasons may inform branch structure only.",
+    "out_of_scope": [
+      "seasonal transitions",
+      "seasonal recoloring"
+    ]
+  },
+  "generator_digest": "6d0b2c04db2c83b942e5b228219a87f514e03cf06752831f8ac02256fa4cfa85",
+  "review_date": "2026-09-07",
+  "review_scope": "Stylized spring vertical slice; source acceptance is separate from world variant endorsement.",
+  "pilot_artifacts": {
+    "1": "af9f661a455aa434971730eceb2ac07658f044362616d6f591ea9dea6c6db6ed",
+    "4": "851631dcc2e6859b4e3452af8cdcd1540a5590ec682af2e7bf63543ff64e6353",
+    "7": "5ab3c4c2b9de7f010c510fe27f7b98cafe759abc1fb028b2009afa4d5bf931cc"
+  },
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "a8b75c2d7391db787da035ad3c79b48b140552bec6ca80b410e272afdf6f02c6"
+  }
+}

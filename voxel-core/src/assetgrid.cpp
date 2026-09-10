@@ -41,6 +41,7 @@ void AssetGrid::clear() {
     // onTerrainLattice() -- that is the one question whose wrong answer stamps
     // a detail entity into the world.
     voxelSizeUm_ = 0;
+    solidCount_ = 0;
     runMat_.clear();
     runLen_.clear();
     colRun_.clear();
@@ -105,6 +106,9 @@ AssetParseError AssetGrid::parse(const uint8_t* blob, size_t bytes) {
         runMat_[i] = static_cast<MaterialId>(rec[0]);
         const uint32_t len = readU32(rec + 1);
         runLen_[i] = len;
+        // Preserve the old scan result even on a material-run sum failure,
+        // which leaves these partial runs observable on an invalid grid.
+        if (runMat_[i] != MAT_AIR) solidCount_ += len;
         total += len;
         // Checked inside the loop, not only after it: a corrupt header can
         // claim run lengths that sum past 2^64 across enough records, and a
@@ -300,11 +304,10 @@ MaterialId AssetGrid::atYaw(int32_t rx, int32_t ry, int32_t rz, uint8_t yawQuart
 }
 
 uint64_t AssetGrid::solidCount() const {
-    uint64_t n = 0;
-    for (size_t i = 0; i < runMat_.size(); ++i) {
-        if (runMat_[i] != MAT_AIR) n += runLen_[i];
-    }
-    return n;
+    // Default vector moves empty the source run table while scalar members
+    // retain their previous values. Match the old empty-table scan result,
+    // including self-move assignment, without changing other move semantics.
+    return runMat_.empty() ? 0 : solidCount_;
 }
 
 MaterialId AssetGrid::maxMaterialId() const {

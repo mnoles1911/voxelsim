@@ -1,0 +1,88 @@
+{
+  "species": "european-yew",
+  "status": "passed pilot review",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "findings": [
+    "Low broad evergreen crown and irregular divided scaffold follow the younger whole-tree reference. Ancient trunk photograph is structural context, not a claim that every seed is a hollow veteran."
+  ],
+  "reviewed_images": [
+    {
+      "image_id": "39603",
+      "source": "https://plants.ces.ncsu.edu/plants/taxus-baccata/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    },
+    {
+      "image_id": "42049",
+      "source": "https://plants.ces.ncsu.edu/plants/taxus-baccata/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    }
+  ],
+  "taxon": "taxus-baccata",
+  "sources": [
+    "https://plants.ces.ncsu.edu/plants/taxus-baccata/"
+  ],
+  "habitat": "understory",
+  "art_baseline": {
+    "season": "spring",
+    "foliage": "Species-appropriate spring foliage and fresh growth; flowering only where appropriate to the species.",
+    "reference_policy": "Use spring photographs for finished color and foliage. Other seasons may inform branch structure only.",
+    "out_of_scope": [
+      "seasonal transitions",
+      "seasonal recoloring"
+    ]
+  },
+  "generator_digest": "6d0b2c04db2c83b942e5b228219a87f514e03cf06752831f8ac02256fa4cfa85",
+  "review_date": "2026-09-07",
+  "review_scope": "Stylized spring vertical slice; source acceptance is separate from world variant endorsement.",
+  "pilot_artifacts": {
+    "1": "94dac30eba36856d022a1bbc1ef4fb88ef9dbcb6fe3755ff08723ba8440d29c1",
+    "4": "0b9effe8ee6b36b2d875f7d9ec2e9ae9d25b816689c2204c6dfcafe5fe8ff26d",
+    "7": "301670d36165f295354e4da4418cdab964ba2c77fe556994b9caf8f97ccdc8f5"
+  },
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "b20bd723a78bacfa7dfbc5eba1d8f4eee492c7dfb33cc850d88e75c39f6139d5"
+  }
+}

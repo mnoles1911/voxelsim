@@ -15,6 +15,7 @@
 #include "VertexFactory.h"
 #include "RenderResource.h"
 #include "ShaderParameters.h"
+#include "VoxelTerrainAppearanceGpuState.h"
 
 // The quad pool SRV, handed to the shader in one uniform buffer. A stable
 // FRHIUniformBuffer* stays hashable, which keeps the door open to draw-command
@@ -26,6 +27,10 @@
 // because it would be a different, unbound symbol. Black terrain, no error.
 BEGIN_GLOBAL_SHADER_PARAMETER_STRUCT(FVoxelQuadVertexFactoryParameters, )
 	SHADER_PARAMETER_SRV(StructuredBuffer<uint2>, QuadBuffer)
+	SHADER_PARAMETER_SRV(StructuredBuffer<uint>, AppearancePages)
+	SHADER_PARAMETER_SRV(StructuredBuffer<uint>, AppearanceSources)
+	SHADER_PARAMETER_SRV(StructuredBuffer<uint2>, AppearanceRanges)
+	SHADER_PARAMETER_SRV(StructuredBuffer<uint4>, AppearanceSlots)
 	// Single-chunk framing (the G2 component). Ignored when PoolMode is 1.
 	SHADER_PARAMETER(FVector3f, ChunkOriginUU)
 	SHADER_PARAMETER(float, LevelScale)
@@ -223,6 +228,10 @@ public:
 	// Marks this factory as drawing water fill rather than terrain. See
 	// FVoxelQuadVertexFactoryParameters::WaterMode. Must be set BEFORE InitRHI,
 	// like every other setter here -- the uniform buffer is built there.
+    // Render-thread only. Refreshes the uniform binding without releasing
+    // geometry streams. Slots belong to this quad pool's chunk-ID namespace.
+    void SetAppearanceBuffers(FRHICommandListBase& RHI, const FVoxelTerrainAppearanceGpuState::FViews& Views);
+
 	void SetWaterMode(bool bInWaterMode) { bWaterMode = bInWaterMode; }
 
 	// The per-quad corner-height buffer -- see
@@ -245,6 +254,9 @@ public:
 	FRHIUniformBuffer* GetZeroRangeUniformBuffer() const { return ZeroRangeUniformBuffer.GetReference(); }
 
 private:
+    void UpdateUniformBuffer(FRHICommandListBase& RHI);
+    FVoxelTerrainAppearanceGpuState::FViews AppearanceViews;
+    TUniquePtr<FVoxelTerrainAppearanceGpuState> EmptyAppearance;
 	FShaderResourceViewRHIRef QuadBufferSRV;
 	FVector3f ChunkOriginUU = FVector3f::ZeroVector;
 	float LevelScale = 1.0f;

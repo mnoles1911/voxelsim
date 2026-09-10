@@ -143,9 +143,10 @@ struct FVoxelWorklistAssetInstance
 	uint32 SizeY = 0;
 	uint32 SizeZ = 0;
 	uint32 ColStartsBase = 0;
-	uint32 Pad0 = 0;
+	uint32 RenderOwned = 0; // explicit winner ownership; formerly zero padding
 };
 static_assert(sizeof(FVoxelWorklistAssetInstance) == 48, "the 48-byte instance IS the contract");
+static_assert(STRUCT_OFFSET(FVoxelWorklistAssetInstance, RenderOwned) == 44, "ownership occupies only the former final padding dword");
 
 // A record's asset payload, handed to Append alongside the record and staged
 // into the FLUSH that consumes it (never uploaded for deferred records --
@@ -799,6 +800,7 @@ private:
 	uint32 ProofStashTail = 0;
 	uint32 ProofStashConsumed = 0;
 	uint32 ProofStashFold = 0;
+	int64 ProofStashClaims = 0; // same flush as GPU proof; excludes the deferred next-flush claim
 	double LastProofSeconds = 0.0;
 	FProofStatus Proof;
 

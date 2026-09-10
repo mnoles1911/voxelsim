@@ -1,0 +1,81 @@
+{
+  "version": 1,
+  "scope": "Detour candidate following route-capture-2 failure at low sapling foliage. Original six endpoints retained. Source-bank clearance is local only; terrain support and full route remain runtime-unverified.",
+  "spawn_x_m": -154740,
+  "spawn_y_m": -81476,
+  "configuration_sha256": "e68b98f5d52952d59cece8e4403c6d42eaddb9fee5d3259dabb999a6f1ad0936",
+  "species_manifest_sha256": "0197da097e17a2634c2f15dca0589e5e98157eb631c2998513769738427dd4f6",
+  "waypoints": [
+    {
+      "x_m": -154720.0,
+      "y_m": -81472.0,
+      "label": "survey point; route connectivity unverified",
+      "survey_slope_mm_per_m": 90,
+      "survey_stand": 0,
+      "survey_water_mm": 0
+    },
+    {
+      "x_m": -154696.0,
+      "y_m": -81448.0,
+      "label": "survey point; route connectivity unverified",
+      "survey_slope_mm_per_m": 1,
+      "survey_stand": 1,
+      "survey_water_mm": 0
+    },
+    {
+      "x_m": -154706.199,
+      "y_m": -81436.101,
+      "label": "approach observed obstruction without clearing",
+      "arrival_radius_m": 0.35
+    },
+    {
+      "x_m": -154704.8,
+      "y_m": -81436.5,
+      "label": "east sidestep around low foliage",
+      "arrival_radius_m": 0.35
+    },
+    {
+      "x_m": -154704.8,
+      "y_m": -81432,
+      "label": "north along clear local source-bank corridor",
+      "arrival_radius_m": 0.35
+    },
+    {
+      "x_m": -154708,
+      "y_m": -81431,
+      "label": "rejoin original destination approach",
+      "arrival_radius_m": 0.35
+    },
+    {
+      "x_m": -154720.0,
+      "y_m": -81416.0,
+      "label": "survey point; route connectivity unverified",
+      "survey_slope_mm_per_m": 100,
+      "survey_stand": 1,
+      "survey_water_mm": 0
+    },
+    {
+      "x_m": -154752.0,
+      "y_m": -81440.0,
+      "label": "survey point; route connectivity unverified",
+      "survey_slope_mm_per_m": 71,
+      "survey_stand": 1,
+      "survey_water_mm": 0
+    },
+    {
+      "x_m": -154776.0,
+      "y_m": -81464.0,
+      "label": "survey point; route connectivity unverified",
+      "survey_slope_mm_per_m": 127,
+      "survey_stand": 1,
+      "survey_water_mm": 0
+    },
+    {
+      "x_m": -154776.0,
+      "y_m": -81456.0,
+      "label": "screened plot candidate; support and access unverified"
+    }
+  ],
+  "parent_route_sha256": "0d058ebb798740684b26b687230070cfea2cedbf40575543094b88823a0d4642",
+  "obstruction_evidence": "route-capture-2: stalled at (-154706.199,-81436.101,73.401m); temperate-sapling-0012 yaw2 MAT_LEAF_BROADLEAF blocks X/Y and raised step."
+}

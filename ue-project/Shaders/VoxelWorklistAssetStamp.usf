@@ -109,6 +109,10 @@ void AssetStampWorklistMain(uint3 Gid : SV_GroupID, uint3 GTid : SV_GroupThreadI
 
 	// Instances IN SLICE ORDER -- the classic per-instance pass order, so
 	// first-non-air-wins picks the same winner for every overlapped cell.
+#if VXC_ASSET_OWNERSHIP
+    uint OwnedWinners[32];
+    [unroll] for(uint K=0u;K<32u;++K) OwnedWinners[K]=0u;
+#endif
 	for (uint I = 0u; I < R.AssetCount; ++I)
 	{
 		const GpuAssetStampInstance Inst = WorklistAssetInstances[R.AssetBase + I];
@@ -162,7 +166,17 @@ void AssetStampWorklistMain(uint3 Gid : SV_GroupID, uint3 GTid : SV_GroupThreadI
 			if ((Cell & 0xffu) == 0u)
 			{
 				OutCells[CellIndex] = (Cell & ~0xffu) | Mat;
+#if VXC_ASSET_OWNERSHIP
+                OwnedWinners[K] = Inst.RenderOwned;
+#endif
 			}
 		}
 	}
+#if VXC_ASSET_OWNERSHIP
+    [unroll] for(uint K=0u;K<32u;++K) if(OwnedWinners[K]!=0u){
+        const uint Index=CellArenaBase+(FootprintIndex*4u+(K>>3u))*512u+(Lx+8u*(Ly+8u*(K&7u)));
+        OutCells[Index]&=~0xffu;
+    }
+
+#endif
 }

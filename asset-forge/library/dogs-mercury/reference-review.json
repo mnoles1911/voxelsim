@@ -1,0 +1,294 @@
+{
+  "status": "passed pilot review",
+  "source": "https://www.wildlifetrusts.org/wildlife-explorer/wildflowers/dogs-mercury",
+  "viewed_photos": [
+    "Leafy shoots - Philip Precey"
+  ],
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "batch_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+  ],
+  "findings": "Inspected the Wildlife Trusts spring shoot photograph and compared all three size pilots and 36 variants. Opposite broad lanceolate leaf pairs follow upright stems with an open clonal tuft silhouette rather than a green sphere; current variants span 0.20-0.38 m. No invented bright flower heads or summer fruit. Small green florets and toothed margins cannot individually resolve at 25 mm; top stem tips are their coarse representation. Accepted as stylized spring dogs mercury foliage, with source approval separate from user endorsement.",
+  "generator_digest": "a4f3f77fb3fb13d063d8c450102b1e0a618a3a1bc2ec3a6688da8d307717d064",
+  "sheet_hash": "a416ca67cdcf4df54ad129b9a8a7bc9460bf6b0cfb31007e7237077ad35dd554",
+  "reviewed_at": 1788841799.5596406,
+  "pilot_hashes": {
+    "1": "32314035d45be8d479396b80610bf6f24bac0127139b483172b024e0f8f6a830",
+    "4": "d1b828b21be82d6106d23b2089f5170fa35ace30990ebd9d547073b429483bc0",
+    "7": "88fec76e52a375065317db7e96e5168a2cdf02c99aeba9eb2d4bd0c4bf47a627"
+  },
+  "profile": "dogs-mercury",
+  "review_date": "2026-09-08",
+  "taxon": "Mercurialis perennis",
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "a416ca67cdcf4df54ad129b9a8a7bc9460bf6b0cfb31007e7237077ad35dd554"
+  },
+  "identity_revalidations": [
+    {
+      "previous_digest": "526e7c42e8162face63e4fcbb8d7d3bf52f9c9e046c04696c4f5f9571574eb55",
+      "new_digest": "a4f3f77fb3fb13d063d8c450102b1e0a618a3a1bc2ec3a6688da8d307717d064",
+      "timestamp": 1788843660.7523177,
+      "method": "Every saved VXA rebuilt to identical SHA-256; original files and all user decisions preserved",
+      "variants": [
+        {
+          "id": "dogs-mercury-0001",
+          "seed": 1,
+          "hash": "32314035d45be8d479396b80610bf6f24bac0127139b483172b024e0f8f6a830"
+        },
+        {
+          "id": "dogs-mercury-0002",
+          "seed": 2,
+          "hash": "561c98304e4c81a9779f1386848edc0ea0271d035c58996f28d7f8d978ce261f"
+        },
+        {
+          "id": "dogs-mercury-0003",
+          "seed": 3,
+          "hash": "82d25f16aa332d6b187c26987e6c6cdca83ea25acf86602eff42173eb694926f"
+        },
+        {
+          "id": "dogs-mercury-0004",
+          "seed": 4,
+          "hash": "d1b828b21be82d6106d23b2089f5170fa35ace30990ebd9d547073b429483bc0"
+        },
+        {
+          "id": "dogs-mercury-0005",
+          "seed": 5,
+          "hash": "ee3b5994d20025df744f8301b84f0d5dee51acb3ad27b7b37b11258373121652"
+        },
+        {
+          "id": "dogs-mercury-0006",
+          "seed": 6,
+          "hash": "9dbd2b7cf68585ddf65791ed47f19e5d61b445656299645f19dae7eb57dc2507"
+        },
+        {
+          "id": "dogs-mercury-0007",
+          "seed": 7,
+          "hash": "88fec76e52a375065317db7e96e5168a2cdf02c99aeba9eb2d4bd0c4bf47a627"
+        },
+        {
+          "id": "dogs-mercury-0008",
+          "seed": 8,
+          "hash": "d981649ac99fa27b3502895590d88479f08609b1a6745c1eaf6f237f81a8684d"
+        },
+        {
+          "id": "dogs-mercury-0009",
+          "seed": 9,
+          "hash": "a7ba5d59d5b8e1068844c1c1742ad56b24e45564801158b857fbfe708ac8b0fb"
+        },
+        {
+          "id": "dogs-mercury-0010",
+          "seed": 10,
+          "hash": "34a28950087b83dbdb7696a2a80937fe30a0fc6310d4ceea62bb024851e6650f"
+        },
+        {
+          "id": "dogs-mercury-0011",
+          "seed": 11,
+          "hash": "dd6404f90c8b2a7bbb50d6601edf9726622c8f06f32495ff5b65cd59d18ecb9f"
+        },
+        {
+          "id": "dogs-mercury-0012",
+          "seed": 12,
+          "hash": "d105366929603a6defd3549947ed377ad744b2d95667c9c8d04e02f55761668c"
+        },
+        {
+          "id": "dogs-mercury-0013",
+          "seed": 13,
+          "hash": "36bd2071a3fa8524761b70539226375e87e411fac4a8dbddd34e2364198db8d8"
+        },
+        {
+          "id": "dogs-mercury-0014",
+          "seed": 14,
+          "hash": "a6e7f1698459aacdc1edc9dabfbd2d0ccac45a44b2c3443e84cbe14ea1a198f0"
+        },
+        {
+          "id": "dogs-mercury-0015",
+          "seed": 15,
+          "hash": "916a8053d36515358b6762d512f7066bdd8104d67eb55a54cb53503a571f9dac"
+        },
+        {
+          "id": "dogs-mercury-0016",
+          "seed": 16,
+          "hash": "011a3d70d51a9fada0de977644dd6dea6cbd0982e68c5903495dd4fe42c44396"
+        },
+        {
+          "id": "dogs-mercury-0017",
+          "seed": 17,
+          "hash": "ea8b5f764588bbd46878c248cb298b199d5a4391b8ed7bd41f5c5ab27f45c975"
+        },
+        {
+          "id": "dogs-mercury-0018",
+          "seed": 18,
+          "hash": "00e4f855fb3300cac7fd7480afa57b9d9cec24f5d83b77bc833f2e14cc8d225d"
+        },
+        {
+          "id": "dogs-mercury-0019",
+          "seed": 19,
+          "hash": "fea491b9acd42153815c04179cddde2fd20561f632c30e39276ae6d6439e309f"
+        },
+        {
+          "id": "dogs-mercury-0020",
+          "seed": 20,
+          "hash": "baf050d6ece118bdeb7f69e16d11f3bd339a76f93b0540d5d4cdacfae760411f"
+        },
+        {
+          "id": "dogs-mercury-0021",
+          "seed": 21,
+          "hash": "8ee5ca8d74b97c09c5cb211f0f3d2bb88b5fddb742e5cbdb1a9487d0d87573d1"
+        },
+        {
+          "id": "dogs-mercury-0022",
+          "seed": 22,
+          "hash": "093cf6e470eb165f4473559904fd0c88cfd9e484c3b4682b6e6ea513a4a4107c"
+        },
+        {
+          "id": "dogs-mercury-0023",
+          "seed": 23,
+          "hash": "e7b885beb5880caaf6013171495c2859025015fa5ab22bae43dc175c116a7927"
+        },
+        {
+          "id": "dogs-mercury-0024",
+          "seed": 24,
+          "hash": "3288c58a77b8ecae10f4e1681d98c1a6670ec9d6f70bbeb7395023660cbd57db"
+        },
+        {
+          "id": "dogs-mercury-0025",
+          "seed": 25,
+          "hash": "0918a38dbc988b6fe9ca0123fa9333e780334807340a5a524ea9a3947eb510f8"
+        },
+        {
+          "id": "dogs-mercury-0026",
+          "seed": 26,
+          "hash": "2f9e2538581f84cf26d8b2614f2f0f61933f9aecae801e604aac6e1d8913ffe7"
+        },
+        {
+          "id": "dogs-mercury-0027",
+          "seed": 27,
+          "hash": "4c56a099decb5d60d56d4bbf90f7104c3a03d2c787e77e4d4e13595398461d53"
+        },
+        {
+          "id": "dogs-mercury-0028",
+          "seed": 28,
+          "hash": "ebb18d6c38bf047cd0d6655648d1a8df0512267b49200cb23dc58e9b604433c0"
+        },
+        {
+          "id": "dogs-mercury-0029",
+          "seed": 29,
+          "hash": "f377c4368dbc989b20111922e2c52a258c240b010fd6f048963137205e62fae9"
+        },
+        {
+          "id": "dogs-mercury-0030",
+          "seed": 30,
+          "hash": "9207ee0efd510b3dedea555152937079ac95dc1af50aeda43530eb2ad285e15d"
+        },
+        {
+          "id": "dogs-mercury-0031",
+          "seed": 31,
+          "hash": "440bc85a8325c6c95acf344d88ea00b3dc617efe04717fc5791c8e88740f8db8"
+        },
+        {
+          "id": "dogs-mercury-0032",
+          "seed": 32,
+          "hash": "22162b06de9ab697bf1ccb5c665552dda91dd50e845ab1d6891a70a9b1c5a947"
+        },
+        {
+          "id": "dogs-mercury-0033",
+          "seed": 33,
+          "hash": "fb601a498cb6e298c32df3e1f2b526fcd0604bd3502edd855e976db87792e7a7"
+        },
+        {
+          "id": "dogs-mercury-0034",
+          "seed": 34,
+          "hash": "c74d7c3e0838cff42d6aa260f146de2bed43c780a3903e1c8efe9ba6980e04ea"
+        },
+        {
+          "id": "dogs-mercury-0035",
+          "seed": 35,
+          "hash": "8933a22c8ee24dbb0e35978e7ee6b4c524086e015add1eb4b4db51c4f25c8dac"
+        },
+        {
+          "id": "dogs-mercury-0036",
+          "seed": 36,
+          "hash": "1b20130676969f16ff1bcd728e5bc5f7cfc5b82a0ad85fe393ff4d82a508af50"
+        }
+      ]
+    }
+  ]
+}

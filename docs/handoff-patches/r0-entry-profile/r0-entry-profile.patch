@@ -1,0 +1,156 @@
+--- a/ue-project/Source/VoxelEarth/VoxelWorldSubsystem.cpp
++++ b/ue-project/Source/VoxelEarth/VoxelWorldSubsystem.cpp
+@@ -6594,6 +6594,47 @@
+ 	uint64 Loaded = 0;
+ 	uint64 Refused = 0;
+ };
++
++
++// Opt-in GT-only R0 diagnostic. Durations are INCLUSIVE, not additive.
++// No clocks inside the per-Z predicate/probe loop. One record per entry slice;
++// split scans therefore sum through CSV Accumulate. Destructor handles returns.
++namespace R0EntryDiagnostic
++{
++enum EStage { Entry, Footprint, Memo, Compute, Resolve, Sky, Nearest, Prefetch, NumStages };
++struct FSample { double Ms[NumStages]{}; uint64 Calls[NumStages]{}; uint64 ZCells=0, Evaluations=0, MemoHits=0, EpochInvalidations=0; };
++static thread_local FSample* Active = nullptr;
++struct FTimer
++{
++ FSample* Sample; EStage Stage; double Start;
++ explicit FTimer(EStage InStage) : Sample(Active), Stage(InStage), Start(Sample ? FPlatformTime::Seconds() : 0.0) { if (Sample) ++Sample->Calls[Stage]; }
++ ~FTimer() { if (Sample) Sample->Ms[Stage] += (FPlatformTime::Seconds()-Start)*1000.0; }
++};
++struct FEntry
++{
++ FSample Sample; bool Enabled; double Start; bool Finished=false;
++ explicit FEntry(int32 Level) : Enabled(Level==0 && IsInGameThread() && FParse::Param(FCommandLine::Get(), TEXT("VoxelR0EntryProfile"))), Start(Enabled ? FPlatformTime::Seconds() : 0.0) { if (Enabled) { check(Active==nullptr); Active=&Sample; } }
++ void Finish()
++ {
++  if (!Enabled || Finished) return;
++  Finished=true; Active=nullptr; Sample.Ms[Entry]=(FPlatformTime::Seconds()-Start)*1000.0; Sample.Calls[Entry]=1;
++  static FSample WindowMax; static double LastLog=0.0;
++#define R0_EMIT(Name) CSV_CUSTOM_STAT(VoxelStream, R0Entry##Name##Ms, Sample.Ms[Name], ECsvCustomStatOp::Accumulate); CSV_CUSTOM_STAT(VoxelStream, R0Entry##Name##Calls, double(Sample.Calls[Name]), ECsvCustomStatOp::Accumulate); WindowMax.Ms[Name]=FMath::Max(WindowMax.Ms[Name],Sample.Ms[Name]); WindowMax.Calls[Name]+=Sample.Calls[Name];
++  R0_EMIT(Entry) R0_EMIT(Footprint) R0_EMIT(Memo) R0_EMIT(Compute) R0_EMIT(Resolve) R0_EMIT(Sky) R0_EMIT(Nearest) R0_EMIT(Prefetch)
++#undef R0_EMIT
++#define R0_COUNT(Name) CSV_CUSTOM_STAT(VoxelStream, R0Entry##Name, double(Sample.Name), ECsvCustomStatOp::Accumulate); WindowMax.Name+=Sample.Name;
++  R0_COUNT(ZCells) R0_COUNT(Evaluations) R0_COUNT(MemoHits) R0_COUNT(EpochInvalidations)
++#undef R0_COUNT
++  const double Now=FPlatformTime::Seconds();
++  if (Now-LastLog>=5.0)
++  {
++   UE_LOG(LogVoxelEarth, Log, TEXT("R0EntryProfile inclusive slice-window-max ms: entry=%.3f footprint=%.3f memo=%.3f compute=%.3f resolve=%.3f sky=%.3f nearest=%.3f prefetch=%.3f; window calls entry=%llu footprint=%llu memo=%llu compute=%llu resolve=%llu sky=%llu nearest=%llu prefetch=%llu z=%llu eval=%llu memoHit=%llu epochInvalid=%llu"), WindowMax.Ms[Entry],WindowMax.Ms[Footprint],WindowMax.Ms[Memo],WindowMax.Ms[Compute],WindowMax.Ms[Resolve],WindowMax.Ms[Sky],WindowMax.Ms[Nearest],WindowMax.Ms[Prefetch],WindowMax.Calls[Entry],WindowMax.Calls[Footprint],WindowMax.Calls[Memo],WindowMax.Calls[Compute],WindowMax.Calls[Resolve],WindowMax.Calls[Sky],WindowMax.Calls[Nearest],WindowMax.Calls[Prefetch],WindowMax.ZCells,WindowMax.Evaluations,WindowMax.MemoHits,WindowMax.EpochInvalidations);
++   WindowMax=FSample{}; LastLog=Now;
++  }
++ }
++ ~FEntry() { Finish(); }
++};
++}
+ 
+ struct FVoxelWorldImpl
+ {
+@@ -18531,6 +18572,7 @@
+ void FVoxelWorldImpl::ComputeFootprintChunkZRange(int32 ChunkX, int32 ChunkY, int32 Level, int32& OutChunkZMin, int32& OutChunkZMax,
+                                                    int32& OutChunkZMaxUntrimmed) const
+ {
++	R0EntryDiagnostic::FTimer R0Timer(R0EntryDiagnostic::Compute);
+ 	using namespace VoxelCoords;
+ 
+ 	// Cheap proxy for stage 1's exhaustive per-brick surfaceBrickRange (which
+@@ -18827,7 +18869,7 @@
+ 			// exactly the work that was written here before.
+ 			std::vector<vxc::AssetField::ResolvedAssetInstance> ResolveScratch;
+ 			const std::vector<vxc::AssetField::ResolvedAssetInstance>& Resolved =
+-				*ResolvedAssetsForFootprint(0, ChunkX, ChunkY, ResolveScratch,EAssetResolveCaller::Admission);
++				*[&]() { R0EntryDiagnostic::FTimer Timer(R0EntryDiagnostic::Resolve); return ResolvedAssetsForFootprint(0, ChunkX, ChunkY, ResolveScratch,EAssetResolveCaller::Admission); }();
+ 			int64 MaxCrownTop = INT64_MIN;
+ 			for (const vxc::AssetField::ResolvedAssetInstance& R : Resolved)
+ 			{
+@@ -18860,6 +18902,7 @@
+ void FVoxelWorldImpl::FootprintChunkZRangeCached(int32 ChunkX, int32 ChunkY, int32 Level, int32& OutChunkZMin,
+                                                  int32& OutChunkZMax, int32& OutChunkZMaxUntrimmed) const
+ {
++	R0EntryDiagnostic::FTimer R0Timer(R0EntryDiagnostic::Memo);
+ 	const VoxelCoords::FVoxelLevelChunkKey CacheKey{Level, VoxelCoords::FVoxelChunkKey{ChunkX, ChunkY, 0}};
+ 	if (const FFootprintZRange* Hit = FootprintZRangeCache.Find(CacheKey))
+ 	{
+@@ -18872,6 +18915,7 @@
+ 		    && (!FineStreamer || Hit->ResidencyEpoch != FineStreamer->ResidencyEpoch()))
+ 		{
+ 			FootprintZRangeCache.Remove(CacheKey);
++			if (R0EntryDiagnostic::Active) ++R0EntryDiagnostic::Active->EpochInvalidations;
+ 		}
+ 		else
+ 		{
+@@ -18880,6 +18924,7 @@
+ 			// retires the fill timer below (it would then be on a hot path and be a
+ 			// cost of its own).
+ 			if (ActiveCensus) { ++ActiveCensus->MemoHit; }
++			if (R0EntryDiagnostic::Active) ++R0EntryDiagnostic::Active->MemoHits;
+ 			OutChunkZMin = Hit->ChunkZMin;
+ 			OutChunkZMax = Hit->ChunkZMax;
+ 			OutChunkZMaxUntrimmed = Hit->ChunkZMaxUntrimmed;
+@@ -19913,7 +19958,7 @@
+ 		const int64 FineY0Mm = WorldToMm(CenterY - HalfEdge);
+ 		const int64 FineY1Mm = WorldToMm(CenterY + HalfEdge);
+ 		if (!FineStreamer->IsFootprintResident(FineX0Mm, FineY0Mm, FineX1Mm, FineY1Mm) &&
+-		    !FineStreamer->RequestFootprint(FineX0Mm, FineY0Mm, FineX1Mm, FineY1Mm))
++		    ![&]() { R0EntryDiagnostic::FTimer Timer(R0EntryDiagnostic::Prefetch); return FineStreamer->RequestFootprint(FineX0Mm, FineY0Mm, FineX1Mm, FineY1Mm); }())
+ 		{
+ 			// Still not resident (missing on disk, or failed
+ 			// validation -- see VoxelFineTileStreamer.cpp's
+@@ -20013,6 +20058,7 @@
+     const VoxelCoords::FVoxelLevelChunkKey& LevelKey, bool bDeepAnchorRelative, const FVector& Anchor,
+     bool* bCellDeferredRecordedPtr)
+ {
++	if (R0EntryDiagnostic::Active) ++R0EntryDiagnostic::Active->Evaluations;
+ 	using namespace VoxelCoords;
+ 	const double ChunkEdge = ChunkEdgeUUForLevel(LevelKey.Level);
+ 	const double CenterX = (double(LevelKey.Key.X) + 0.5) * ChunkEdge;
+@@ -20497,6 +20543,7 @@
+                                                           bool bVolumeNeedsSolid, const FVector& Anchor,
+                                                           int32* OutChunkZMin, int32* OutChunkZMax)
+ {
++	R0EntryDiagnostic::FTimer R0Timer(R0EntryDiagnostic::Footprint);
+ 	using namespace VoxelCoords;
+ 	++ThisFrameLevelFootprints[Level];
+ 	int32 ChunkZMin, ChunkZMax, ChunkZMaxUntrimmed;
+@@ -20582,7 +20629,7 @@
+ 	// re-derive one answer up to a dozen times.
+ 	//
+ 	// No-op unless voxel.Stream.SkyMark is 1; that switch is the control arm.
+-	MarkOpenSkyColumn(Level, Cx, Cy, ChunkZMax);
++	{ R0EntryDiagnostic::FTimer Timer(R0EntryDiagnostic::Sky); MarkOpenSkyColumn(Level, Cx, Cy, ChunkZMax); }
+ 
+ 	// Backlog recording (see DeferredFootprints): one insert per
+ 	// FOOTPRINT per scan, not per rejected chunk -- the Z loop
+@@ -20637,6 +20684,7 @@
+ 		// is counted rather than timed for. zCells/cells collapsing towards 1 is
+ 		// a failing reading: it means the Z range has stopped being a range.
+ 		if (ActiveCensus) { ++ActiveCensus->ZCells; }
++		if (R0EntryDiagnostic::Active) ++R0EntryDiagnostic::Active->ZCells;
+ 		const FVoxelLevelChunkKey CandidateKey{Level, FVoxelChunkKey{Cx, Cy, Cz}};
+ 		bool bBandEmpty = false;
+ 		if (AdmitBand)
+@@ -21673,6 +21721,7 @@
+ 			// over the same set of slices, so they stay one bracket.
+ 			ActiveCensus = &LevelCensusScratch;
+ 		}
++		R0EntryDiagnostic::FEntry R0Profile(Level);
+ 		// Per-CALL, and a split pass is one call: the flag is idempotent across
+ 		// this level's slices (the deferral clear at the bottom reads exactly
+ 		// it), while the COUNT is taken once, by the slice that starts the
+@@ -22388,12 +22437,14 @@
+ 		// then leave nothing for the cells the later slices reach.
+ 		if (bLevelSweptToEnd)
+ 		{
++			R0EntryDiagnostic::FTimer Timer(R0EntryDiagnostic::Nearest);
+ 			CommitNearestAdmitScratch(Level, Anchor);
+ 		}
+ 
+ 		// Levels that early-`continue`d above (anchor still inside the same
+ 		// level-L chunk) leave their entry at 0 -- exactly the "did no work"
+ 		// reading we want.
++		R0Profile.Finish();
+ 		ThisFrameLevelEntryMs[Level] = float((FPlatformTime::Seconds() - LevelT0) * 1000.0);
+ 		MaxLevelEntryMs[Level] = FMath::Max(MaxLevelEntryMs[Level], ThisFrameLevelEntryMs[Level]);
+ 		// Window SUM beside the window max (see AccumFineResidencyMs' doc

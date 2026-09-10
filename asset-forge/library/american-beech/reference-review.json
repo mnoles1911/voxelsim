@@ -1,0 +1,93 @@
+{
+  "species": "american-beech",
+  "status": "passed pilot review",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "findings": [
+    "Accepted for the stylized spring vertical slice: connected low forks replace radial tiers; the mature spreading crown is furnished by small shoots, with sparser juvenile crowns.",
+    "Reviewed all 36 shaded variants: open, woodland and edge forms remain distinct without disconnected crowns. Botanical micro-detail remains limited by 100 mm voxels."
+  ],
+  "reviewed_images": [
+    {
+      "image_id": "7954",
+      "source": "https://plants.ces.ncsu.edu/plants/fagus-grandifolia/",
+      "purpose": "branch structure and crown habit"
+    },
+    {
+      "image_id": "17029",
+      "source": "https://plants.ces.ncsu.edu/plants/fagus-grandifolia/",
+      "purpose": "branch structure and crown habit"
+    }
+  ],
+  "taxon": "fagus-grandifolia",
+  "sources": [
+    "https://plants.ces.ncsu.edu/plants/fagus-grandifolia/"
+  ],
+  "habitat": "canopy",
+  "reviewed_generator": "temperate-shoots-v2",
+  "review_date": "2026-09-07",
+  "assessment": "Initial pilot rejected; v2 replacement requires a new comparison.",
+  "art_baseline": {
+    "season": "spring",
+    "foliage": "Species-appropriate spring foliage and fresh growth; flowering only where appropriate to the species.",
+    "reference_policy": "Use spring photographs for finished color and foliage. Other seasons may inform branch structure only.",
+    "out_of_scope": [
+      "seasonal transitions",
+      "seasonal recoloring"
+    ]
+  },
+  "previous_findings": [
+    "Repeated radial tiers and thin major limbs do not match broad spreading beech scaffolds."
+  ],
+  "generator_digest": "6d0b2c04db2c83b942e5b228219a87f514e03cf06752831f8ac02256fa4cfa85",
+  "pilot_artifacts": {
+    "1": "fefdacb5de559fa03b1b0c0b231cb80a55e872253308f22d0965614eedf40914",
+    "4": "474b00f437dfbafee8a8fc376cf2cec16051d9f66562a362bef50c741c58074b",
+    "7": "8f84ad2c2c0b3b1f60f5237e36400aa3f5a4d4a0ac7c5b3b85677feb9ecfda71"
+  },
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "66dd8f5a7b1b82caa2126a8679b98b9e25da3c00f886067b5b80501ce09a32d6"
+  }
+}

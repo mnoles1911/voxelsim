@@ -1,5 +1,8 @@
 """Dedicated masked material for the opt-in environment LOD prototype."""
 import unreal
+import sys
+from pathlib import Path
+sys.path.insert(0,str(Path(__file__).resolve().parent))
 from vegetation_material_common import add_vegetation
 path='/Game/Voxel/M_VoxelEnvironmentLOD'
 m=unreal.load_asset(path)
@@ -13,7 +16,17 @@ color=mel.create_material_expression(m,unreal.MaterialExpressionVertexColor)
 power=mel.create_material_expression(m,unreal.MaterialExpressionPower)
 power.set_editor_property("const_exponent",2.2)
 assert mel.connect_material_expressions(color,"",power,"Base")
-assert mel.connect_material_property(power,"",unreal.MaterialProperty.MP_BASE_COLOR)
+appearance=mel.create_material_expression(m,unreal.MaterialExpressionScalarParameter)
+appearance.set_editor_property('parameter_name','TreeAppearance');appearance.set_editor_property('default_value',0.)
+decode=mel.create_material_expression(m,unreal.MaterialExpressionCustom)
+decode.set_editor_property('code','float3 exact=float3(C.r<=.04045?C.r/12.92:pow((C.r+.055)/1.055,2.4),C.g<=.04045?C.g/12.92:pow((C.g+.055)/1.055,2.4),C.b<=.04045?C.b/12.92:pow((C.b+.055)/1.055,2.4)); return lerp(Legacy,exact,step(.5,Enabled));')
+decode.set_editor_property('output_type',unreal.CustomMaterialOutputType.CMOT_FLOAT3)
+decode_inputs=[]
+for name in ('C','Legacy','Enabled'):
+    item=unreal.CustomInput();item.set_editor_property('input_name',name);decode_inputs.append(item)
+decode.set_editor_property('inputs',decode_inputs)
+for src,pin in ((color,'C'),(power,'Legacy'),(appearance,'Enabled')):assert mel.connect_material_expressions(src,'',decode,pin)
+assert mel.connect_material_property(decode,"",unreal.MaterialProperty.MP_BASE_COLOR)
 rough=mel.create_material_expression(m,unreal.MaterialExpressionConstant)
 rough.set_editor_property("r",.9)
 assert mel.connect_material_property(rough,"",unreal.MaterialProperty.MP_ROUGHNESS)

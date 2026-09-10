@@ -1,0 +1,88 @@
+{
+  "species": "sweet-chestnut",
+  "status": "passed pilot review",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "findings": [
+    "Broad spreading crown follows the mature specimen, with ascending forks and elongated terminal fans informed by the foliage photograph. Fruit in the reference is excluded from the spring baseline."
+  ],
+  "reviewed_images": [
+    {
+      "image_id": "19600",
+      "source": "https://plants.ces.ncsu.edu/plants/castanea-sativa/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    },
+    {
+      "image_id": "19598",
+      "source": "https://plants.ces.ncsu.edu/plants/castanea-sativa/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    }
+  ],
+  "taxon": "castanea-sativa",
+  "sources": [
+    "https://plants.ces.ncsu.edu/plants/castanea-sativa/"
+  ],
+  "habitat": "canopy",
+  "art_baseline": {
+    "season": "spring",
+    "foliage": "Species-appropriate spring foliage and fresh growth; flowering only where appropriate to the species.",
+    "reference_policy": "Use spring photographs for finished color and foliage. Other seasons may inform branch structure only.",
+    "out_of_scope": [
+      "seasonal transitions",
+      "seasonal recoloring"
+    ]
+  },
+  "generator_digest": "6d0b2c04db2c83b942e5b228219a87f514e03cf06752831f8ac02256fa4cfa85",
+  "review_date": "2026-09-07",
+  "review_scope": "Stylized spring vertical slice; source acceptance is separate from world variant endorsement.",
+  "pilot_artifacts": {
+    "1": "904e8fe3ac6c2b66793e6352d2c45bb07e4d2989f6b49f767b06ebeb8e010ad3",
+    "4": "cfc31411de8d866b9c2795d7d9ec91fe1b15aee69e09b6f695fd023c20ccc8bf",
+    "7": "0040fd4c39d33f04db169fd57bf7d003533e42e3a291b2951dcf509f9e3cb366"
+  },
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "b9ad547b4f2d27c916e1a971f73911f2aeaa7d184490c98197c03abaceb2e159"
+  }
+}

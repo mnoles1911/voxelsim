@@ -9,6 +9,8 @@
 // sequencing arithmetic.
 
 #include "VoxelGpuWorklist.h"
+#include "VoxelAssetColumnAppend.h"
+#include "ProfilingDebugging/CsvProfiler.h"
 
 #include "VoxelGpuWorldGen.h"        // FVoxelGpuColumnSample -- the arena element
 #include "VoxelGpuWorldGenGraph.h"   // AddWorklistColumnPass (the converted Column dispatch)
@@ -56,6 +58,7 @@
 DECLARE_GPU_STAT_NAMED(VoxelStreamWorklist, TEXT("VoxelStreamWorklist"));
 
 DEFINE_LOG_CATEGORY_STATIC(LogVoxelGpuWorklist, Log, All);
+CSV_DEFINE_CATEGORY(VoxelWorklist, true);
 
 // Layout lock against the .ush mirror: 16 dwords, offsets as documented.
 static_assert(offsetof(FVoxelGpuChunkWorkRecord, OriginVx) == 0, "record layout");
@@ -502,6 +505,7 @@ void FVoxelGpuWorklist::SetClaimStageArmed(bool bArmed, FPoolBinder Binder, bool
 
 void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 {
+	CSV_SCOPED_TIMING_STAT(VoxelWorklist, FlushMs);
 	check(IsInGameThread());
 	check(IsInitialized());
 	// Voxelize stage armed: the CELL arena caps how many records one flush
@@ -548,6 +552,26 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 	TArray<uint32> FlushSpans;
 	if (IsAssetStampStageArmed())
 	{
+		CSV_SCOPED_TIMING_STAT(VoxelWorklist, AssetAssemblyMs);
+		// Count only the payloads this consume window will actually use.
+		// Reserving once avoids recopying the accumulated voxel blobs when
+		// each following payload grows the destination arrays.
+		int64 InstanceCount = 0, ColumnCount = 0, SpanCount = 0;
+		for (int32 I = 0; I < Staged.Num(); ++I)
+		{
+			const FVoxelWorklistAssetPayload& P = StagedAssets[I];
+			if (!P.IsEmpty() && Head + uint32(I) - Tail < Take)
+			{
+				InstanceCount += P.Instances.Num();
+				ColumnCount += P.ColStarts.Num();
+				SpanCount += P.Spans.Num();
+			}
+		}
+		checkf(InstanceCount <= MAX_int32 && ColumnCount <= MAX_int32 && SpanCount <= MAX_int32,
+			TEXT("Worklist asset flush exceeds TArray capacity"));
+		FlushInstances.Reserve(int32(InstanceCount));
+		FlushColStarts.Reserve(int32(ColumnCount));
+		FlushSpans.Reserve(int32(SpanCount));
 		for (int32 I = 0; I < Staged.Num(); ++I)
 		{
 			FVoxelWorklistAssetPayload& P = StagedAssets[I];
@@ -568,16 +592,16 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 				Inst.ColStartsBase += ColStartsOffset;
 				FlushInstances.Add(Inst);
 			}
-			for (uint32 CS : P.ColStarts)
-			{
-				FlushColStarts.Add(CS + SpansOffset);   // values index Spans
-			}
+			VoxelAssetColumns::AppendRebased(FlushColStarts, P.ColStarts, SpansOffset);
 			FlushSpans.Append(P.Spans);
 			Staged[I].AssetBase = InstanceBase;
 			Staged[I].LevelFlags |= (1u << 9);
 		}
 	}
-	StagedAssets.Reset();
+	{
+		CSV_SCOPED_TIMING_STAT(VoxelWorklist, PayloadCleanupMs);
+		StagedAssets.Reset();
+	}
 
 	// --- Claim staging (-VoxelGpuWorklistClaim; P3 stage 6) -----------------
 	//
@@ -750,7 +774,7 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 		Proof.ClaimWitnessRecord = GProofClaimWitnessRec.load(std::memory_order_relaxed);
 		GpuClaimEligible = int64(ClaimEligible);
 		Proof.ClaimEligibleOnGpu = ClaimEligible;
-		Proof.ClaimStagedOnHost = CumClaimStaged;
+		Proof.ClaimStagedOnHost = ProofStashClaims;
 		Proof.MalformedOnGpu = GpuBad;
 		Proof.ColumnDwordMismatches = ColMismatch;
 		Proof.ColumnsChecked = ColChecked;
@@ -768,11 +792,10 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 		// --- THE SET-IDENTITY GATE (the one that was missing) ---------------
 		//
 		// The records the GPU claims and the records the host staged for a GPU
-		// claim must be THE SAME SET. Both counters are cumulative and both
-		// are captured at the same flush, so the compare is exact -- with one
-		// allowance: the GPU number is as of the flush whose readback landed,
-		// which is a few flushes behind the host's, so the GPU may be BEHIND.
-		// It may never be AHEAD.
+		// claim must be THE SAME SET. Compare the host snapshot captured with
+		// THIS proof, never the current host counter. A delayed readback is
+		// neither evidence of missing claims nor permission for extra claims.
+		// The snapshot excludes the async claim deferred beyond its copy pass.
 		//
 		// GPU AHEAD OF HOST is the double claim: the flush graph claimed a
 		// slot the batch graph also claims classically, the first grant is
@@ -780,7 +803,7 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 		// Its other face is [brick-gpualloc] `unclaimed` going NEGATIVE --
 		// claims + claimFails exceeding shells, claims with no shell behind
 		// them. The leg that found this read unclaimed = -643,164.
-		if (int64(ClaimEligible) > CumClaimStaged)
+		if (int64(ClaimEligible) > ProofStashClaims)
 		{
 			UE_LOG(LogVoxelGpuWorklist, Error,
 			       TEXT("[gpu-worklist] CLAIM SET MISMATCH: the GPU claimed %u records but ")
@@ -789,18 +812,18 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 			       TEXT("once classically in the batch graph -- and the first grant of each ")
 			       TEXT("pair LEAKS. Cross-check [brick-gpualloc] `unclaimed`: it will be ")
 			       TEXT("negative by about this much. The leg is invalid."),
-			       ClaimEligible, CumClaimStaged, int64(ClaimEligible) - CumClaimStaged);
+			       ClaimEligible, ProofStashClaims, int64(ClaimEligible) - ProofStashClaims);
 		}
-		if (ClaimEligible == 0u && CumClaimStaged > 0)
+		if (int64(ClaimEligible) < ProofStashClaims)
 		{
 			// The other direction, and it is NOT harmless: the host skipped
 			// the batch graph's brick chain for chunks it believed the flush
 			// graph would land. Nothing claimed them; they arrive unwritten.
 			UE_LOG(LogVoxelGpuWorklist, Error,
-			       TEXT("[gpu-worklist] CLAIM STAGE DARK: host staged %lld records for a GPU ")
-			       TEXT("claim and the GPU claimed 0. Those chunks' batch brick chains were ")
+			       TEXT("[gpu-worklist] CLAIM STAGE DARK: proof expects %lld records for a GPU ")
+			       TEXT("claim and the GPU claimed %u. Those chunks' batch brick chains were ")
 			       TEXT("skipped and nothing landed them -- expect holes, not corruption."),
-			       CumClaimStaged);
+			       ProofStashClaims, ClaimEligible);
 		}
 		if (ClaimMismatch > 0)
 		{
@@ -918,7 +941,7 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 			       ProofSeq, GpuConsumed, GpuFold, GpuTail, GpuBad, ColChecked, ColMismatch,
 			       VoxChecked, VoxMismatch, CtChecked, CtMismatch, StampChecked, StampMismatch,
 			       PackChecked, PackMismatch, ClaimChecked, ClaimMismatch,
-			       ClaimEligible, CumClaimStaged);
+			       ClaimEligible, ProofStashClaims);
 			if (GpuBad > 0)
 			{
 				UE_LOG(LogVoxelGpuWorklist, Error,
@@ -947,6 +970,11 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 			ProofStashTail = Tail + Take;
 			ProofStashConsumed = uint32(CumConsumedRecords);
 			ProofStashFold = CumConsumedFold;
+			// The readback follows this flush's HeadClaim, but precedes the
+			// newly deferred async claim. Only consumed staged records carry
+			// claimStaged; queued/unconsumed records never enter this count.
+			ProofStashClaims = CumClaimStaged - (DeferredClaim.bValid ? int64(DeferredClaim.StagedRecords) : 0);
+			check(ProofStashClaims >= 0);
 		}
 	}
 
@@ -1416,6 +1444,7 @@ void FVoxelGpuWorklist::RenderThread_AddGenStages(FRDGBuilder& GraphBuilder,
 			SDispatch.Spans = MakeBlobBuffer(
 				TEXT("Voxel.WorklistAssetSpans"), InWindow.StampSpans.GetData(),
 				uint32(InWindow.StampSpans.Num()), sizeof(uint32));
+			SDispatch.bHasOwnedWinners=InWindow.StampInstances.ContainsByPredicate([](const auto& I){return I.RenderOwned!=0;});
 			SDispatch.bAsyncCompute = bAsyncCompute;
 			VoxelGpuWorldGen::AddWorklistAssetStampPass(GraphBuilder, SDispatch);
 		}

@@ -1,0 +1,88 @@
+{
+  "species": "douglas-fir",
+  "status": "passed pilot review",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "findings": [
+    "Continuous dominant leader, tapering spire and attached irregular bough tiers follow whole-tree and native-habitat photographs. Woodland seeds raise the clear bole."
+  ],
+  "reviewed_images": [
+    {
+      "image_id": "36211",
+      "source": "https://plants.ces.ncsu.edu/plants/pseudotsuga-menziesii/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    },
+    {
+      "image_id": "36216",
+      "source": "https://plants.ces.ncsu.edu/plants/pseudotsuga-menziesii/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    }
+  ],
+  "taxon": "pseudotsuga-menziesii",
+  "sources": [
+    "https://plants.ces.ncsu.edu/plants/pseudotsuga-menziesii/"
+  ],
+  "habitat": "coastal",
+  "art_baseline": {
+    "season": "spring",
+    "foliage": "Species-appropriate spring foliage and fresh growth; flowering only where appropriate to the species.",
+    "reference_policy": "Use spring photographs for finished color and foliage. Other seasons may inform branch structure only.",
+    "out_of_scope": [
+      "seasonal transitions",
+      "seasonal recoloring"
+    ]
+  },
+  "generator_digest": "6d0b2c04db2c83b942e5b228219a87f514e03cf06752831f8ac02256fa4cfa85",
+  "review_date": "2026-09-07",
+  "review_scope": "Stylized spring vertical slice; source acceptance is separate from world variant endorsement.",
+  "pilot_artifacts": {
+    "1": "ec0695848bd0fbc15e7d216b1514a4bf1a091527c58184ce9c3ed8c2e8b6123d",
+    "4": "366108e5591fc48f30ac3b24a3ea4b52bd32a7b35f7bcdbfcd629dc04a3e2a4c",
+    "7": "b4da17830a7f94a6b83215e8f45f28cc3ff04715f767553a76f41aa5edac8d65"
+  },
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "b295ef6b92b6318f74bc52fe9121a23272d8612f8bb7fcdea5d094b213905c26"
+  }
+}

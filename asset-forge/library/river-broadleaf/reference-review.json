@@ -1,0 +1,88 @@
+{
+  "species": "river-broadleaf",
+  "status": "passed pilot review",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "findings": [
+    "Alder-informed riparian archetype uses a leader and spreading secondary forks with attached fine shoots. It is explicitly an authored habitat profile, not an additional taxon."
+  ],
+  "reviewed_images": [
+    {
+      "image_id": "11248",
+      "source": "https://plants.ces.ncsu.edu/plants/alnus-glutinosa/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    },
+    {
+      "image_id": "11250",
+      "source": "https://plants.ces.ncsu.edu/plants/alnus-glutinosa/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    }
+  ],
+  "taxon": "alnus-glutinosa",
+  "sources": [
+    "https://plants.ces.ncsu.edu/plants/alnus-glutinosa/"
+  ],
+  "habitat": "wetland",
+  "art_baseline": {
+    "season": "spring",
+    "foliage": "Species-appropriate spring foliage and fresh growth; flowering only where appropriate to the species.",
+    "reference_policy": "Use spring photographs for finished color and foliage. Other seasons may inform branch structure only.",
+    "out_of_scope": [
+      "seasonal transitions",
+      "seasonal recoloring"
+    ]
+  },
+  "generator_digest": "6d0b2c04db2c83b942e5b228219a87f514e03cf06752831f8ac02256fa4cfa85",
+  "review_date": "2026-09-07",
+  "review_scope": "Stylized spring vertical slice; source acceptance is separate from world variant endorsement.",
+  "pilot_artifacts": {
+    "1": "c9f957050c7dd6f04d163c238fd648ffcb9e2c39e3fc47983ad865fe27b6726b",
+    "4": "ea1c57a3b72432c060d09d88dfa8d05ad5b1ef58edf95e5d9ad080f2812113f8",
+    "7": "dc59e376678b46517bab3b3955e4158b158645a62dbb1423ee0d296b0e19bd5d"
+  },
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "85957c3b77b2651fda7b11a7b6ca5633c175e8d1d6b9aab529798e6ab69637b5"
+  }
+}

@@ -1,0 +1,88 @@
+{
+  "species": "weeping-willow",
+  "status": "passed pilot review",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "findings": [
+    "Broad drooping canopy with hanging fine shoots reaches near ground, supported by an arched scaffold. Ground clipping is fixed; the stem remains connected at every reviewed size."
+  ],
+  "reviewed_images": [
+    {
+      "image_id": "4321",
+      "source": "https://plants.ces.ncsu.edu/plants/salix-babylonica/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    },
+    {
+      "image_id": "4322",
+      "source": "https://plants.ces.ncsu.edu/plants/salix-babylonica/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    }
+  ],
+  "taxon": "salix-babylonica",
+  "sources": [
+    "https://plants.ces.ncsu.edu/plants/salix-babylonica/"
+  ],
+  "habitat": "wetland",
+  "art_baseline": {
+    "season": "spring",
+    "foliage": "Species-appropriate spring foliage and fresh growth; flowering only where appropriate to the species.",
+    "reference_policy": "Use spring photographs for finished color and foliage. Other seasons may inform branch structure only.",
+    "out_of_scope": [
+      "seasonal transitions",
+      "seasonal recoloring"
+    ]
+  },
+  "generator_digest": "6d0b2c04db2c83b942e5b228219a87f514e03cf06752831f8ac02256fa4cfa85",
+  "review_date": "2026-09-07",
+  "review_scope": "Stylized spring vertical slice; source acceptance is separate from world variant endorsement.",
+  "pilot_artifacts": {
+    "1": "ae960d7f729ca98085974aaad082a1bdf6cd3d4b666977e37309527d7bc57799",
+    "4": "9c27cc7d71220ee3fdf6db8ae74881657fad09c264cbbd96f1b943c0261c829a",
+    "7": "2a709af7d29702990895bb48bc33579a213b43711ba467273693a680d8104f00"
+  },
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "6e9bc32df67d3d435b34c65062229b757dd55e94694bb56b95454d99ba5c9498"
+  }
+}

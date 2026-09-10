@@ -1,0 +1,672 @@
+{
+  "status": "passed pilot review",
+  "source": "https://plants.ces.ncsu.edu/plants/dryopteris-filix-mas/",
+  "viewed_photos": [
+    "Dryopteris filix-mas \u00e2\u20ac\u201d Kari Phylaviita",
+    "Dryopteris filix-mas \u00e2\u20ac\u201d Hermann-Falkner-sokol",
+    "Sori detail \u00e2\u20ac\u201d Camelia TWU"
+  ],
+  "findings": "Compared the erect tuft and streamside arching-frond photographs, then all three current sizes and all 36 variants. The final model carries distinct curved rachises, opposite pinnae, and secondary pinnules aligned to the rachis tangent; upright and spreading fronds now coexist instead of horizontal shelves. The 36 variants retain connected bases and varied open silhouettes across 0.42\u20131.05 m heights. At the small end, pinnae merge into voxel ladders; microscopic sori and individual leaflet serrations are intentionally unresolved at 25 mm. Accepted as a stylized spring male fern source, separate from user variant endorsement.",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "batch_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+  ],
+  "generator_digest": "469eb80a96ff218650d2de5e034ba0da10bd3413dd76396da11011fbc09dbda0",
+  "sheet_hash": "87adf906bc05d80245162bce953217dedf7d21d5cc47c167f63de7dbac4ce145",
+  "reviewed_at": 1788840302.1113853,
+  "pilot_hashes": {
+    "1": "1d1b04a870aecd8b348720ed0f65e70daf6fd47a6a0c7c0203748e1def77a4b3",
+    "4": "4b07703d8e1a6558c6e44ff6410914bc2f1401b5afb2006d5aa2fef2dc89b449",
+    "7": "32d7ddc534e0c095aae17be12ebaca15bdd62197982221fd8c72b75101db0bdb"
+  },
+  "profile": "male-fern",
+  "review_date": "2026-09-08",
+  "taxon": "Dryopteris filix-mas",
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "87adf906bc05d80245162bce953217dedf7d21d5cc47c167f63de7dbac4ce145"
+  },
+  "identity_revalidations": [
+    {
+      "previous_digest": "a5fa1eeeea7a03b22eb462bd863f1fcde0411e68dcdf284351be4c34c422540e",
+      "new_digest": "b635e5e97f18ead03d3b0dfbeef27847c9a2ddbea0e2188e57845a97386a424d",
+      "timestamp": 1788840461.04477,
+      "method": "Every saved VXA rebuilt to identical SHA-256; original files and all user decisions preserved",
+      "variants": [
+        {
+          "id": "male-fern-0001",
+          "seed": 1,
+          "hash": "1d1b04a870aecd8b348720ed0f65e70daf6fd47a6a0c7c0203748e1def77a4b3"
+        },
+        {
+          "id": "male-fern-0002",
+          "seed": 2,
+          "hash": "50f1b6899d747cf315d5a57778de060cebebe5661c7d9e40137d0c91025c664f"
+        },
+        {
+          "id": "male-fern-0003",
+          "seed": 3,
+          "hash": "f65ec93f3a3c4d1425067c63d5c309db6568eeec5b768923537218edc397cbec"
+        },
+        {
+          "id": "male-fern-0004",
+          "seed": 4,
+          "hash": "4b07703d8e1a6558c6e44ff6410914bc2f1401b5afb2006d5aa2fef2dc89b449"
+        },
+        {
+          "id": "male-fern-0005",
+          "seed": 5,
+          "hash": "883d7c3b73f59ae1846d63ef21583444d32b4854fb2437028d5d983be8164aa2"
+        },
+        {
+          "id": "male-fern-0006",
+          "seed": 6,
+          "hash": "95ae579b1cd764231a43a88bb080452b3a9c5f742688498bededfac601c9002d"
+        },
+        {
+          "id": "male-fern-0007",
+          "seed": 7,
+          "hash": "32d7ddc534e0c095aae17be12ebaca15bdd62197982221fd8c72b75101db0bdb"
+        },
+        {
+          "id": "male-fern-0008",
+          "seed": 8,
+          "hash": "e94ef6e7f259aa39fa16138e9ee53afec7b462561b8a1e29a3c633bcc44ccba8"
+        },
+        {
+          "id": "male-fern-0009",
+          "seed": 9,
+          "hash": "11af5773447146a2c545c9366710ecf4ea71941fce68b2ddc69bbf3977286fd4"
+        },
+        {
+          "id": "male-fern-0010",
+          "seed": 10,
+          "hash": "b7a7a75668484cf5aacbc5c513b4acf1edd3aeee64860d4799c8152d4ecd31ee"
+        },
+        {
+          "id": "male-fern-0011",
+          "seed": 11,
+          "hash": "bda56401bab145ffd86c7675c34282ece2d578b30b0832482c489b3985d8317f"
+        },
+        {
+          "id": "male-fern-0012",
+          "seed": 12,
+          "hash": "bfe74777bb3d497f0c2a4e1366129e7fcc9ade53fa27caa2e1750dc24ac167c6"
+        },
+        {
+          "id": "male-fern-0013",
+          "seed": 13,
+          "hash": "25f0d312b7e40dcdeadc9ed252d3047a3b71274c807c2e7b4f2ea0b00f20ec19"
+        },
+        {
+          "id": "male-fern-0014",
+          "seed": 14,
+          "hash": "3108d208c880dd0e26c1ecd0e8346907f178b5fec36cec0f9827149d598ac169"
+        },
+        {
+          "id": "male-fern-0015",
+          "seed": 15,
+          "hash": "57c1ee2bd60b61cc11babcafa67f2c8060bc72d4faa1c7a442c79ac08d957f72"
+        },
+        {
+          "id": "male-fern-0016",
+          "seed": 16,
+          "hash": "feb5062f6c057b13a69933d5f3c40ebddd8a2da4d8b98f047ebbdb23787f6feb"
+        },
+        {
+          "id": "male-fern-0017",
+          "seed": 17,
+          "hash": "d5d89e52df820b441f0c0444f8792893a00e7d88d1c2aad9339e68dbde215a93"
+        },
+        {
+          "id": "male-fern-0018",
+          "seed": 18,
+          "hash": "b9d1a9d2b600fa8d736c0b1c4140b9ce9ff85f374f5f42fcee2056487ae61973"
+        },
+        {
+          "id": "male-fern-0019",
+          "seed": 19,
+          "hash": "491310177bae449039e0a27b856c36cc65ed90e0da64ee173aef92ab638c2036"
+        },
+        {
+          "id": "male-fern-0020",
+          "seed": 20,
+          "hash": "38c114f213d2213e5792f4b1d53c862107b813274226231a37aedc93ea1dd183"
+        },
+        {
+          "id": "male-fern-0021",
+          "seed": 21,
+          "hash": "378ee9b15ef1164964c2f7387339582b9d57bb84fec33a1262e242171c6e9166"
+        },
+        {
+          "id": "male-fern-0022",
+          "seed": 22,
+          "hash": "6772d09ded15ce0e1d958c59fd7ef10ebe2f8a8a38ab5329f50912a7edb804ee"
+        },
+        {
+          "id": "male-fern-0023",
+          "seed": 23,
+          "hash": "30f4ede90a36308458664053d7cca1135fe4e75733b3e73e7c5b686b52e1accc"
+        },
+        {
+          "id": "male-fern-0024",
+          "seed": 24,
+          "hash": "ee70bdd7a626b835bd73b19fca0df2de15a33d8f7ed29f650a8f13f47c8ad75a"
+        },
+        {
+          "id": "male-fern-0025",
+          "seed": 25,
+          "hash": "1dcfeec8e1a8d207854b2e55b45388d7117f271beaa3f939945d156aa94b5ced"
+        },
+        {
+          "id": "male-fern-0026",
+          "seed": 26,
+          "hash": "9969e87062954ac1ee19e3c20915867fddb6671415579dfce64575637a81688e"
+        },
+        {
+          "id": "male-fern-0027",
+          "seed": 27,
+          "hash": "676ad4752e49e95da55d31de69cd898278cf8165d5eefd517fb327da71a4b85d"
+        },
+        {
+          "id": "male-fern-0028",
+          "seed": 28,
+          "hash": "4f40b98be97e8085d673c427c8ac2c78ba342692788b146020282566cf1516c5"
+        },
+        {
+          "id": "male-fern-0029",
+          "seed": 29,
+          "hash": "8ea07f5b2b4958baaba8e84bb9bd34f59ef173754a31b7e68341f6ab61002230"
+        },
+        {
+          "id": "male-fern-0030",
+          "seed": 30,
+          "hash": "81ccffcf74d0788e1557b3f938a5149b3402bb83ce5fd8c7a5cb0b8574564249"
+        },
+        {
+          "id": "male-fern-0031",
+          "seed": 31,
+          "hash": "9f13f4d91d6e2aa97dd81a221c4104a78cce9aaaedc02fe2576638cf96cbdcb3"
+        },
+        {
+          "id": "male-fern-0032",
+          "seed": 32,
+          "hash": "bdc20829f12501919693a62a4991227b9463eadea3405d248373cbb207bebca6"
+        },
+        {
+          "id": "male-fern-0033",
+          "seed": 33,
+          "hash": "4abdfbccbc0671aa2c3354003e72aed48f254770f5d1446aea08e6bb3be1808b"
+        },
+        {
+          "id": "male-fern-0034",
+          "seed": 34,
+          "hash": "c7804156bd5f02310dd7d3d63f9b28604a566e94483163e670be443b3f93dcc1"
+        },
+        {
+          "id": "male-fern-0035",
+          "seed": 35,
+          "hash": "e2ec209f1cdaa63b6169228279fb1f0382cef0478552d7cb820b5607b6af9d14"
+        },
+        {
+          "id": "male-fern-0036",
+          "seed": 36,
+          "hash": "90b71c4b7febfdfb38018b3593439c9be29119071e9b14465e2577aafcc2133e"
+        }
+      ]
+    },
+    {
+      "previous_digest": "b635e5e97f18ead03d3b0dfbeef27847c9a2ddbea0e2188e57845a97386a424d",
+      "new_digest": "33a2aaf2bdf29c9cff21dd9a3770b9d59cbbafa845ed9ce1736ef6175bb7e8b9",
+      "timestamp": 1788842529.025159,
+      "method": "Every saved VXA rebuilt to identical SHA-256; original files and all user decisions preserved",
+      "variants": [
+        {
+          "id": "male-fern-0001",
+          "seed": 1,
+          "hash": "1d1b04a870aecd8b348720ed0f65e70daf6fd47a6a0c7c0203748e1def77a4b3"
+        },
+        {
+          "id": "male-fern-0002",
+          "seed": 2,
+          "hash": "50f1b6899d747cf315d5a57778de060cebebe5661c7d9e40137d0c91025c664f"
+        },
+        {
+          "id": "male-fern-0003",
+          "seed": 3,
+          "hash": "f65ec93f3a3c4d1425067c63d5c309db6568eeec5b768923537218edc397cbec"
+        },
+        {
+          "id": "male-fern-0004",
+          "seed": 4,
+          "hash": "4b07703d8e1a6558c6e44ff6410914bc2f1401b5afb2006d5aa2fef2dc89b449"
+        },
+        {
+          "id": "male-fern-0005",
+          "seed": 5,
+          "hash": "883d7c3b73f59ae1846d63ef21583444d32b4854fb2437028d5d983be8164aa2"
+        },
+        {
+          "id": "male-fern-0006",
+          "seed": 6,
+          "hash": "95ae579b1cd764231a43a88bb080452b3a9c5f742688498bededfac601c9002d"
+        },
+        {
+          "id": "male-fern-0007",
+          "seed": 7,
+          "hash": "32d7ddc534e0c095aae17be12ebaca15bdd62197982221fd8c72b75101db0bdb"
+        },
+        {
+          "id": "male-fern-0008",
+          "seed": 8,
+          "hash": "e94ef6e7f259aa39fa16138e9ee53afec7b462561b8a1e29a3c633bcc44ccba8"
+        },
+        {
+          "id": "male-fern-0009",
+          "seed": 9,
+          "hash": "11af5773447146a2c545c9366710ecf4ea71941fce68b2ddc69bbf3977286fd4"
+        },
+        {
+          "id": "male-fern-0010",
+          "seed": 10,
+          "hash": "b7a7a75668484cf5aacbc5c513b4acf1edd3aeee64860d4799c8152d4ecd31ee"
+        },
+        {
+          "id": "male-fern-0011",
+          "seed": 11,
+          "hash": "bda56401bab145ffd86c7675c34282ece2d578b30b0832482c489b3985d8317f"
+        },
+        {
+          "id": "male-fern-0012",
+          "seed": 12,
+          "hash": "bfe74777bb3d497f0c2a4e1366129e7fcc9ade53fa27caa2e1750dc24ac167c6"
+        },
+        {
+          "id": "male-fern-0013",
+          "seed": 13,
+          "hash": "25f0d312b7e40dcdeadc9ed252d3047a3b71274c807c2e7b4f2ea0b00f20ec19"
+        },
+        {
+          "id": "male-fern-0014",
+          "seed": 14,
+          "hash": "3108d208c880dd0e26c1ecd0e8346907f178b5fec36cec0f9827149d598ac169"
+        },
+        {
+          "id": "male-fern-0015",
+          "seed": 15,
+          "hash": "57c1ee2bd60b61cc11babcafa67f2c8060bc72d4faa1c7a442c79ac08d957f72"
+        },
+        {
+          "id": "male-fern-0016",
+          "seed": 16,
+          "hash": "feb5062f6c057b13a69933d5f3c40ebddd8a2da4d8b98f047ebbdb23787f6feb"
+        },
+        {
+          "id": "male-fern-0017",
+          "seed": 17,
+          "hash": "d5d89e52df820b441f0c0444f8792893a00e7d88d1c2aad9339e68dbde215a93"
+        },
+        {
+          "id": "male-fern-0018",
+          "seed": 18,
+          "hash": "b9d1a9d2b600fa8d736c0b1c4140b9ce9ff85f374f5f42fcee2056487ae61973"
+        },
+        {
+          "id": "male-fern-0019",
+          "seed": 19,
+          "hash": "491310177bae449039e0a27b856c36cc65ed90e0da64ee173aef92ab638c2036"
+        },
+        {
+          "id": "male-fern-0020",
+          "seed": 20,
+          "hash": "38c114f213d2213e5792f4b1d53c862107b813274226231a37aedc93ea1dd183"
+        },
+        {
+          "id": "male-fern-0021",
+          "seed": 21,
+          "hash": "378ee9b15ef1164964c2f7387339582b9d57bb84fec33a1262e242171c6e9166"
+        },
+        {
+          "id": "male-fern-0022",
+          "seed": 22,
+          "hash": "6772d09ded15ce0e1d958c59fd7ef10ebe2f8a8a38ab5329f50912a7edb804ee"
+        },
+        {
+          "id": "male-fern-0023",
+          "seed": 23,
+          "hash": "30f4ede90a36308458664053d7cca1135fe4e75733b3e73e7c5b686b52e1accc"
+        },
+        {
+          "id": "male-fern-0024",
+          "seed": 24,
+          "hash": "ee70bdd7a626b835bd73b19fca0df2de15a33d8f7ed29f650a8f13f47c8ad75a"
+        },
+        {
+          "id": "male-fern-0025",
+          "seed": 25,
+          "hash": "1dcfeec8e1a8d207854b2e55b45388d7117f271beaa3f939945d156aa94b5ced"
+        },
+        {
+          "id": "male-fern-0026",
+          "seed": 26,
+          "hash": "9969e87062954ac1ee19e3c20915867fddb6671415579dfce64575637a81688e"
+        },
+        {
+          "id": "male-fern-0027",
+          "seed": 27,
+          "hash": "676ad4752e49e95da55d31de69cd898278cf8165d5eefd517fb327da71a4b85d"
+        },
+        {
+          "id": "male-fern-0028",
+          "seed": 28,
+          "hash": "4f40b98be97e8085d673c427c8ac2c78ba342692788b146020282566cf1516c5"
+        },
+        {
+          "id": "male-fern-0029",
+          "seed": 29,
+          "hash": "8ea07f5b2b4958baaba8e84bb9bd34f59ef173754a31b7e68341f6ab61002230"
+        },
+        {
+          "id": "male-fern-0030",
+          "seed": 30,
+          "hash": "81ccffcf74d0788e1557b3f938a5149b3402bb83ce5fd8c7a5cb0b8574564249"
+        },
+        {
+          "id": "male-fern-0031",
+          "seed": 31,
+          "hash": "9f13f4d91d6e2aa97dd81a221c4104a78cce9aaaedc02fe2576638cf96cbdcb3"
+        },
+        {
+          "id": "male-fern-0032",
+          "seed": 32,
+          "hash": "bdc20829f12501919693a62a4991227b9463eadea3405d248373cbb207bebca6"
+        },
+        {
+          "id": "male-fern-0033",
+          "seed": 33,
+          "hash": "4abdfbccbc0671aa2c3354003e72aed48f254770f5d1446aea08e6bb3be1808b"
+        },
+        {
+          "id": "male-fern-0034",
+          "seed": 34,
+          "hash": "c7804156bd5f02310dd7d3d63f9b28604a566e94483163e670be443b3f93dcc1"
+        },
+        {
+          "id": "male-fern-0035",
+          "seed": 35,
+          "hash": "e2ec209f1cdaa63b6169228279fb1f0382cef0478552d7cb820b5607b6af9d14"
+        },
+        {
+          "id": "male-fern-0036",
+          "seed": 36,
+          "hash": "90b71c4b7febfdfb38018b3593439c9be29119071e9b14465e2577aafcc2133e"
+        }
+      ]
+    },
+    {
+      "previous_digest": "33a2aaf2bdf29c9cff21dd9a3770b9d59cbbafa845ed9ce1736ef6175bb7e8b9",
+      "new_digest": "469eb80a96ff218650d2de5e034ba0da10bd3413dd76396da11011fbc09dbda0",
+      "timestamp": 1788842590.2268858,
+      "method": "Every saved VXA rebuilt to identical SHA-256; original files and all user decisions preserved",
+      "variants": [
+        {
+          "id": "male-fern-0001",
+          "seed": 1,
+          "hash": "1d1b04a870aecd8b348720ed0f65e70daf6fd47a6a0c7c0203748e1def77a4b3"
+        },
+        {
+          "id": "male-fern-0002",
+          "seed": 2,
+          "hash": "50f1b6899d747cf315d5a57778de060cebebe5661c7d9e40137d0c91025c664f"
+        },
+        {
+          "id": "male-fern-0003",
+          "seed": 3,
+          "hash": "f65ec93f3a3c4d1425067c63d5c309db6568eeec5b768923537218edc397cbec"
+        },
+        {
+          "id": "male-fern-0004",
+          "seed": 4,
+          "hash": "4b07703d8e1a6558c6e44ff6410914bc2f1401b5afb2006d5aa2fef2dc89b449"
+        },
+        {
+          "id": "male-fern-0005",
+          "seed": 5,
+          "hash": "883d7c3b73f59ae1846d63ef21583444d32b4854fb2437028d5d983be8164aa2"
+        },
+        {
+          "id": "male-fern-0006",
+          "seed": 6,
+          "hash": "95ae579b1cd764231a43a88bb080452b3a9c5f742688498bededfac601c9002d"
+        },
+        {
+          "id": "male-fern-0007",
+          "seed": 7,
+          "hash": "32d7ddc534e0c095aae17be12ebaca15bdd62197982221fd8c72b75101db0bdb"
+        },
+        {
+          "id": "male-fern-0008",
+          "seed": 8,
+          "hash": "e94ef6e7f259aa39fa16138e9ee53afec7b462561b8a1e29a3c633bcc44ccba8"
+        },
+        {
+          "id": "male-fern-0009",
+          "seed": 9,
+          "hash": "11af5773447146a2c545c9366710ecf4ea71941fce68b2ddc69bbf3977286fd4"
+        },
+        {
+          "id": "male-fern-0010",
+          "seed": 10,
+          "hash": "b7a7a75668484cf5aacbc5c513b4acf1edd3aeee64860d4799c8152d4ecd31ee"
+        },
+        {
+          "id": "male-fern-0011",
+          "seed": 11,
+          "hash": "bda56401bab145ffd86c7675c34282ece2d578b30b0832482c489b3985d8317f"
+        },
+        {
+          "id": "male-fern-0012",
+          "seed": 12,
+          "hash": "bfe74777bb3d497f0c2a4e1366129e7fcc9ade53fa27caa2e1750dc24ac167c6"
+        },
+        {
+          "id": "male-fern-0013",
+          "seed": 13,
+          "hash": "25f0d312b7e40dcdeadc9ed252d3047a3b71274c807c2e7b4f2ea0b00f20ec19"
+        },
+        {
+          "id": "male-fern-0014",
+          "seed": 14,
+          "hash": "3108d208c880dd0e26c1ecd0e8346907f178b5fec36cec0f9827149d598ac169"
+        },
+        {
+          "id": "male-fern-0015",
+          "seed": 15,
+          "hash": "57c1ee2bd60b61cc11babcafa67f2c8060bc72d4faa1c7a442c79ac08d957f72"
+        },
+        {
+          "id": "male-fern-0016",
+          "seed": 16,
+          "hash": "feb5062f6c057b13a69933d5f3c40ebddd8a2da4d8b98f047ebbdb23787f6feb"
+        },
+        {
+          "id": "male-fern-0017",
+          "seed": 17,
+          "hash": "d5d89e52df820b441f0c0444f8792893a00e7d88d1c2aad9339e68dbde215a93"
+        },
+        {
+          "id": "male-fern-0018",
+          "seed": 18,
+          "hash": "b9d1a9d2b600fa8d736c0b1c4140b9ce9ff85f374f5f42fcee2056487ae61973"
+        },
+        {
+          "id": "male-fern-0019",
+          "seed": 19,
+          "hash": "491310177bae449039e0a27b856c36cc65ed90e0da64ee173aef92ab638c2036"
+        },
+        {
+          "id": "male-fern-0020",
+          "seed": 20,
+          "hash": "38c114f213d2213e5792f4b1d53c862107b813274226231a37aedc93ea1dd183"
+        },
+        {
+          "id": "male-fern-0021",
+          "seed": 21,
+          "hash": "378ee9b15ef1164964c2f7387339582b9d57bb84fec33a1262e242171c6e9166"
+        },
+        {
+          "id": "male-fern-0022",
+          "seed": 22,
+          "hash": "6772d09ded15ce0e1d958c59fd7ef10ebe2f8a8a38ab5329f50912a7edb804ee"
+        },
+        {
+          "id": "male-fern-0023",
+          "seed": 23,
+          "hash": "30f4ede90a36308458664053d7cca1135fe4e75733b3e73e7c5b686b52e1accc"
+        },
+        {
+          "id": "male-fern-0024",
+          "seed": 24,
+          "hash": "ee70bdd7a626b835bd73b19fca0df2de15a33d8f7ed29f650a8f13f47c8ad75a"
+        },
+        {
+          "id": "male-fern-0025",
+          "seed": 25,
+          "hash": "1dcfeec8e1a8d207854b2e55b45388d7117f271beaa3f939945d156aa94b5ced"
+        },
+        {
+          "id": "male-fern-0026",
+          "seed": 26,
+          "hash": "9969e87062954ac1ee19e3c20915867fddb6671415579dfce64575637a81688e"
+        },
+        {
+          "id": "male-fern-0027",
+          "seed": 27,
+          "hash": "676ad4752e49e95da55d31de69cd898278cf8165d5eefd517fb327da71a4b85d"
+        },
+        {
+          "id": "male-fern-0028",
+          "seed": 28,
+          "hash": "4f40b98be97e8085d673c427c8ac2c78ba342692788b146020282566cf1516c5"
+        },
+        {
+          "id": "male-fern-0029",
+          "seed": 29,
+          "hash": "8ea07f5b2b4958baaba8e84bb9bd34f59ef173754a31b7e68341f6ab61002230"
+        },
+        {
+          "id": "male-fern-0030",
+          "seed": 30,
+          "hash": "81ccffcf74d0788e1557b3f938a5149b3402bb83ce5fd8c7a5cb0b8574564249"
+        },
+        {
+          "id": "male-fern-0031",
+          "seed": 31,
+          "hash": "9f13f4d91d6e2aa97dd81a221c4104a78cce9aaaedc02fe2576638cf96cbdcb3"
+        },
+        {
+          "id": "male-fern-0032",
+          "seed": 32,
+          "hash": "bdc20829f12501919693a62a4991227b9463eadea3405d248373cbb207bebca6"
+        },
+        {
+          "id": "male-fern-0033",
+          "seed": 33,
+          "hash": "4abdfbccbc0671aa2c3354003e72aed48f254770f5d1446aea08e6bb3be1808b"
+        },
+        {
+          "id": "male-fern-0034",
+          "seed": 34,
+          "hash": "c7804156bd5f02310dd7d3d63f9b28604a566e94483163e670be443b3f93dcc1"
+        },
+        {
+          "id": "male-fern-0035",
+          "seed": 35,
+          "hash": "e2ec209f1cdaa63b6169228279fb1f0382cef0478552d7cb820b5607b6af9d14"
+        },
+        {
+          "id": "male-fern-0036",
+          "seed": 36,
+          "hash": "90b71c4b7febfdfb38018b3593439c9be29119071e9b14465e2577aafcc2133e"
+        }
+      ]
+    }
+  ]
+}

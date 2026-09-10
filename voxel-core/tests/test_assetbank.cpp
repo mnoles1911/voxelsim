@@ -11,6 +11,7 @@
 // not an afternoon.
 
 #include "voxelcore/assetbank.h"
+#include "voxelcore/assetecologybinding.h"
 
 #include <cstdio>
 #include <filesystem>
@@ -146,6 +147,50 @@ VXC_TEST(assetbank_loads_sorted_and_reduces_the_seed_index) {
     CHECK(st.bytesResident > 0);
 }
 
+VXC_TEST(assetbank_exact_filename_does_not_substitute_refused_or_missing_seed){
+    const fs::path root=scratch("exact_name");
+    writeBlob(root/"test-oak"/"test-oak-0001.vxa",tinyTree(MaterialId(16)));
+    writeBlob(root/"test-oak"/"test-oak-0004.vxa",{1,2,3});
+    writeBlob(root/"test-oak"/"test-oak-0007.vxa",tinyTree(MaterialId(18)));
+    AssetManifest manifest;
+    CHECK_EQ(int(manifest.parse(buildVxm({oakRow("test-oak")}))),int(AssetManifestError::kOk));
+    AssetBankLibrary library;library.configure(&manifest,root.string());
+    uint16_t slot=99;const AssetGrid* grid=nullptr;
+    CHECK(library.findSeedByFilename(0,"test-oak-0007.vxa",slot,grid));
+    CHECK_EQ(slot,1);CHECK(grid==library.bankGrid(0,slot));
+    CHECK(!library.findSeedByFilename(0,"test-oak-0004.vxa",slot,grid));CHECK(!grid);CHECK_EQ(slot,0);
+    CHECK(!library.findSeedByFilename(0,"test-oak-9999.vxa",slot,grid));CHECK(!grid);
+    CHECK(!library.findSeedByFilename(0,"../test-oak-0007.vxa",slot,grid));
+    CHECK(!library.findSeedByFilename(9,"test-oak-0007.vxa",slot,grid));
+}
+
+VXC_TEST(ecology_binding_requires_exact_accepted_source_and_is_atomic){
+    const fs::path root=scratch("ecology_binding");
+    writeBlob(root/"test-oak"/"test-oak-0001.vxa",{1,2,3});
+    writeBlob(root/"test-oak"/"test-oak-0007.vxa",tinyTree(MaterialId(16)));
+    AssetManifest manifest;
+    CHECK_EQ(int(manifest.parse(buildVxm({oakRow("test-oak")}))),int(AssetManifestError::kOk));
+    AssetBankLibrary banks;const AssetGrid* observed=nullptr;
+    banks.configure(&manifest,root.string(),[&](const AssetGrid& g,const uint8_t* bytes,size_t size){
+        CHECK(size==tinyTree(MaterialId(16)).size());CHECK(bytes[0]=='V');observed=&g;
+    });
+    EcoNamedSpecies named;named.name="test-oak";named.placement.tree=true;named.placement.stableId=42;
+    named.placement.communityWeights={1000,1000,1000,1000};
+    EcoNamedVariant variant;variant.filename="test-oak-0007.vxa";variant.sourceIdentity="fixture-authorized";
+    variant.placement={7,7,300,false,100,100};named.variants.push_back(variant);
+    EcoPlacementConfig output;std::string error;
+    auto verify=[&](const AssetGrid& grid,const std::string& identity){return &grid==observed&&identity=="fixture-authorized";};
+    CHECK(ecoBindPublished(EcoConfig{},uint16_t(1u<<TEMPERATE_FOREST),{named},manifest,banks,verify,output,error));
+    CHECK_EQ(output.species[0].variants[0].seedIndex,0);
+    CHECK(output.species[0].variants[0].published);
+    named.variants[0].sourceIdentity="wrong-source";
+    CHECK(!ecoBindPublished(EcoConfig{},uint16_t(1u<<TEMPERATE_FOREST),{named},manifest,banks,verify,output,error));
+    CHECK(output.species.empty());CHECK(!error.empty());
+    named.variants[0].sourceIdentity="fixture-authorized";named.variants[0].placement.heightMm=301;
+    CHECK(!ecoBindPublished(EcoConfig{},uint16_t(1u<<TEMPERATE_FOREST),{named},manifest,banks,verify,output,error));
+    CHECK(output.species.empty());
+}
+
 VXC_TEST(assetbank_refuses_by_name_and_still_serves_the_rest) {
     const fs::path root = scratch("refusals");
     // Seed 1 good; seed 2 taller than L1's 34 m cap (341 voxels of trunk);
@@ -237,4 +282,22 @@ VXC_TEST(assetbank_serves_the_file_asset_forge_actually_baked) {
     const AssetBankLibrary::Stats st = lib.stats();
     CHECK_EQ(int(st.filesLoaded), 1);
     CHECK_EQ(int(st.filesRefused), 0);
+}
+
+VXC_TEST(assetbank_source_observer_sees_exact_accepted_bytes_once) {
+    const fs::path root = scratch("source-observer");
+    const auto blob=tinyTree(MaterialId(16));
+    writeBlob(root/"test-oak"/"test-oak-0001.vxa",blob);
+    writeBlob(root/"test-oak"/"test-oak-0002.vxa",std::vector<uint8_t>{1,2,3});
+    AssetManifest m;
+    CHECK_EQ(int(m.parse(buildVxm({oakRow("test-oak",1)}))),int(AssetManifestError::kOk));
+    AssetBankLibrary lib;int calls=0;const AssetGrid* seen=nullptr;
+    lib.configure(&m,root.string(),[&](const AssetGrid& grid,const uint8_t* bytes,size_t size){
+        ++calls;seen=&grid;CHECK(std::vector<uint8_t>(bytes,bytes+size)==blob);
+        CHECK_EQ(int(grid.at(0,0,0)),16);
+    });
+    const auto* grid=lib.bankGrid(0,0);CHECK(grid!=nullptr);CHECK_EQ(grid,seen);
+    CHECK_EQ(lib.bankGrid(0,123),grid);CHECK_EQ(lib.loadSpecies(0),1);CHECK_EQ(calls,1);
+    CHECK_EQ(int(lib.stats().filesRefused),1);
+    lib.configure(&m,root.string());CHECK(lib.bankGrid(0,0)!=nullptr);CHECK_EQ(calls,1);
 }

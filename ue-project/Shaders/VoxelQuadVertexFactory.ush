@@ -24,6 +24,7 @@
 // there because that file is compiled by DXC from tools/compile-shaders.ps1 and
 // this one cannot be -- see the block above GetMaterialPixelParameters.
 #include "/VoxelEarth/VoxelMaterialPalette.ush"
+#include "/VoxelEarth/VoxelQuadAppearance.ush"
 
 // The quad pool and its framing arrive in the VoxelVF uniform buffer, declared
 // by FVoxelQuadVertexFactoryParameters and injected into this shader by the
@@ -82,6 +83,7 @@ struct FVertexFactoryInterpolantsVSToPS
 	// volume's uniforms -- including whatever they hold when GI is off.
 #if NUM_TEX_COORD_INTERPOLATORS > 4
 	float4 VoxelPalette : TEXCOORD2;
+    float4 VoxelAppearance : TEXCOORD3;
 #endif
 };
 
@@ -96,6 +98,7 @@ struct FVertexFactoryIntermediates
 	float3  GIUVW;
 #if NUM_TEX_COORD_INTERPOLATORS > 4
 	float4  VoxelPalette;
+    float4 VoxelAppearance;
 #endif
 
 	FSceneDataIntermediates SceneData;
@@ -161,6 +164,7 @@ FVertexFactoryIntermediates GetVertexFactoryIntermediates(FVertexFactoryInput In
 	// from the uniform buffer instead.
 	float3 ChunkOrigin = VoxelVF.ChunkOriginUU;
 	float ChunkScale = VoxelVF.LevelScale;
+    uint AppearanceChunkId=0u;
 	float2 ChunkClimate = float2(0.5f, 0.5f);
 	// The terrain surface over this chunk as a PLANE, in the chunk's own frame:
 	// ChunkSurfaceZRelUU is its value at the chunk's XY ORIGIN (not its centre --
@@ -174,6 +178,7 @@ FVertexFactoryIntermediates GetVertexFactoryIntermediates(FVertexFactoryInput In
 	if (VoxelVF.PoolMode != 0u)
 	{
 		const uint ChunkId = VoxelVF.QuadChunkIds[QuadIndex];
+        AppearanceChunkId=ChunkId;
 		const float4 Entry = VoxelVF.ChunkOrigins[ChunkId];
 		ChunkOrigin = Entry.xyz;
 		ChunkScale = Entry.w;
@@ -330,8 +335,8 @@ FVertexFactoryIntermediates GetVertexFactoryIntermediates(FVertexFactoryInput In
 		// needs exactly the 24 bits float32 has. This form does not depend on
 		// that coincidence and is cheaper. See VoxelClimateProbe.h.
 		const uint GradBits = (uint)ChunkSurfaceGradPacked;
-		SurfaceDZDX = (float((GradBits >> 12u) & 0xFFFu) - 2048.0f) / 256.0f;
-		SurfaceDZDY = (float(GradBits & 0xFFFu) - 2048.0f) / 256.0f;
+		SurfaceDZDX = (float((GradBits >> 12u) & 0xFFFu) - 2048.0f) / 256.0f; // lint-shader-ub: allow UNSIGNED_UNDERFLOW - explicit float conversion occurs before subtraction
+		SurfaceDZDY = (float(GradBits & 0xFFFu) - 2048.0f) / 256.0f; // lint-shader-ub: allow UNSIGNED_UNDERFLOW - explicit float conversion occurs before subtraction
 	}
 	const float SurfaceZHereRelUU = ChunkSurfaceZRelUU
 		+ SurfaceDZDX * Decoded.PositionUU.x
@@ -452,6 +457,9 @@ FVertexFactoryIntermediates GetVertexFactoryIntermediates(FVertexFactoryInput In
 	// row is black with no variation, and water's own material does not read
 	// these UVs anyway.
 #if NUM_TEX_COORD_INTERPOLATORS > 4
+    const float AppearanceSize=max(VOXEL_SIZE_UU*ChunkScale,1.0f);
+    Intermediates.VoxelAppearance=float4((Decoded.PositionUU-Decoded.Normal*(0.5f*AppearanceSize))/AppearanceSize,
+        float((bWater?0u:AppearanceChunkId)*8u+Axis*2u+(QPositive!=0u?1u:0u)));
 	Intermediates.VoxelPalette = VoxelPalettePack(
 		Decoded.PositionUU,
 		ChunkOrigin,
@@ -555,6 +563,7 @@ FVertexFactoryInterpolantsVSToPS VertexFactoryGetInterpolantsVSToPS(
 	Interpolants.GIUVW = Intermediates.GIUVW;
 #if NUM_TEX_COORD_INTERPOLATORS > 4
 	Interpolants.VoxelPalette = Intermediates.VoxelPalette;
+    Interpolants.VoxelAppearance=Intermediates.VoxelAppearance;
 #endif
 	return Interpolants;
 }
@@ -901,6 +910,13 @@ FMaterialPixelParameters GetMaterialPixelParameters(
 		float3 PaletteRGB;
 		float IsAsset;
 		VoxelPaletteUnpack(Interpolants.VoxelPalette, PaletteRGB, IsAsset);
+        float3 ApprovedRGB;float ApprovedCoverage;
+        uint Material=uint(Interpolants.VoxelPalette.w+0.5f)&255u;
+        if(VoxelQuadSurfaceAppearance(VoxelVF.AppearancePages,VoxelVF.AppearanceSources,VoxelVF.AppearanceRanges,VoxelVF.AppearanceSlots,
+            Interpolants.VoxelAppearance,Material,ddx(Interpolants.VoxelAppearance.xyz),ddy(Interpolants.VoxelAppearance.xyz),ApprovedRGB,ApprovedCoverage)){
+            PaletteRGB=ApprovedRGB;IsAsset=1.0f;
+            clip(ApprovedCoverage-0.5f);
+        }
 		Result.TexCoords[3] = float2(PaletteRGB.r, PaletteRGB.g);
 		Result.TexCoords[4] = float2(PaletteRGB.b, IsAsset);
 	}

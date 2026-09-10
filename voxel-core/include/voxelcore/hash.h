@@ -66,7 +66,8 @@ constexpr uint64_t splitmix64(uint64_t z) {
 //   66..69  assetpolicy.h      CH_ASSET_SPECIES + layer index
 //   70      assetdetail.h      CH_DETAIL_GROUP
 //   71      assetdetail.h      CH_DETAIL_MEMBER
-//   72..    FREE
+//   72..77 assetecology.h     ecological placement fields and selections
+//   78..    FREE
 //
 // HISTORY. CH_CAVE_NODE and CH_CAVE_EDGE originally reused ids 18 and 19 â€”
 // the exact ids CH_ECOTONE_TEMP and CH_ECOTONE_PRECIP already occupied â€” a
@@ -155,6 +156,12 @@ enum HashChannel : uint32_t {
     // rate-separation argument as CH_ASSET_SITE vs CH_ASSET_JITTER.
     CH_DETAIL_GROUP = 70,
     CH_DETAIL_MEMBER = 71,
+    CH_ECO_COMMUNITY = 72,
+    CH_ECO_STRUCTURE = 73,
+    CH_ECO_FEATURE = 74,
+    CH_ECO_PRIORITY = 75,
+    CH_ECO_VARIANT = 76,
+    CH_ECO_COVER = 77,
 };
 
 constexpr uint64_t hash2(uint64_t seed, int64_t x, int64_t y, uint32_t channel) {

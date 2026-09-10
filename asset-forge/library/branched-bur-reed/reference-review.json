@@ -1,0 +1,120 @@
+{
+  "status": "passed pilot review",
+  "source": "https://www.westglamorganflora.org.uk/vascular-plants/sparganium-erectum/",
+  "viewed_photos": [
+    "https://www.westglamorganflora.org.uk/site/assets/files/34062/sparganium_erectum_2_neath_canal_giants_grave_june_2024.800x0.jpg"
+  ],
+  "photo_reviewer": "Astra understory agent actual browser photo inspection",
+  "photo_observations": {
+    "observations": "Charles Hipkin actual June2024 photo viewed: stiff keeled narrow10-30mm leaves, arching outer fans, branching reproductive axis. Spring leafy fans; omit mature June burs. Regional flora describes robust emergent wet-margin shoots.",
+    "viewed_photos": [
+      "https://www.westglamorganflora.org.uk/site/assets/files/34062/sparganium_erectum_2_neath_canal_giants_grave_june_2024.800x0.jpg"
+    ],
+    "source": "https://www.westglamorganflora.org.uk/vascular-plants/sparganium-erectum/"
+  },
+  "findings": "Inspected all36current variants and seeds1/4/7 at small/medium/large scales. Four planar fans with stiff narrow leaves and longer outer tips;40-85cm young spring shoot groups. Omit June burs and mature branched inflorescence. True10-30mm blade widths remain1-2cells.",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "batch_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+  ],
+  "generator_digest": "03ff9fd6246d67ab2a6e04d18cf133ac41e755e0721983405ad251464d51149b",
+  "sheet_hash": "7800c82c1ad6593df097769bac179b38b96958972ca8b9589f5334b97b119aad",
+  "reviewed_at": 1788861145.5164602,
+  "pilot_hashes": {
+    "1": "5e5fde0eb3b504e5c820c8a8ee64dd96fb42c70e1857cc54cca8e5fb133a6c7d",
+    "4": "3334f91b1318baac7d3ade40c77408567c04e80626e8d96680f7e30e232e99c7",
+    "7": "4bca368c1df4339873888545425f83b308933bb4581a5a56a8d635cf1a7c2347"
+  },
+  "profile": "branched-bur-reed",
+  "review_date": "2026-09-08",
+  "additional_sources": [],
+  "reference_catalog_photos": [
+    {
+      "url": "https://www.westglamorganflora.org.uk/site/assets/files/34062/sparganium_erectum_2_neath_canal_giants_grave_june_2024.800x0.jpg",
+      "credit": "Charles Hipkin",
+      "caption": "Actual species photograph"
+    }
+  ],
+  "taxon": "Sparganium erectum",
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "7800c82c1ad6593df097769bac179b38b96958972ca8b9589f5334b97b119aad"
+  }
+}

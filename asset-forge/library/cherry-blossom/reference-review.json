@@ -1,0 +1,88 @@
+{
+  "species": "cherry-blossom",
+  "status": "passed pilot review",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "findings": [
+    "Spreading crown and ascending forks follow the cherry habit references. Coherent blossom accents replace the old alternating-cell checkerboard; all three revised sizes inspected."
+  ],
+  "reviewed_images": [
+    {
+      "image_id": "5719",
+      "source": "https://plants.ces.ncsu.edu/plants/prunus-serrulata/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    },
+    {
+      "image_id": "16563",
+      "source": "https://plants.ces.ncsu.edu/plants/prunus-serrulata/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    }
+  ],
+  "taxon": "prunus-serrulata",
+  "sources": [
+    "https://plants.ces.ncsu.edu/plants/prunus-serrulata/"
+  ],
+  "habitat": "understory-regional",
+  "art_baseline": {
+    "season": "spring",
+    "foliage": "Species-appropriate spring foliage and fresh growth; flowering only where appropriate to the species.",
+    "reference_policy": "Use spring photographs for finished color and foliage. Other seasons may inform branch structure only.",
+    "out_of_scope": [
+      "seasonal transitions",
+      "seasonal recoloring"
+    ]
+  },
+  "generator_digest": "6d0b2c04db2c83b942e5b228219a87f514e03cf06752831f8ac02256fa4cfa85",
+  "review_date": "2026-09-07",
+  "review_scope": "Stylized spring vertical slice; source acceptance is separate from world variant endorsement.",
+  "pilot_artifacts": {
+    "1": "fdb3ee27a376d2309b9685c8412ee064d31f2e3a5d1a4bda8019d4688fc431c9",
+    "4": "04c1ea4a644ff6431bc3b958dfeec164c79f96f821ef215801752e2a36706169",
+    "7": "c8016884e6f14f5f20212fb9896c5cc43c1d02b1b44ed3aad2dc6ead68047675"
+  },
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "7a203bc7130d4d1711db83ef9b7cd567cffdc83914c6c931825a2b1a02594f05"
+  }
+}

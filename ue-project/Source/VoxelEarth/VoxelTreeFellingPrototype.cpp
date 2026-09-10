@@ -19,6 +19,27 @@
 #include "PhysicalMaterials/PhysicalMaterial.h"
 #include "VoxelEarthPlayerController.h"
 
+namespace {
+// Section metadata byte: low two bits are the existing fracture tag;
+// Bits2/3 preserve appearance/needle mode; bit4 explicitly disables cutouts.
+// Legacy zero bit4 retains the existing cutout behavior.
+bool ValidAppearanceFlags(uint8 Flags){return (Flags&~31)==0&&(Flags&3)<=2&&(!(Flags&8)||(Flags&4))&&(!(Flags&16)||(Flags&4));}
+uint8 AppearanceFlags(UProceduralMeshComponent* C,uint8 Cap){
+    float Appearance=0,Needle=0,Cutout=1;
+    if(auto M=C->GetMaterial(0)){
+        M->GetScalarParameterValue(FMaterialParameterInfo(TEXT("TreeAppearance")),Appearance);
+        M->GetScalarParameterValue(FMaterialParameterInfo(TEXT("TreeNeedle")),Needle);
+        M->GetScalarParameterValue(FMaterialParameterInfo(TEXT("FoliageCutout")),Cutout);
+    }
+    return Cap|(Appearance>.5f?4:0)|(Appearance>.5f&&Needle>.5f?8:0)|(Appearance>.5f&&Cutout<.5f?16:0);
+}
+void RestoreAppearanceFlags(UMaterialInstanceDynamic* M,uint8 Flags){
+    M->SetScalarParameterValue(TEXT("TreeAppearance"),(Flags&4)?1.f:0.f);
+    M->SetScalarParameterValue(TEXT("TreeNeedle"),(Flags&8)?1.f:0.f);
+    M->SetScalarParameterValue(TEXT("FoliageCutout"),(Flags&16)?0.f:1.f);
+}
+}
+
 struct FTimberStagedRestore {
     struct FSection {FProcMeshSection Mesh;FTransform Relative;bool Visible=true;uint8 Cap=0;};
     TAtomic<bool> Cancelled{false};
@@ -218,6 +239,7 @@ bool AVoxelFallingTimber::SerializePersistentState(FArchive& Ar,bool GeometryOnl
             auto C=Visuals[I];auto S=C->GetProcMeshSection(0);if(!S)return false;
             SourceSection=S;Relative=C->GetComponentTransform().GetRelativeTransform(Transform);Visible=C->IsVisible();
             Cap=C->ComponentHasTag(TEXT("FractureLowerCap"))?1:C->ComponentHasTag(TEXT("FractureUpperCap"))?2:0;
+            Cap=AppearanceFlags(C,Cap);
         }
         Ar<<Relative<<Visible<<Cap;
         if(Ar.CustomVer(VoxelPackedTimberMesh::VersionKey)>=1){
@@ -227,7 +249,7 @@ bool AVoxelFallingTimber::SerializePersistentState(FArchive& Ar,bool GeometryOnl
             if(!Array(Ar,Section.ProcVertexBuffer,262144,[](FArchive& A,FProcMeshVertex& V){A<<V.Position<<V.Normal<<V.UV0<<V.UV1<<V.Color<<V.Tangent.TangentX<<V.Tangent.bFlipTangentY;}))return false;
             if(!Array(Ar,Section.ProcIndexBuffer,393216,[](FArchive& A,uint32& Index){A<<Index;}))return false;
         }
-        if(Ar.IsError()||Relative.ContainsNaN()||Cap>2||Section.ProcIndexBuffer.Num()%3)return false;
+        if(Ar.IsError()||Relative.ContainsNaN()||!ValidAppearanceFlags(Cap)||Section.ProcIndexBuffer.Num()%3)return false;
         if(Ar.IsLoading()){
             Section.SectionLocalBox=FBox(ForceInit);
             for(auto& V:Section.ProcVertexBuffer){if(V.Position.ContainsNaN()||V.Normal.ContainsNaN()||V.UV0.ContainsNaN()||V.UV1.ContainsNaN()||V.Tangent.TangentX.ContainsNaN())return false;Section.SectionLocalBox+=V.Position;}
@@ -236,7 +258,8 @@ bool AVoxelFallingTimber::SerializePersistentState(FArchive& Ar,bool GeometryOnl
             C->SetWorldTransform(Relative*Transform);C->SetProcMeshSection(0,Section);C->SetCollisionEnabled(ECollisionEnabled::NoCollision);
             auto Base=LoadObject<UMaterialInterface>(nullptr,TEXT("/Game/Voxel/M_VoxelEnvironmentLOD.M_VoxelEnvironmentLOD"));if(!Base)return false;
             auto Mat=UMaterialInstanceDynamic::Create(Base,this);Mat->SetScalarParameterValue(TEXT("WindEnabled"),0);Mat->SetScalarParameterValue(TEXT("Fade"),1);Mat->SetScalarParameterValue(TEXT("Reverse"),0);C->SetMaterial(0,Mat);
-            if(Cap)C->ComponentTags.Add(Cap==1?TEXT("FractureLowerCap"):TEXT("FractureUpperCap"));
+            RestoreAppearanceFlags(Mat,Cap);
+            if(Cap&3)C->ComponentTags.Add((Cap&3)==1?TEXT("FractureLowerCap"):TEXT("FractureUpperCap"));
             Loaded.Add(C);Visibility.Add(Visible);
         }
     }
@@ -316,7 +339,7 @@ void AVoxelFallingTimber::BeginStagedObjectRestore(FVoxelImmutableGeometry Geome
             for(int I=0;I<Count;++I){
                 if(Job->Cancelled.Load())return false;
                 FTimberStagedRestore::FSection Section;G<<Section.Relative<<Section.Visible<<Section.Cap;
-                if(G.IsError()||Section.Relative.ContainsNaN()||Section.Cap>2||!VoxelPackedTimberMesh::Serialize(G,Section.Mesh,nullptr))return false;
+                if(G.IsError()||Section.Relative.ContainsNaN()||!ValidAppearanceFlags(Section.Cap)||!VoxelPackedTimberMesh::Serialize(G,Section.Mesh,nullptr))return false;
                 Section.Mesh.SectionLocalBox=FBox(ForceInit);
                 for(const auto& V:Section.Mesh.ProcVertexBuffer){if(V.Position.ContainsNaN()||V.Normal.ContainsNaN()||V.UV0.ContainsNaN()||V.UV1.ContainsNaN()||V.Tangent.TangentX.ContainsNaN())return false;Section.Mesh.SectionLocalBox+=V.Position;}
                 for(auto Index:Section.Mesh.ProcIndexBuffer)if(Index>=uint32(Section.Mesh.ProcVertexBuffer.Num()))return false;
@@ -340,7 +363,8 @@ bool AVoxelFallingTimber::AdvanceStagedObjectRestore(){
         auto Base=LoadObject<UMaterialInterface>(nullptr,TEXT("/Game/Voxel/M_VoxelEnvironmentLOD.M_VoxelEnvironmentLOD"));if(!Base){CancelStagedObjectRestore();return true;}
         auto& S=Job->Sections[Job->Next++];auto C=NewObject<UProceduralMeshComponent>(this);C->SetupAttachment(Body);C->SetRelativeTransform(S.Relative);C->SetCollisionEnabled(ECollisionEnabled::NoCollision);C->SetVisibility(S.Visible);C->RegisterComponent();C->SetProcMeshSection(0,S.Mesh);
         auto Mat=UMaterialInstanceDynamic::Create(Base,this);Mat->SetScalarParameterValue(TEXT("WindEnabled"),0);Mat->SetScalarParameterValue(TEXT("Fade"),1);Mat->SetScalarParameterValue(TEXT("Reverse"),0);C->SetMaterial(0,Mat);
-        if(S.Cap)C->ComponentTags.Add(S.Cap==1?TEXT("FractureLowerCap"):TEXT("FractureUpperCap"));
+        RestoreAppearanceFlags(Mat,S.Cap);
+        if(S.Cap&3)C->ComponentTags.Add((S.Cap&3)==1?TEXT("FractureLowerCap"):TEXT("FractureUpperCap"));
         Visuals.Add(C);S.Mesh=FProcMeshSection();return true;
     }
     GeometrySnapshot=Job->Geometry;PreparedRestore=Job;StagedRestore.Reset();

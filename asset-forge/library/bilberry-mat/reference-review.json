@@ -1,0 +1,294 @@
+{
+  "status": "passed pilot review",
+  "source": "https://www.wildlifetrusts.org/wildlife-explorer/trees-and-shrubs/bilberry",
+  "viewed_photos": [
+    "Fruiting shoots, twig and leaf structure only - Ben Osbourne"
+  ],
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "batch_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+  ],
+  "findings": "Inspected the photographed low angular twigs and small oval leaves, explicitly excluding the summer berries and surrounding heather from the spring model. Reduced the original overly dense pilot to fewer stools, twigs and 25 mm leaf envelopes, then inspected all three current sizes and 36 variants. The open low shrub silhouettes span 0.23-0.47 m and retain green branch-following foliage. Individual small flowers and leaf teeth are unresolved at 25 mm; no fruit is generated. Accepted as a stylized spring bilberry ground layer, pending user endorsement.",
+  "generator_digest": "8ebaa518388277020cf9033e5fbe3bce984f71bf72f75faecdad671aaf8976ec",
+  "sheet_hash": "4da1e8cd381fe69490f2ef3c4c77245c0996ba448aeff1ddc8612f67925dd793",
+  "reviewed_at": 1788842064.006987,
+  "pilot_hashes": {
+    "1": "79d251fb20720b60db1ff00234e291ccfc0f1ff752acd02f3e858d538d51f8b7",
+    "4": "7c1fb7e5cfc0e07a4d3d78df1d583182b4f5c5fcf146e4a2f8c0555e3c7101fd",
+    "7": "5bf44ad33445324b047e2c64d8cc37a9b11fe19208f97c9ad3373610f5be5dc3"
+  },
+  "profile": "bilberry-mat",
+  "review_date": "2026-09-08",
+  "taxon": "Vaccinium myrtillus",
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "4da1e8cd381fe69490f2ef3c4c77245c0996ba448aeff1ddc8612f67925dd793"
+  },
+  "identity_revalidations": [
+    {
+      "previous_digest": "62f1a826b0b850b347da4f7df4949aaba5afd910dd126df0d8bf26576a5a4e37",
+      "new_digest": "8ebaa518388277020cf9033e5fbe3bce984f71bf72f75faecdad671aaf8976ec",
+      "timestamp": 1788847308.3118691,
+      "method": "Every saved VXA rebuilt to identical SHA-256; original files and all user decisions preserved",
+      "variants": [
+        {
+          "id": "bilberry-mat-0001",
+          "seed": 1,
+          "hash": "79d251fb20720b60db1ff00234e291ccfc0f1ff752acd02f3e858d538d51f8b7"
+        },
+        {
+          "id": "bilberry-mat-0002",
+          "seed": 2,
+          "hash": "c7a52883420dadf8e4f3aeedf22b156c1312b3510d490db6211eba14171aa904"
+        },
+        {
+          "id": "bilberry-mat-0003",
+          "seed": 3,
+          "hash": "50603a3829f543d4184d86d7eb05769e035df1457b6fb5fa9412daab0a6b08f1"
+        },
+        {
+          "id": "bilberry-mat-0004",
+          "seed": 4,
+          "hash": "7c1fb7e5cfc0e07a4d3d78df1d583182b4f5c5fcf146e4a2f8c0555e3c7101fd"
+        },
+        {
+          "id": "bilberry-mat-0005",
+          "seed": 5,
+          "hash": "6a46e5bbb784ddf8a80ff04632935d053bdefd1687a9c57f2c45b8998428df5f"
+        },
+        {
+          "id": "bilberry-mat-0006",
+          "seed": 6,
+          "hash": "5ee8a336709e62a85a5d0235b8825a7e8b5e7b02201f2b58b603f5d9d66e6cd2"
+        },
+        {
+          "id": "bilberry-mat-0007",
+          "seed": 7,
+          "hash": "5bf44ad33445324b047e2c64d8cc37a9b11fe19208f97c9ad3373610f5be5dc3"
+        },
+        {
+          "id": "bilberry-mat-0008",
+          "seed": 8,
+          "hash": "fa834a1311eac9f56a5b4355182e8f926a52442d9ef2e06f4817f4e74432a886"
+        },
+        {
+          "id": "bilberry-mat-0009",
+          "seed": 9,
+          "hash": "4b7e2bc348049f75675cbb147fd0bb302fdd2e32ffba7ba08f8b7b9c48bdfc5f"
+        },
+        {
+          "id": "bilberry-mat-0010",
+          "seed": 10,
+          "hash": "b35d9bb106f4fdf9823c432c39837a74a8e47a83aa0f1824e5b9ecfa33250bae"
+        },
+        {
+          "id": "bilberry-mat-0011",
+          "seed": 11,
+          "hash": "fa0ed44685bed9ec063da405dfcf6150b7c5fae5ab84e0185f3b8605047f8e22"
+        },
+        {
+          "id": "bilberry-mat-0012",
+          "seed": 12,
+          "hash": "e5c91e0b9d178808e6187483fad0a8a5c75a2587952c71edc9d4f5e1338a2863"
+        },
+        {
+          "id": "bilberry-mat-0013",
+          "seed": 13,
+          "hash": "0f798b1532ede5913795595804f0560bb0472756f5289d8767aaa8ec3b568e82"
+        },
+        {
+          "id": "bilberry-mat-0014",
+          "seed": 14,
+          "hash": "5c048b0a6efb158cf29a7dfef29ad514d4f789c3da7f85f356e16f936c93cd78"
+        },
+        {
+          "id": "bilberry-mat-0015",
+          "seed": 15,
+          "hash": "5508848125ef58340e97910901dc6746f1e7743c1d85fbf0036f7d3b3865d9b1"
+        },
+        {
+          "id": "bilberry-mat-0016",
+          "seed": 16,
+          "hash": "d087014154d4baa53234fa4385206c8374ca81c43f7ae38634051fa76eeae5ae"
+        },
+        {
+          "id": "bilberry-mat-0017",
+          "seed": 17,
+          "hash": "e3fed19db2dc79ea2e5c6f4a8b5d7a3ac8aa3a1892ce6c3ee362a4067f3f2e46"
+        },
+        {
+          "id": "bilberry-mat-0018",
+          "seed": 18,
+          "hash": "055ec55b04d0afedc91f17db9499861c6936ad9f11cbefd21ab84ef38609d158"
+        },
+        {
+          "id": "bilberry-mat-0019",
+          "seed": 19,
+          "hash": "a67897f72b5d2f3162350560d3a0cf022bfbd98b0727267f8a14763137655be7"
+        },
+        {
+          "id": "bilberry-mat-0020",
+          "seed": 20,
+          "hash": "b51ab6058474fe949d0eab9368d29379ff06babb33b3969c5d886240921f232d"
+        },
+        {
+          "id": "bilberry-mat-0021",
+          "seed": 21,
+          "hash": "505ad2ef00c2d5dca81a9603763e88ec8df2a2c4a437c2abc2dd2b50e6f294dc"
+        },
+        {
+          "id": "bilberry-mat-0022",
+          "seed": 22,
+          "hash": "b06a4c2fcf6576ec914a82b6c1ee14746a62ea4c213c85fc8bdc949ccb736bfe"
+        },
+        {
+          "id": "bilberry-mat-0023",
+          "seed": 23,
+          "hash": "09a2400ee637bc095954af9c65ee250eb667b58e5941ee1e352b8f4b462fb527"
+        },
+        {
+          "id": "bilberry-mat-0024",
+          "seed": 24,
+          "hash": "2488d2893e243aada8541b1c35a8cdb9a5b9943659924b86f736e02874c900c6"
+        },
+        {
+          "id": "bilberry-mat-0025",
+          "seed": 25,
+          "hash": "251220c3ed8503cd21f8320a8e15d7e8abf798a104f5725a7d008f5810af0e45"
+        },
+        {
+          "id": "bilberry-mat-0026",
+          "seed": 26,
+          "hash": "11e0a6f30636f6e161363cf34b1eaf53882d7bd2e5522861a746623b7d63a7ef"
+        },
+        {
+          "id": "bilberry-mat-0027",
+          "seed": 27,
+          "hash": "770c547b90b0062a44c13fc22a58bfe535ada57e33320a6b748e477637808c17"
+        },
+        {
+          "id": "bilberry-mat-0028",
+          "seed": 28,
+          "hash": "d362aedadc15842fc9e0fc8e6ffb6e597ecb08dc34efbf111f5dba003721848d"
+        },
+        {
+          "id": "bilberry-mat-0029",
+          "seed": 29,
+          "hash": "ae75ba928657efe384cb03083c825e3f7cba9fb99814097cd02764dc3f5ff3ee"
+        },
+        {
+          "id": "bilberry-mat-0030",
+          "seed": 30,
+          "hash": "e507db8dcb6c83809bc9f495ea8ab71aa89ea790590ba470e0481e1b04c4e6f8"
+        },
+        {
+          "id": "bilberry-mat-0031",
+          "seed": 31,
+          "hash": "3fcc8807623bc5a4a603e901d6964962d88a3b31bef4bf689f1377a129eb7310"
+        },
+        {
+          "id": "bilberry-mat-0032",
+          "seed": 32,
+          "hash": "18bc5de99ad7030cf46d3362d38261adbe3bc69cea491b7cf1b1e77fd29f8b5e"
+        },
+        {
+          "id": "bilberry-mat-0033",
+          "seed": 33,
+          "hash": "7c856e2f2a74b642f90787a9066eaae1af78d4ca98f2d013bb132913e4d4d27d"
+        },
+        {
+          "id": "bilberry-mat-0034",
+          "seed": 34,
+          "hash": "0d9513699fe299d6316a9f7ca2910201d15a3612482076a806c14924fff47068"
+        },
+        {
+          "id": "bilberry-mat-0035",
+          "seed": 35,
+          "hash": "6651747e6e63058d5d3105dbd9db883ed348d45a401f167f630e0b98de302b31"
+        },
+        {
+          "id": "bilberry-mat-0036",
+          "seed": 36,
+          "hash": "e4725ebbdbb439a98a70cde3a8e504dfe9ae02c1e8b4f86ca28b249900ad5956"
+        }
+      ]
+    }
+  ]
+}

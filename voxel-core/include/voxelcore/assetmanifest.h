@@ -397,8 +397,10 @@ struct AssetTableBuildStats {
 //
 // `speciesOut[i].bankId` is the species' ROW INDEX IN THE MANIFEST, which is
 // what AssetBankLibrary resolves back to a name and a directory.
+// Explicit world-generation density overrides; habitat gates are untouched.
+struct AssetDensityPolicy { uint16_t bankId=0; uint16_t abundanceQ10=1024; int32_t spacingMm=24000; uint16_t biomeMask=0xffff; };
 AssetTableBuildStats assetSpeciesTableFromManifest(const AssetManifest& m,
-                                                   std::vector<AssetSpecies>& speciesOut);
+    std::vector<AssetSpecies>& speciesOut, const std::vector<AssetDensityPolicy>& policies = {});
 
 // LOWER EACH LAYER'S maxHeightMm TO THE TALLEST THING ACTUALLY FILED ON IT.
 //

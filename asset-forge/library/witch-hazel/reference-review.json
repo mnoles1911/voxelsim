@@ -1,0 +1,151 @@
+{
+  "status": "passed pilot review",
+  "source": "https://plants.ces.ncsu.edu/plants/hamamelis-virginiana/",
+  "viewed_photos": [
+    "H C Williams leaves",
+    "skdavidson spring canopy Brunswick Nature",
+    "Kurt Wagner flowers; excluded for spring"
+  ],
+  "findings": "Broad rounded alternate foliage and fewer spreading main stems match the spring canopy reference. Irregular open 1.6-3.6 m shrubs retain visible branching. Autumn yellow ribbon flowers were viewed but excluded; fine crenation is below 25 mm. Actually compared reference photographs, current seeds 1,4,7 and all 36 variants. Accepted as stylized spring source; user endorsement remains separate.",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "batch_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+  ],
+  "generator_digest": "8ae52ce06fc3310aa3273ed189610cfe451dcdebe4fd1eff40db5a88b947ff7b",
+  "sheet_hash": "609e90f216d10e221ea644abd017685f7b911fa9fec2c98c6a6f7bf0c59074bb",
+  "reviewed_at": 1788850912.653751,
+  "pilot_hashes": {
+    "1": "2636b7ce2131872893139a3d54b1c5a8506dddbe77e5e2ba90c93fee2830b309",
+    "4": "d6c43f078213cc5f74c63201fabc3bd3b6230bc1e0152721f9e904ce0c7be8ef",
+    "7": "26b6b5dda69376824e9bcda1acd80e504d1d8399e4a29f3023b6134bd953de42"
+  },
+  "profile": "witch-hazel",
+  "review_date": "2026-09-08",
+  "additional_sources": [],
+  "reference_catalog_photos": [
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Hamamelis-virginia--H-C-Williams--CC-BY-.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=oLR9qJwuGof0KPBOd97VDX8Uvhc%3D&Expires=1788853960",
+      "caption": "Hamamelis virginiana",
+      "credit": "H. C. Wiliams",
+      "license": "<a href='http://creativecommons.org/licenses/by/2.0/legalcode'>CC BY 2.0</a>",
+      "image_id": "492"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/20200411_120414_HDR_amzvwJVcNdhH.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=K4YkWcXuqiizbdOrMlwvsjS8eBc%3D&Expires=1788853959",
+      "caption": "Hamamelis virginiana canopy in spring Brunswick Nature Park",
+      "credit": "skdavidson",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/2.0/'>CC-BY-SA 2.0</a>",
+      "image_id": "26522"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Hamamelis-virginia--Kurt-Wagner--CC-BY-NC-ND.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=FZGP5VXWOqPTrH6QFaxWrRiXWsI%3D&Expires=1788853959",
+      "caption": "Hamamelis virginiana",
+      "credit": "Kurt Wagner",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc-nd/2.0/legalcode'>CC BY-NC-ND 2.0</a>",
+      "image_id": "4244"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Hamamelis-virginia--broombesoom--CC-BY-NC-ND.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=mZ0dwPkW7ehlmYxyJvxSZaEQDYw%3D&Expires=1788853959",
+      "caption": "Hamamelis virginiana in snow.",
+      "credit": "broombesoom",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc-nd/2.0/legalcode'>CC BY-NC-ND 2.0</a>",
+      "image_id": "7311"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Hamamelis-virginiana_BdsBwFOKorbE.jpe?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=XzI1O58UkXDtYeaZYC7rBWiUg2w%3D&Expires=1788853959",
+      "caption": "Hamamelis virginiana. Bloom detail",
+      "credit": "Debbie Roos",
+      "license": "<a href='http://creativecommons.org/licenses/by/2.0/legalcode'>CC BY 2.0</a>",
+      "image_id": "24300"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Hamamelis_virginiana_Vjdl36Oog7nA.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=DBNBX7FAH4TRnFgSb3Jo2x2DG3w%3D&Expires=1788853959",
+      "caption": "Hamamelis virginiana (Buncombe County, NC)",
+      "credit": "Randy Harter",
+      "license": "<a href='http://creativecommons.org/licenses/by/4.0/legalcode'>CC BY 4.0</a>",
+      "image_id": "27860"
+    }
+  ],
+  "taxon": "Hamamelis virginiana",
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "609e90f216d10e221ea644abd017685f7b911fa9fec2c98c6a6f7bf0c59074bb"
+  }
+}

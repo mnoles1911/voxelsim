@@ -688,7 +688,8 @@ inline bool assetClusterKeeps(uint64_t seed, const AssetLayer& layer, int32_t la
 // leak onto a layer whose bound did not account for it.
 inline bool assetResolveSite(uint64_t seed, const AssetLayer* layers, int layerCount,
                              const AssetSpecies* species, int speciesCount, const AssetSite& site,
-                             const AssetColumnFacts& col, AssetInstance& out) {
+                             const AssetColumnFacts& col, AssetInstance& out,
+                             const uint16_t* clusterIdentities = nullptr) {
     if (!col.known) return false;
     if (layers == nullptr || species == nullptr || speciesCount <= 0) return false;
     if (site.layer < 0 || site.layer >= layerCount || site.layer >= kAssetLayerCount) return false;
@@ -771,7 +772,7 @@ inline bool assetResolveSite(uint64_t seed, const AssetLayer* layers, int layerC
     // so 1000 x 1e6 x 4096 ~ 4e12, comfortably inside int64.
     const AssetSpecies& S = species[chosen];
     const int64_t occ = int64_t(S.occupancyPerMille[col.biome]);
-    if (!assetClusterKeeps(seed, L, site.layer, uint16_t(chosen), S.clusterQ10, site.anchorXMm,
+    if (!assetClusterKeeps(seed, L, site.layer, clusterIdentities?clusterIdentities[chosen]:uint16_t(chosen), S.clusterQ10, site.anchorXMm,
                            site.anchorYMm, site.cellX, site.cellY, int64_t(cap) * occ,
                            1000 * 1000))
         return false;

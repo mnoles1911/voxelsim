@@ -1,0 +1,88 @@
+{
+  "species": "shagbark-hickory",
+  "status": "passed pilot review",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "findings": [
+    "Tall bole and upright divided crown follow the road and woodland specimens. Bark strips are a coarse voxel approximation; compound foliage is represented by attached shoot fans."
+  ],
+  "reviewed_images": [
+    {
+      "image_id": "29973",
+      "source": "https://plants.ces.ncsu.edu/plants/carya-ovata/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    },
+    {
+      "image_id": "4012",
+      "source": "https://plants.ces.ncsu.edu/plants/carya-ovata/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    }
+  ],
+  "taxon": "carya-ovata",
+  "sources": [
+    "https://plants.ces.ncsu.edu/plants/carya-ovata/"
+  ],
+  "habitat": "canopy",
+  "art_baseline": {
+    "season": "spring",
+    "foliage": "Species-appropriate spring foliage and fresh growth; flowering only where appropriate to the species.",
+    "reference_policy": "Use spring photographs for finished color and foliage. Other seasons may inform branch structure only.",
+    "out_of_scope": [
+      "seasonal transitions",
+      "seasonal recoloring"
+    ]
+  },
+  "generator_digest": "6d0b2c04db2c83b942e5b228219a87f514e03cf06752831f8ac02256fa4cfa85",
+  "review_date": "2026-09-07",
+  "review_scope": "Stylized spring vertical slice; source acceptance is separate from world variant endorsement.",
+  "pilot_artifacts": {
+    "1": "ce974fb5a55b4b278d8a54a9d6d42d74b89f3a8bb539cf64dbbf8adcf298cd2a",
+    "4": "8017b5ce75c3aab2dbc9d0f844fa22275a493ac1a5b53208a947c125ae27ce27",
+    "7": "ab263ae0a5201e15c12be90cc6deade8dadc196c2674bafd3feb9ab8052437a8"
+  },
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "8ad53114671447017f37430ac018b2408aa83ec8c10e61de2269df6f7f4fef7b"
+  }
+}

@@ -1,0 +1,483 @@
+{
+  "status": "passed pilot review",
+  "source": "https://plants.ces.ncsu.edu/plants/buxus-sempervirens/",
+  "viewed_photos": [
+    "Whole plant/leaf detail - Leonora Enking",
+    "Form - Leonora (Ellie) Enking"
+  ],
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "batch_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+  ],
+  "findings": "Compared small rounded evergreen leaves and dense shrub form photographs, then all current three-size pilots and 36 variants. The displayed Fastigiata cultivar was excluded from the natural silhouette decision; the hedge photograph informs density rather than clipping. Added numerous fine terminal shoots, thinner green young twigs and smaller main stems after the first pilot looked brown and bare. Current irregular untrimmed outlines span 1.15-2.42 m and retain dense twig-following leaf cover without spherical blobs. Opposite phyllotaxy and tiny spring flowers are not individually legible at 25 mm; the source is accepted as a stylized natural box shrub, with user variant endorsement separate.",
+  "generator_digest": "a819b1b51a5bc2b58496f14cbe0d0c617dfe261b20ba27e9f84d6f0e69366d7a",
+  "sheet_hash": "d4abe766c561b8fe9a123903a0621af70cb8effdf91bd353bf80feb235ac6f98",
+  "reviewed_at": 1788841359.3419962,
+  "pilot_hashes": {
+    "1": "9de95d1c35aed0b4e087df67ce7a9b62eb7ddc44888e5c04aaab6aa643e0ee7b",
+    "4": "dc864c0a90222aabdbbc836c8a453c5fd3f9e575fa997e5323981e2a00823b83",
+    "7": "a1ad96d023b1ece5e729fe2fc159e8be755ae1c1096f2b047d15b6a1b4be4fe8"
+  },
+  "profile": "box",
+  "review_date": "2026-09-08",
+  "taxon": "Buxus sempervirens",
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "d4abe766c561b8fe9a123903a0621af70cb8effdf91bd353bf80feb235ac6f98"
+  },
+  "identity_revalidations": [
+    {
+      "previous_digest": "951854f1ec0531834775db192f38e51ec7c37b4989606b24d482cb06e98a494d",
+      "new_digest": "0e03c3e14cce7d84696408672a955dc335ee525ab8904c52aaa92f7f026ff208",
+      "timestamp": 1788841891.1429114,
+      "method": "Every saved VXA rebuilt to identical SHA-256; original files and all user decisions preserved",
+      "variants": [
+        {
+          "id": "box-0001",
+          "seed": 1,
+          "hash": "9de95d1c35aed0b4e087df67ce7a9b62eb7ddc44888e5c04aaab6aa643e0ee7b"
+        },
+        {
+          "id": "box-0002",
+          "seed": 2,
+          "hash": "bc4d786a27b0870c10958ebec78dc0c59691221f4e3a16169b00cb3052e1c9f1"
+        },
+        {
+          "id": "box-0003",
+          "seed": 3,
+          "hash": "ec091d37eb6a58050b03dd99d63eb83f16f5f51659ad9238bcc251c68c76a9fa"
+        },
+        {
+          "id": "box-0004",
+          "seed": 4,
+          "hash": "dc864c0a90222aabdbbc836c8a453c5fd3f9e575fa997e5323981e2a00823b83"
+        },
+        {
+          "id": "box-0005",
+          "seed": 5,
+          "hash": "d6311b6a834a076d995fbf22178eceab90648ef7ccccf392af0551cd2ca46b0f"
+        },
+        {
+          "id": "box-0006",
+          "seed": 6,
+          "hash": "3d830f71200a4dbee751748055b756a9ca630408fe7943793743e1330cc435fd"
+        },
+        {
+          "id": "box-0007",
+          "seed": 7,
+          "hash": "a1ad96d023b1ece5e729fe2fc159e8be755ae1c1096f2b047d15b6a1b4be4fe8"
+        },
+        {
+          "id": "box-0008",
+          "seed": 8,
+          "hash": "ef57ed7f515e75d645c8ad4d31522d83ca6c6fbfe60a08b32277b47032c49c71"
+        },
+        {
+          "id": "box-0009",
+          "seed": 9,
+          "hash": "ec5c427fc4df8d70889167100d92f9ce5b47e20749e9e0c4991651d4e7b9315e"
+        },
+        {
+          "id": "box-0010",
+          "seed": 10,
+          "hash": "2ace781700c515c716df49c67fa0cab4a5a956e4bc50ace86821995894dba5ba"
+        },
+        {
+          "id": "box-0011",
+          "seed": 11,
+          "hash": "7b5b4791dcf0b6e5330b0d9d6252e746525b96bca553ac5af86fd09c6ea20ba6"
+        },
+        {
+          "id": "box-0012",
+          "seed": 12,
+          "hash": "78ae2c5947054a02e39422863ec87fd443a211c0b79d5c0a8633e8c9ad56d6ce"
+        },
+        {
+          "id": "box-0013",
+          "seed": 13,
+          "hash": "08bbcf0a701038dad9b8b253305e96d99dc3df62c590c375b3376fbd9f6ffc1c"
+        },
+        {
+          "id": "box-0014",
+          "seed": 14,
+          "hash": "6d3406e1978ff6d1ec6033e6237ab4273de24cdbb7b7c9630e14193080a5ee57"
+        },
+        {
+          "id": "box-0015",
+          "seed": 15,
+          "hash": "f3b1845992b31f1871dbfc665e3d1cf28ddec5064f1b8af71d6c4959bc53cd30"
+        },
+        {
+          "id": "box-0016",
+          "seed": 16,
+          "hash": "d49e267a511f8a99fd8ffee5f9f43256083f8734484e872d0363063ee0807a82"
+        },
+        {
+          "id": "box-0017",
+          "seed": 17,
+          "hash": "f69de0ad336f8778dd46c6b29d85c0bca2ce6d444d556586d07144ca759f6083"
+        },
+        {
+          "id": "box-0018",
+          "seed": 18,
+          "hash": "a3096d2c6dca94da51f248e4b76ca56369df4006976b7348ecec1463b7af91f0"
+        },
+        {
+          "id": "box-0019",
+          "seed": 19,
+          "hash": "ec44acbda867bea070fbb912eb2a3761160ba28de7975052967942fc8f87bb5e"
+        },
+        {
+          "id": "box-0020",
+          "seed": 20,
+          "hash": "951fc7160b5d3bdd0cce6aeafd12a1b9b01fcbdcec7aa96f04e0b7a7981187e0"
+        },
+        {
+          "id": "box-0021",
+          "seed": 21,
+          "hash": "6f6e107fc4240876ecf7fbfa875e3523c4fb7fd38376643562f920b49f1fd4b9"
+        },
+        {
+          "id": "box-0022",
+          "seed": 22,
+          "hash": "3a1a9bfbc544ff8edc9b2bece9a9fe4ef9544dbb8e22655b8c05700d021a6e5c"
+        },
+        {
+          "id": "box-0023",
+          "seed": 23,
+          "hash": "07c2be18a7060ce865817b28efd2c2ba2e867c634124c737f7d6885ca561cc1b"
+        },
+        {
+          "id": "box-0024",
+          "seed": 24,
+          "hash": "156f1051eb728fc133a2e8be9aee163356a4a4837a42078b27c1edf0487230d8"
+        },
+        {
+          "id": "box-0025",
+          "seed": 25,
+          "hash": "25da9490b24e68a064068e70b80d038a63f1b5c19ca17e1cae826c43173aaf3c"
+        },
+        {
+          "id": "box-0026",
+          "seed": 26,
+          "hash": "a4094ccbf18375a54dbfc4f56370ed82281b9747735a442bda10aec3c53a9fe9"
+        },
+        {
+          "id": "box-0027",
+          "seed": 27,
+          "hash": "3d6267b5dbf25ebc26f9c936242a5dff7b9c5862a3f74337c57663c0bf6cff77"
+        },
+        {
+          "id": "box-0028",
+          "seed": 28,
+          "hash": "0a93df637a1d44371fb12667e9772f09dd5ba8030e65b39363223f52659f4e2c"
+        },
+        {
+          "id": "box-0029",
+          "seed": 29,
+          "hash": "a2cbe212a6194269552de2d4249e5b4a8b4fae434eb19ae3a8c9b8462a28de65"
+        },
+        {
+          "id": "box-0030",
+          "seed": 30,
+          "hash": "f7a7fc1577af22add41468ba3a908a801b7d9971ace1a65cff5678bdbe4fc14c"
+        },
+        {
+          "id": "box-0031",
+          "seed": 31,
+          "hash": "fdb158b92837777aaf4cac73a6881be8574ad1b76df94152f806695f6642281e"
+        },
+        {
+          "id": "box-0032",
+          "seed": 32,
+          "hash": "d72ee2c89c8801870ff4ef9c0e87cc6178692ddd00923dd60e4c30ee04ab70ec"
+        },
+        {
+          "id": "box-0033",
+          "seed": 33,
+          "hash": "6a4c1ed282bcbf185bfc806c90f9d8f8657fbe3207fb28293ff3c935ee5c73ff"
+        },
+        {
+          "id": "box-0034",
+          "seed": 34,
+          "hash": "4eae62e2e12edc82c1dbd45b822a8ce0b3bae77398e75a60f10178f267bd903d"
+        },
+        {
+          "id": "box-0035",
+          "seed": 35,
+          "hash": "993f48f6ba522c92763faf7cae6d1a7d95f41b906cc131ed8234662e6b3cb012"
+        },
+        {
+          "id": "box-0036",
+          "seed": 36,
+          "hash": "9b0b2e3302fd7ebe1e230beb984017e470651bce4f0c8d38d9f15a2be7f79fd3"
+        }
+      ]
+    },
+    {
+      "previous_digest": "0e03c3e14cce7d84696408672a955dc335ee525ab8904c52aaa92f7f026ff208",
+      "new_digest": "a819b1b51a5bc2b58496f14cbe0d0c617dfe261b20ba27e9f84d6f0e69366d7a",
+      "timestamp": 1788847284.7302785,
+      "method": "Every saved VXA rebuilt to identical SHA-256; original files and all user decisions preserved",
+      "variants": [
+        {
+          "id": "box-0001",
+          "seed": 1,
+          "hash": "9de95d1c35aed0b4e087df67ce7a9b62eb7ddc44888e5c04aaab6aa643e0ee7b"
+        },
+        {
+          "id": "box-0002",
+          "seed": 2,
+          "hash": "bc4d786a27b0870c10958ebec78dc0c59691221f4e3a16169b00cb3052e1c9f1"
+        },
+        {
+          "id": "box-0003",
+          "seed": 3,
+          "hash": "ec091d37eb6a58050b03dd99d63eb83f16f5f51659ad9238bcc251c68c76a9fa"
+        },
+        {
+          "id": "box-0004",
+          "seed": 4,
+          "hash": "dc864c0a90222aabdbbc836c8a453c5fd3f9e575fa997e5323981e2a00823b83"
+        },
+        {
+          "id": "box-0005",
+          "seed": 5,
+          "hash": "d6311b6a834a076d995fbf22178eceab90648ef7ccccf392af0551cd2ca46b0f"
+        },
+        {
+          "id": "box-0006",
+          "seed": 6,
+          "hash": "3d830f71200a4dbee751748055b756a9ca630408fe7943793743e1330cc435fd"
+        },
+        {
+          "id": "box-0007",
+          "seed": 7,
+          "hash": "a1ad96d023b1ece5e729fe2fc159e8be755ae1c1096f2b047d15b6a1b4be4fe8"
+        },
+        {
+          "id": "box-0008",
+          "seed": 8,
+          "hash": "ef57ed7f515e75d645c8ad4d31522d83ca6c6fbfe60a08b32277b47032c49c71"
+        },
+        {
+          "id": "box-0009",
+          "seed": 9,
+          "hash": "ec5c427fc4df8d70889167100d92f9ce5b47e20749e9e0c4991651d4e7b9315e"
+        },
+        {
+          "id": "box-0010",
+          "seed": 10,
+          "hash": "2ace781700c515c716df49c67fa0cab4a5a956e4bc50ace86821995894dba5ba"
+        },
+        {
+          "id": "box-0011",
+          "seed": 11,
+          "hash": "7b5b4791dcf0b6e5330b0d9d6252e746525b96bca553ac5af86fd09c6ea20ba6"
+        },
+        {
+          "id": "box-0012",
+          "seed": 12,
+          "hash": "78ae2c5947054a02e39422863ec87fd443a211c0b79d5c0a8633e8c9ad56d6ce"
+        },
+        {
+          "id": "box-0013",
+          "seed": 13,
+          "hash": "08bbcf0a701038dad9b8b253305e96d99dc3df62c590c375b3376fbd9f6ffc1c"
+        },
+        {
+          "id": "box-0014",
+          "seed": 14,
+          "hash": "6d3406e1978ff6d1ec6033e6237ab4273de24cdbb7b7c9630e14193080a5ee57"
+        },
+        {
+          "id": "box-0015",
+          "seed": 15,
+          "hash": "f3b1845992b31f1871dbfc665e3d1cf28ddec5064f1b8af71d6c4959bc53cd30"
+        },
+        {
+          "id": "box-0016",
+          "seed": 16,
+          "hash": "d49e267a511f8a99fd8ffee5f9f43256083f8734484e872d0363063ee0807a82"
+        },
+        {
+          "id": "box-0017",
+          "seed": 17,
+          "hash": "f69de0ad336f8778dd46c6b29d85c0bca2ce6d444d556586d07144ca759f6083"
+        },
+        {
+          "id": "box-0018",
+          "seed": 18,
+          "hash": "a3096d2c6dca94da51f248e4b76ca56369df4006976b7348ecec1463b7af91f0"
+        },
+        {
+          "id": "box-0019",
+          "seed": 19,
+          "hash": "ec44acbda867bea070fbb912eb2a3761160ba28de7975052967942fc8f87bb5e"
+        },
+        {
+          "id": "box-0020",
+          "seed": 20,
+          "hash": "951fc7160b5d3bdd0cce6aeafd12a1b9b01fcbdcec7aa96f04e0b7a7981187e0"
+        },
+        {
+          "id": "box-0021",
+          "seed": 21,
+          "hash": "6f6e107fc4240876ecf7fbfa875e3523c4fb7fd38376643562f920b49f1fd4b9"
+        },
+        {
+          "id": "box-0022",
+          "seed": 22,
+          "hash": "3a1a9bfbc544ff8edc9b2bece9a9fe4ef9544dbb8e22655b8c05700d021a6e5c"
+        },
+        {
+          "id": "box-0023",
+          "seed": 23,
+          "hash": "07c2be18a7060ce865817b28efd2c2ba2e867c634124c737f7d6885ca561cc1b"
+        },
+        {
+          "id": "box-0024",
+          "seed": 24,
+          "hash": "156f1051eb728fc133a2e8be9aee163356a4a4837a42078b27c1edf0487230d8"
+        },
+        {
+          "id": "box-0025",
+          "seed": 25,
+          "hash": "25da9490b24e68a064068e70b80d038a63f1b5c19ca17e1cae826c43173aaf3c"
+        },
+        {
+          "id": "box-0026",
+          "seed": 26,
+          "hash": "a4094ccbf18375a54dbfc4f56370ed82281b9747735a442bda10aec3c53a9fe9"
+        },
+        {
+          "id": "box-0027",
+          "seed": 27,
+          "hash": "3d6267b5dbf25ebc26f9c936242a5dff7b9c5862a3f74337c57663c0bf6cff77"
+        },
+        {
+          "id": "box-0028",
+          "seed": 28,
+          "hash": "0a93df637a1d44371fb12667e9772f09dd5ba8030e65b39363223f52659f4e2c"
+        },
+        {
+          "id": "box-0029",
+          "seed": 29,
+          "hash": "a2cbe212a6194269552de2d4249e5b4a8b4fae434eb19ae3a8c9b8462a28de65"
+        },
+        {
+          "id": "box-0030",
+          "seed": 30,
+          "hash": "f7a7fc1577af22add41468ba3a908a801b7d9971ace1a65cff5678bdbe4fc14c"
+        },
+        {
+          "id": "box-0031",
+          "seed": 31,
+          "hash": "fdb158b92837777aaf4cac73a6881be8574ad1b76df94152f806695f6642281e"
+        },
+        {
+          "id": "box-0032",
+          "seed": 32,
+          "hash": "d72ee2c89c8801870ff4ef9c0e87cc6178692ddd00923dd60e4c30ee04ab70ec"
+        },
+        {
+          "id": "box-0033",
+          "seed": 33,
+          "hash": "6a4c1ed282bcbf185bfc806c90f9d8f8657fbe3207fb28293ff3c935ee5c73ff"
+        },
+        {
+          "id": "box-0034",
+          "seed": 34,
+          "hash": "4eae62e2e12edc82c1dbd45b822a8ce0b3bae77398e75a60f10178f267bd903d"
+        },
+        {
+          "id": "box-0035",
+          "seed": 35,
+          "hash": "993f48f6ba522c92763faf7cae6d1a7d95f41b906cc131ed8234662e6b3cb012"
+        },
+        {
+          "id": "box-0036",
+          "seed": 36,
+          "hash": "9b0b2e3302fd7ebe1e230beb984017e470651bce4f0c8d38d9f15a2be7f79fd3"
+        }
+      ]
+    }
+  ]
+}

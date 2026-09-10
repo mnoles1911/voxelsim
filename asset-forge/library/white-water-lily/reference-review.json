@@ -1,0 +1,157 @@
+{
+  "status": "passed pilot review",
+  "source": "https://www.wildlifetrusts.org/wildlife-explorer/wildflowers/white-water-lily",
+  "viewed_photos": [
+    "https://www.wildlifetrusts.org/sites/default/files/styles/spotlight_default/public/2018-01/White_Water_Lily2%2C_Derbyshire%2C_Philip_Precey.JPG?h=4a7d4be1&itok=SPoZEMzk",
+    "https://botany.cz/foto3/lekninherb4.jpg",
+    "https://botany.cz/foto3/lekninherb2.jpg"
+  ],
+  "photo_reviewer": "Astra root actual photo review; understory agent geometry comparison",
+  "photo_observations": {
+    "species": "white-water-lily",
+    "taxon": "Nymphaea alba",
+    "source": "https://www.wildlifetrusts.org/wildlife-explorer/wildflowers/white-water-lily",
+    "additional_sources": [
+      "https://botany.cz/cs/nymphaea-alba/"
+    ],
+    "photos": [
+      {
+        "url": "https://www.wildlifetrusts.org/sites/default/files/styles/spotlight_default/public/2018-01/White_Water_Lily2%2C_Derbyshire%2C_Philip_Precey.JPG?h=4a7d4be1&itok=SPoZEMzk",
+        "credit": "Philip Precey",
+        "caption": "White many-petalled flower"
+      },
+      {
+        "url": "https://botany.cz/foto3/lekninherb4.jpg",
+        "credit": "BOTANY.cz; article V\u00c3\u00adt Grulich, individual photographer not verified",
+        "caption": "Flower and notched pads"
+      },
+      {
+        "url": "https://botany.cz/foto3/lekninherb2.jpg",
+        "credit": "BOTANY.cz; article V\u00c3\u00adt Grulich, individual photographer not verified",
+        "caption": "Whole floating colony"
+      }
+    ],
+    "viewed_photos": true,
+    "observations": "Broad elliptic rounded pads with deep basal cuts lie at surface, with occasional lifted edges and water gaps. Flowers are smaller than pads, white layered cups, yellow centers. Not elevated bowls of leaves.",
+    "metric_notes": "BOTANY pads usually25\u00e2\u20ac\u201c30cm long by24\u00e2\u20ac\u201c27cm wide, broader extremes16\u00e2\u20ac\u201c38cm. Flowers up to10cm. Rooting water depth70\u00e2\u20ac\u201c150cm is not emergent plant height.",
+    "spring_notes": "Wildlife Trusts June\u00e2\u20ac\u201cAugust; BOTANY May\u00e2\u20ac\u201cAugust allows mild late-spring bloom. Conservative leafy spring stage is valid; if retaining flowers document May basis and keep sparse rather than summer blanket.",
+    "voxel_implications": "25mm resolves pad notch and6\u00e2\u20ac\u201c15cell dimensions. Preserve thin pad planes and gaps. Underwater petioles/roots must not lift pads into a terrestrial shrub."
+  },
+  "findings": "Inspected all36current variants and seeds1/4/7 at small/medium/large scales. Five broad notched green pads16-30cm across at5cm waterline depth, varied spacing and overlap. Conservative spring leaf-only despite regional May bloom possibility. Submerged attachment links are simplified; full-depth petioles omitted.",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "batch_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+  ],
+  "generator_digest": "9136ab945d39f2a02308023c400e87fc183e3062bed350bf182145401bd94c88",
+  "sheet_hash": "6bef343753ece9cb6a66d23fa5d0d23551603334996105de4aadd037c184a4b8",
+  "reviewed_at": 1788861146.4078138,
+  "pilot_hashes": {
+    "1": "9550820d2a5e45ec820c3e5546dc51f41be3dbbfa3f840ef46ce60ec9e7be209",
+    "4": "6ac04b14fa87196da643bcf78952f38c64ef0fd07d67c7539b85bf53b168b9df",
+    "7": "f178c147018abc92c320c394b0cf217092e70d02fabfa5050139c72da47b888d"
+  },
+  "profile": "white-water-lily",
+  "review_date": "2026-09-08",
+  "additional_sources": [
+    "https://botany.cz/cs/nymphaea-alba/"
+  ],
+  "reference_catalog_photos": [
+    {
+      "url": "https://www.wildlifetrusts.org/sites/default/files/styles/spotlight_default/public/2018-01/White_Water_Lily2%2C_Derbyshire%2C_Philip_Precey.JPG?h=4a7d4be1&itok=SPoZEMzk",
+      "credit": "Philip Precey",
+      "caption": "White many-petalled flower"
+    },
+    {
+      "url": "https://botany.cz/foto3/lekninherb4.jpg",
+      "credit": "BOTANY.cz; article V\u00c3\u00adt Grulich, individual photographer not verified",
+      "caption": "Flower and notched pads"
+    },
+    {
+      "url": "https://botany.cz/foto3/lekninherb2.jpg",
+      "credit": "BOTANY.cz; article V\u00c3\u00adt Grulich, individual photographer not verified",
+      "caption": "Whole floating colony"
+    }
+  ],
+  "taxon": "Nymphaea alba",
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "6bef343753ece9cb6a66d23fa5d0d23551603334996105de4aadd037c184a4b8"
+  }
+}

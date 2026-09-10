@@ -105,6 +105,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <sstream>
 #include <optional>
 #include <string>
 #include <thread>
@@ -290,7 +292,7 @@ std::string jsonEsc(const std::string& s) {
 } // namespace
 
 int main(int argc, char** argv) {
-    std::string fineDir, zstdPath, jsonPath, regionName;
+    std::string fineDir, zstdPath, jsonPath, regionName, ecologyCsv;
     int64_t strideM = 30;
     int threads = static_cast<int>(std::thread::hardware_concurrency());
     if (threads < 1) threads = 1;
@@ -309,6 +311,8 @@ int main(int argc, char** argv) {
         };
         if (!std::strcmp(a, "--fine-dir"))
             fineDir = need(a);
+        else if (!std::strcmp(a, "--ecology-csv"))
+            ecologyCsv = need(a);
         else if (!std::strcmp(a, "--zstd"))
             zstdPath = need(a);
         else if (!std::strcmp(a, "--json"))
@@ -341,7 +345,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr,
                      "usage: vxc_reliefprobe <tiledir> <seed> <x0M> <y0M> <widthM> [heightM]\n"
                      "       [--fine-dir DIR] [--zstd PATH] [--stride-m N] [--threads N]\n"
-                     "       [--json PATH] [--region NAME] [--baseline]\n");
+                     "       [--json PATH] [--region NAME] [--baseline] [--ecology-csv PATH]\n");
         return 2;
     }
     const std::string dir = argv[1];
@@ -350,6 +354,10 @@ int main(int argc, char** argv) {
     const int64_t y0M = std::strtoll(argv[4], nullptr, 10);
     const int64_t widthM = std::strtoll(argv[5], nullptr, 10);
     const int64_t heightM = argc > 6 ? std::strtoll(argv[6], nullptr, 10) : widthM;
+    if (!ecologyCsv.empty() && (fineDir.empty() || std::filesystem::exists(ecologyCsv))) {
+        std::fprintf(stderr,"--ecology-csv requires fine terrain and a fresh output path\n");
+        return 2;
+    }
     if (widthM < strideM * 4 || heightM < strideM * 4) {
         std::fprintf(stderr, "region smaller than 4 strides per axis is not a region\n");
         return 2;
@@ -455,6 +463,10 @@ int main(int argc, char** argv) {
         const int64_t px1 = floorDiv((x0M + widthM) * 1000, fineMm) + margin;
         const int64_t py1 = floorDiv((y0M + heightM) * 1000, fineMm) + margin;
         const bool warm = fine.prewarm(px0, py0, px1, py1);
+        if (!warm && !ecologyCsv.empty()) {
+            std::fprintf(stderr,"Incomplete fine terrain: refusing ecological survey\n");
+            return 1;
+        }
         if (!optBaseline)
             std::printf("fine prewarm: [%lld..%lld]x[%lld..%lld] px %s\n", (long long)px0,
                         (long long)px1, (long long)py0, (long long)py1,
@@ -463,6 +475,34 @@ int main(int argc, char** argv) {
     }
 
     Amplifier amp(seed, *tiles);
+
+    // Site selection uses the production fine amplifier, not coarse climate
+    // alone. This is a sampling grid, not a rendered placement acceptance.
+    if (!ecologyCsv.empty()) {
+        const int64_t nx=widthM/strideM,ny=heightM/strideM;
+        if(nx>1000000 || ny>1000000 || nx*ny>1000000) {
+            std::fprintf(stderr,"Ecological survey exceeds one million samples\n");return 2;
+        }
+        std::ostringstream csv;
+        csv<<"x_mm,y_mm,surface_mm,slope_mm_per_m,biome,distance_water_mm\n";
+        for(int64_t j=0;j<ny;++j)for(int64_t i=0;i<nx;++i) {
+            const int64_t vx=(x0M+i*strideM)*10,vy=(y0M+j*strideM)*10;
+            const auto c=amp.column(vx,vy);
+            const auto p=fine.placementAtVoxel(vx,vy);
+            if(!p.valid){std::fprintf(stderr,"Missing placement channels\n");return 1;}
+            csv<<vx*100<<','<<vy*100<<','<<c.surfaceMm<<','<<c.slopeMmPerM<<','
+               <<int(c.biome)<<','<<placementDistanceMm(p.distWater)<<'\n';
+        }
+        if(fine.missingTileQueries.load() || grid.missingTileQueries.load()) {
+            std::fprintf(stderr,"Terrain miss during ecological survey\n");return 1;
+        }
+        std::ofstream output(ecologyCsv,std::ios::binary);
+        output<<csv.str();output.close();
+        if(!output){std::fprintf(stderr,"Failed writing ecological survey\n");return 1;}
+        std::printf("Ecological fine survey complete: %lld samples -> %s\n",
+            static_cast<long long>(nx*ny),ecologyCsv.c_str());
+        return 0;
+    }
 
     // --- sample the amplified surface --------------------------------------
     const int64_t nx = widthM / strideM;

@@ -71,6 +71,14 @@ StructuredBuffer<uint> ColStarts;
 StructuredBuffer<uint> Spans;
 
 RWStructuredBuffer<uint> OutCells;
+#ifndef VXC_ASSET_OWNERSHIP
+#define VXC_ASSET_OWNERSHIP 0
+#endif
+#if VXC_ASSET_OWNERSHIP
+uint RenderOwned;
+RWStructuredBuffer<uint> OwnedWinnerMask;
+#endif
+
 
 [numthreads(8, 8, 1)]
 void AssetStampMain(uint3 Tid : SV_DispatchThreadID)
@@ -139,6 +147,9 @@ void AssetStampMain(uint3 Tid : SV_DispatchThreadID)
             if ((Cell & 0xffu) == 0u)
             {
                 OutCells[CellIndex] = (Cell & ~0xffu) | Mat;
+#if VXC_ASSET_OWNERSHIP
+                if (RenderOwned != 0u && Mat != 0u) OwnedWinnerMask[CellIndex] = 1u; // lint-shader-ub: allow UNGUARDED_WRITE - same checked brick/cell index as OutCells; mask has identical element count
+#endif
             }
         }
     }
@@ -308,6 +319,9 @@ void AssetStampCoarseMain(uint3 Tid : SV_DispatchThreadID)
         if ((Cell & 0xffu) == 0u)
         {
             OutCells[CellIndex] = (Cell & ~0xffu) | Mat;
+#if VXC_ASSET_OWNERSHIP
+                if (RenderOwned != 0u && Mat != 0u) OwnedWinnerMask[CellIndex] = 1u; // lint-shader-ub: allow UNGUARDED_WRITE - same checked brick/cell index as OutCells; mask has identical element count
+#endif
         }
     }
 }

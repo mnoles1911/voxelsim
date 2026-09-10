@@ -300,7 +300,7 @@ private:
                 if (!runs.empty() && runs.back().first == c.mat && runs.back().second < 0xffff)
                     ++runs.back().second;
                 else
-                    runs.push_back({c.mat, 1});
+                    runs.push_back({c.mat, uint16_t(1)});
             }
             if (2 + 3 * runs.size() < 2 + 3 * e.cells.size()) {
                 w.u8(kRle);

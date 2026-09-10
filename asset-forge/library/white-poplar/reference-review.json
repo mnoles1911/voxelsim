@@ -1,0 +1,89 @@
+{
+  "species": "white-poplar",
+  "status": "passed pilot review",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "findings": [
+    "Broader forked crown distinguishes white poplar from aspen. Replaced November close-ups with OSU whole-tree photographs. Silvery leaf undersides are a remaining limitation of the shared engine leaf palette."
+  ],
+  "reviewed_images": [
+    {
+      "image_id": "poalba910.jpg",
+      "source": "https://landscapeplants.oregonstate.edu/plants/populus-alba",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    },
+    {
+      "image_id": "poalba994.jpg",
+      "source": "https://landscapeplants.oregonstate.edu/plants/populus-alba",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    }
+  ],
+  "taxon": "populus-alba",
+  "sources": [
+    "https://plants.ces.ncsu.edu/plants/populus-alba/",
+    "https://landscapeplants.oregonstate.edu/plants/populus-alba"
+  ],
+  "habitat": "wetland",
+  "art_baseline": {
+    "season": "spring",
+    "foliage": "Species-appropriate spring foliage and fresh growth; flowering only where appropriate to the species.",
+    "reference_policy": "Use spring photographs for finished color and foliage. Other seasons may inform branch structure only.",
+    "out_of_scope": [
+      "seasonal transitions",
+      "seasonal recoloring"
+    ]
+  },
+  "generator_digest": "6d0b2c04db2c83b942e5b228219a87f514e03cf06752831f8ac02256fa4cfa85",
+  "review_date": "2026-09-07",
+  "review_scope": "Stylized spring vertical slice; source acceptance is separate from world variant endorsement.",
+  "pilot_artifacts": {
+    "1": "5dfe866bc353b1a59c342a5b2365b08888326c263c2b4e62ce45cdcdc96f0980",
+    "4": "7c333f5086aba804b108b61f25037edbe48f98ec0deb95886ef7827a3d6c368d",
+    "7": "eaab8bdac23f465e9786be8edf812cf2cf5c973a5c35a574a3aa79b88cef1db6"
+  },
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "98a4464573754b8f59233064dc7861d31c2c673506d4bea6d6dca67c5ec144f3"
+  }
+}

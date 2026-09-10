@@ -1,0 +1,669 @@
+{
+  "status": "passed pilot review",
+  "source": "https://plants.ces.ncsu.edu/plants/primula-vulgaris/",
+  "viewed_photos": [
+    "Form \u00e2\u20ac\u201d David J. Stang"
+  ],
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "batch_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+  ],
+  "findings": "Compared the wild-form photograph by David J. Stang, then all three refined sizes and the current 36-sheet. Broad basal rosettes and individual flower stalks remain legible across compact, spreading and leaning clumps. Purple double-flower cultivars were excluded from species/color judgment. Coarse opaque 25 mm petals and the existing stronger yellow palette are recorded stylization limits; leaf wrinkling and pale cream species coloring await the separate appearance pass.",
+  "generator_digest": "d80e32c5f3293a0482c4c35a3d9d731584683a0dcbbca38ce806c6e5cdc3514a",
+  "sheet_hash": "e1b249f3e7627b2affab44c2f2bc15e304c9d9226dcc052755a0347c2d1e8e27",
+  "pilot_hashes": {
+    "1": "70ff626f10e5869ee903e2ac77f4172d1ac101586eaacf11ae689662e9be289f",
+    "4": "48c9920114e854db29cdd058088fd4d563a20f3c0b0081980738459c0e6d0c5c",
+    "7": "410f209251b15dcbb8e8122b722ab136239e3111fc9028a26454df985956b43f"
+  },
+  "profile": "primrose",
+  "review_date": "2026-09-08",
+  "taxon": "Primula vulgaris",
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "e1b249f3e7627b2affab44c2f2bc15e304c9d9226dcc052755a0347c2d1e8e27"
+  },
+  "identity_revalidations": [
+    {
+      "previous_digest": "747e396e8e0321902c68f64554f6ccae9527e8e8db197ec8993d7c4b8472ffa8",
+      "new_digest": "b48af3a6daeb5270b8282c4edd6d67b5ff9bf2d11c5bd2d5ea37b940cf02147e",
+      "timestamp": 1788840451.938254,
+      "method": "Every saved VXA rebuilt to identical SHA-256; original files and all user decisions preserved",
+      "variants": [
+        {
+          "id": "primrose-0001",
+          "seed": 1,
+          "hash": "70ff626f10e5869ee903e2ac77f4172d1ac101586eaacf11ae689662e9be289f"
+        },
+        {
+          "id": "primrose-0002",
+          "seed": 2,
+          "hash": "9b35b3bfce975dc6dd1d734800873be185535ddb4e49b9f346480e38add7e7b8"
+        },
+        {
+          "id": "primrose-0003",
+          "seed": 3,
+          "hash": "145f03f75b2e3c1c2801d1123896e2ca9d1a919f78a696540f3c265a5c9ffa45"
+        },
+        {
+          "id": "primrose-0004",
+          "seed": 4,
+          "hash": "48c9920114e854db29cdd058088fd4d563a20f3c0b0081980738459c0e6d0c5c"
+        },
+        {
+          "id": "primrose-0005",
+          "seed": 5,
+          "hash": "3d9c780d28fc97cd08bdd40082bdbe4c833d77f50de21a36e0b036caa659674e"
+        },
+        {
+          "id": "primrose-0006",
+          "seed": 6,
+          "hash": "fa6d7bb8f50e9699bf7aa031f01053eaccbc8bf35a41b0eb9f434e18f1b5cb1b"
+        },
+        {
+          "id": "primrose-0007",
+          "seed": 7,
+          "hash": "410f209251b15dcbb8e8122b722ab136239e3111fc9028a26454df985956b43f"
+        },
+        {
+          "id": "primrose-0008",
+          "seed": 8,
+          "hash": "42e9a9955c767aa5250ef2ae73aa7526121f3724e4dce234b1a2fb95f44a59f8"
+        },
+        {
+          "id": "primrose-0009",
+          "seed": 9,
+          "hash": "9bef79d1650c6e11b0d796c2b7d78259f1b0c5157963707c8cafacea38ccabcc"
+        },
+        {
+          "id": "primrose-0010",
+          "seed": 10,
+          "hash": "b8ba02177b0de0fc336dbf0b3137d1ed8f9bbd731672a86b72cb60762573c1dc"
+        },
+        {
+          "id": "primrose-0011",
+          "seed": 11,
+          "hash": "d81483223172f5d3bd6d26a1b7533c7043bbc4cba11f7218ef6ba01796db3224"
+        },
+        {
+          "id": "primrose-0012",
+          "seed": 12,
+          "hash": "fec8332932acee013bb8804d0b36051747f2585a6810d822961a33cb16ccbe20"
+        },
+        {
+          "id": "primrose-0013",
+          "seed": 13,
+          "hash": "d1d14ef016e5348da2c5cfd553f100cd65ae8c36969ad0ede70c29daa56d326a"
+        },
+        {
+          "id": "primrose-0014",
+          "seed": 14,
+          "hash": "62f067a0cb0773d98a3d9058d5de6098025cb86b5dc9f277dcab75f49ca8af1c"
+        },
+        {
+          "id": "primrose-0015",
+          "seed": 15,
+          "hash": "8b16a6a9f6154b4edfdb133f627bf569deaa79cf8305bd69d99411517bed37f3"
+        },
+        {
+          "id": "primrose-0016",
+          "seed": 16,
+          "hash": "d0bbecc4557e51555eb14327fdc105c4f2e01d5e7c82153e2c56e479785a2d60"
+        },
+        {
+          "id": "primrose-0017",
+          "seed": 17,
+          "hash": "b32acd911fb8768c4fe37e3b00be33f3006e907471aa4acf756241653efbdfaa"
+        },
+        {
+          "id": "primrose-0018",
+          "seed": 18,
+          "hash": "8284ab7a2ec8e12850a0a810122e0606150c22015539834c939285bd69e175c5"
+        },
+        {
+          "id": "primrose-0019",
+          "seed": 19,
+          "hash": "8f3c0d35bbca9519932cecee7f1b0cc77cfd5c8912c42371a9c704fff53a2340"
+        },
+        {
+          "id": "primrose-0020",
+          "seed": 20,
+          "hash": "86039f487b5a72edb23036efedb957dc5170fe29c6c51831471ca99bc41ea2f3"
+        },
+        {
+          "id": "primrose-0021",
+          "seed": 21,
+          "hash": "5992aecdd332ba5893909f1eecdcba159583389029d48945dad4398a596fa34c"
+        },
+        {
+          "id": "primrose-0022",
+          "seed": 22,
+          "hash": "12e528884b9328a3e2bdcedb63d9e64add80ea38b5e36067c83b5a9bbf6f535d"
+        },
+        {
+          "id": "primrose-0023",
+          "seed": 23,
+          "hash": "40bfda0bac70ee7277d59f0c5419f0ba9f0a0ee7566232d892d799f4250d384b"
+        },
+        {
+          "id": "primrose-0024",
+          "seed": 24,
+          "hash": "5bcdb49ac14fc72fde1abfb8066fe33fa715e7339c4ac87e2065079cccabda19"
+        },
+        {
+          "id": "primrose-0025",
+          "seed": 25,
+          "hash": "e8fc018f5dbaec9a84a1ec294b80b957e4df8da8f6d4c3728bfb218e72952de0"
+        },
+        {
+          "id": "primrose-0026",
+          "seed": 26,
+          "hash": "37fe2293af181af4ab37b252328a007f1a3d5928dfaada8940077396b4b1bf53"
+        },
+        {
+          "id": "primrose-0027",
+          "seed": 27,
+          "hash": "c23eeac62479d27a9e07141ba2e6bca1f7abe76588040a2d206679d41cb52a59"
+        },
+        {
+          "id": "primrose-0028",
+          "seed": 28,
+          "hash": "5cd3b23d31cfd2c366c33c876bb07e64b97220c959ed47e50d3986a64380906a"
+        },
+        {
+          "id": "primrose-0029",
+          "seed": 29,
+          "hash": "c93a6a4c2512f223709723cb34ed37f16da10cf5d97db2d05fb2c57fcceb75b5"
+        },
+        {
+          "id": "primrose-0030",
+          "seed": 30,
+          "hash": "8a3e49f95c7770b07dcea0602560a320632f84ef2f993322c09d766c2a6c1a71"
+        },
+        {
+          "id": "primrose-0031",
+          "seed": 31,
+          "hash": "2f911ce500f46ebc8321d31b911cad73c0b95efe50bc0474ef9a8d1ae7728c58"
+        },
+        {
+          "id": "primrose-0032",
+          "seed": 32,
+          "hash": "1ce731132531fd8963040f810606b37c6e50ea1ef8885220423c3f43d2569850"
+        },
+        {
+          "id": "primrose-0033",
+          "seed": 33,
+          "hash": "b3f1771d72d0b3e278d20c13767c465cd81bb51946f65040f58cf2df13e8382f"
+        },
+        {
+          "id": "primrose-0034",
+          "seed": 34,
+          "hash": "fe49c4f9912ffcd9a73842350a8f7b741de4906aa3d94cd92fb3ea004450e57f"
+        },
+        {
+          "id": "primrose-0035",
+          "seed": 35,
+          "hash": "d70a0336a58377ed0724b36e3cbc7b37c80b674e7f024d92b35108ec3c1b8409"
+        },
+        {
+          "id": "primrose-0036",
+          "seed": 36,
+          "hash": "8a26b1ecda9c47939ab02e4effc5ff574b70108231d00136380631d361ef8062"
+        }
+      ]
+    },
+    {
+      "previous_digest": "b48af3a6daeb5270b8282c4edd6d67b5ff9bf2d11c5bd2d5ea37b940cf02147e",
+      "new_digest": "7eff9292a2dd6ed56a18cc17f9c74ed712f70f4ca345d0870eb559235c12f998",
+      "timestamp": 1788840906.7953072,
+      "method": "Every saved VXA rebuilt to identical SHA-256; original files and all user decisions preserved",
+      "variants": [
+        {
+          "id": "primrose-0001",
+          "seed": 1,
+          "hash": "70ff626f10e5869ee903e2ac77f4172d1ac101586eaacf11ae689662e9be289f"
+        },
+        {
+          "id": "primrose-0002",
+          "seed": 2,
+          "hash": "9b35b3bfce975dc6dd1d734800873be185535ddb4e49b9f346480e38add7e7b8"
+        },
+        {
+          "id": "primrose-0003",
+          "seed": 3,
+          "hash": "145f03f75b2e3c1c2801d1123896e2ca9d1a919f78a696540f3c265a5c9ffa45"
+        },
+        {
+          "id": "primrose-0004",
+          "seed": 4,
+          "hash": "48c9920114e854db29cdd058088fd4d563a20f3c0b0081980738459c0e6d0c5c"
+        },
+        {
+          "id": "primrose-0005",
+          "seed": 5,
+          "hash": "3d9c780d28fc97cd08bdd40082bdbe4c833d77f50de21a36e0b036caa659674e"
+        },
+        {
+          "id": "primrose-0006",
+          "seed": 6,
+          "hash": "fa6d7bb8f50e9699bf7aa031f01053eaccbc8bf35a41b0eb9f434e18f1b5cb1b"
+        },
+        {
+          "id": "primrose-0007",
+          "seed": 7,
+          "hash": "410f209251b15dcbb8e8122b722ab136239e3111fc9028a26454df985956b43f"
+        },
+        {
+          "id": "primrose-0008",
+          "seed": 8,
+          "hash": "42e9a9955c767aa5250ef2ae73aa7526121f3724e4dce234b1a2fb95f44a59f8"
+        },
+        {
+          "id": "primrose-0009",
+          "seed": 9,
+          "hash": "9bef79d1650c6e11b0d796c2b7d78259f1b0c5157963707c8cafacea38ccabcc"
+        },
+        {
+          "id": "primrose-0010",
+          "seed": 10,
+          "hash": "b8ba02177b0de0fc336dbf0b3137d1ed8f9bbd731672a86b72cb60762573c1dc"
+        },
+        {
+          "id": "primrose-0011",
+          "seed": 11,
+          "hash": "d81483223172f5d3bd6d26a1b7533c7043bbc4cba11f7218ef6ba01796db3224"
+        },
+        {
+          "id": "primrose-0012",
+          "seed": 12,
+          "hash": "fec8332932acee013bb8804d0b36051747f2585a6810d822961a33cb16ccbe20"
+        },
+        {
+          "id": "primrose-0013",
+          "seed": 13,
+          "hash": "d1d14ef016e5348da2c5cfd553f100cd65ae8c36969ad0ede70c29daa56d326a"
+        },
+        {
+          "id": "primrose-0014",
+          "seed": 14,
+          "hash": "62f067a0cb0773d98a3d9058d5de6098025cb86b5dc9f277dcab75f49ca8af1c"
+        },
+        {
+          "id": "primrose-0015",
+          "seed": 15,
+          "hash": "8b16a6a9f6154b4edfdb133f627bf569deaa79cf8305bd69d99411517bed37f3"
+        },
+        {
+          "id": "primrose-0016",
+          "seed": 16,
+          "hash": "d0bbecc4557e51555eb14327fdc105c4f2e01d5e7c82153e2c56e479785a2d60"
+        },
+        {
+          "id": "primrose-0017",
+          "seed": 17,
+          "hash": "b32acd911fb8768c4fe37e3b00be33f3006e907471aa4acf756241653efbdfaa"
+        },
+        {
+          "id": "primrose-0018",
+          "seed": 18,
+          "hash": "8284ab7a2ec8e12850a0a810122e0606150c22015539834c939285bd69e175c5"
+        },
+        {
+          "id": "primrose-0019",
+          "seed": 19,
+          "hash": "8f3c0d35bbca9519932cecee7f1b0cc77cfd5c8912c42371a9c704fff53a2340"
+        },
+        {
+          "id": "primrose-0020",
+          "seed": 20,
+          "hash": "86039f487b5a72edb23036efedb957dc5170fe29c6c51831471ca99bc41ea2f3"
+        },
+        {
+          "id": "primrose-0021",
+          "seed": 21,
+          "hash": "5992aecdd332ba5893909f1eecdcba159583389029d48945dad4398a596fa34c"
+        },
+        {
+          "id": "primrose-0022",
+          "seed": 22,
+          "hash": "12e528884b9328a3e2bdcedb63d9e64add80ea38b5e36067c83b5a9bbf6f535d"
+        },
+        {
+          "id": "primrose-0023",
+          "seed": 23,
+          "hash": "40bfda0bac70ee7277d59f0c5419f0ba9f0a0ee7566232d892d799f4250d384b"
+        },
+        {
+          "id": "primrose-0024",
+          "seed": 24,
+          "hash": "5bcdb49ac14fc72fde1abfb8066fe33fa715e7339c4ac87e2065079cccabda19"
+        },
+        {
+          "id": "primrose-0025",
+          "seed": 25,
+          "hash": "e8fc018f5dbaec9a84a1ec294b80b957e4df8da8f6d4c3728bfb218e72952de0"
+        },
+        {
+          "id": "primrose-0026",
+          "seed": 26,
+          "hash": "37fe2293af181af4ab37b252328a007f1a3d5928dfaada8940077396b4b1bf53"
+        },
+        {
+          "id": "primrose-0027",
+          "seed": 27,
+          "hash": "c23eeac62479d27a9e07141ba2e6bca1f7abe76588040a2d206679d41cb52a59"
+        },
+        {
+          "id": "primrose-0028",
+          "seed": 28,
+          "hash": "5cd3b23d31cfd2c366c33c876bb07e64b97220c959ed47e50d3986a64380906a"
+        },
+        {
+          "id": "primrose-0029",
+          "seed": 29,
+          "hash": "c93a6a4c2512f223709723cb34ed37f16da10cf5d97db2d05fb2c57fcceb75b5"
+        },
+        {
+          "id": "primrose-0030",
+          "seed": 30,
+          "hash": "8a3e49f95c7770b07dcea0602560a320632f84ef2f993322c09d766c2a6c1a71"
+        },
+        {
+          "id": "primrose-0031",
+          "seed": 31,
+          "hash": "2f911ce500f46ebc8321d31b911cad73c0b95efe50bc0474ef9a8d1ae7728c58"
+        },
+        {
+          "id": "primrose-0032",
+          "seed": 32,
+          "hash": "1ce731132531fd8963040f810606b37c6e50ea1ef8885220423c3f43d2569850"
+        },
+        {
+          "id": "primrose-0033",
+          "seed": 33,
+          "hash": "b3f1771d72d0b3e278d20c13767c465cd81bb51946f65040f58cf2df13e8382f"
+        },
+        {
+          "id": "primrose-0034",
+          "seed": 34,
+          "hash": "fe49c4f9912ffcd9a73842350a8f7b741de4906aa3d94cd92fb3ea004450e57f"
+        },
+        {
+          "id": "primrose-0035",
+          "seed": 35,
+          "hash": "d70a0336a58377ed0724b36e3cbc7b37c80b674e7f024d92b35108ec3c1b8409"
+        },
+        {
+          "id": "primrose-0036",
+          "seed": 36,
+          "hash": "8a26b1ecda9c47939ab02e4effc5ff574b70108231d00136380631d361ef8062"
+        }
+      ]
+    },
+    {
+      "previous_digest": "7eff9292a2dd6ed56a18cc17f9c74ed712f70f4ca345d0870eb559235c12f998",
+      "new_digest": "d80e32c5f3293a0482c4c35a3d9d731584683a0dcbbca38ce806c6e5cdc3514a",
+      "timestamp": 1788843658.9740949,
+      "method": "Every saved VXA rebuilt to identical SHA-256; original files and all user decisions preserved",
+      "variants": [
+        {
+          "id": "primrose-0001",
+          "seed": 1,
+          "hash": "70ff626f10e5869ee903e2ac77f4172d1ac101586eaacf11ae689662e9be289f"
+        },
+        {
+          "id": "primrose-0002",
+          "seed": 2,
+          "hash": "9b35b3bfce975dc6dd1d734800873be185535ddb4e49b9f346480e38add7e7b8"
+        },
+        {
+          "id": "primrose-0003",
+          "seed": 3,
+          "hash": "145f03f75b2e3c1c2801d1123896e2ca9d1a919f78a696540f3c265a5c9ffa45"
+        },
+        {
+          "id": "primrose-0004",
+          "seed": 4,
+          "hash": "48c9920114e854db29cdd058088fd4d563a20f3c0b0081980738459c0e6d0c5c"
+        },
+        {
+          "id": "primrose-0005",
+          "seed": 5,
+          "hash": "3d9c780d28fc97cd08bdd40082bdbe4c833d77f50de21a36e0b036caa659674e"
+        },
+        {
+          "id": "primrose-0006",
+          "seed": 6,
+          "hash": "fa6d7bb8f50e9699bf7aa031f01053eaccbc8bf35a41b0eb9f434e18f1b5cb1b"
+        },
+        {
+          "id": "primrose-0007",
+          "seed": 7,
+          "hash": "410f209251b15dcbb8e8122b722ab136239e3111fc9028a26454df985956b43f"
+        },
+        {
+          "id": "primrose-0008",
+          "seed": 8,
+          "hash": "42e9a9955c767aa5250ef2ae73aa7526121f3724e4dce234b1a2fb95f44a59f8"
+        },
+        {
+          "id": "primrose-0009",
+          "seed": 9,
+          "hash": "9bef79d1650c6e11b0d796c2b7d78259f1b0c5157963707c8cafacea38ccabcc"
+        },
+        {
+          "id": "primrose-0010",
+          "seed": 10,
+          "hash": "b8ba02177b0de0fc336dbf0b3137d1ed8f9bbd731672a86b72cb60762573c1dc"
+        },
+        {
+          "id": "primrose-0011",
+          "seed": 11,
+          "hash": "d81483223172f5d3bd6d26a1b7533c7043bbc4cba11f7218ef6ba01796db3224"
+        },
+        {
+          "id": "primrose-0012",
+          "seed": 12,
+          "hash": "fec8332932acee013bb8804d0b36051747f2585a6810d822961a33cb16ccbe20"
+        },
+        {
+          "id": "primrose-0013",
+          "seed": 13,
+          "hash": "d1d14ef016e5348da2c5cfd553f100cd65ae8c36969ad0ede70c29daa56d326a"
+        },
+        {
+          "id": "primrose-0014",
+          "seed": 14,
+          "hash": "62f067a0cb0773d98a3d9058d5de6098025cb86b5dc9f277dcab75f49ca8af1c"
+        },
+        {
+          "id": "primrose-0015",
+          "seed": 15,
+          "hash": "8b16a6a9f6154b4edfdb133f627bf569deaa79cf8305bd69d99411517bed37f3"
+        },
+        {
+          "id": "primrose-0016",
+          "seed": 16,
+          "hash": "d0bbecc4557e51555eb14327fdc105c4f2e01d5e7c82153e2c56e479785a2d60"
+        },
+        {
+          "id": "primrose-0017",
+          "seed": 17,
+          "hash": "b32acd911fb8768c4fe37e3b00be33f3006e907471aa4acf756241653efbdfaa"
+        },
+        {
+          "id": "primrose-0018",
+          "seed": 18,
+          "hash": "8284ab7a2ec8e12850a0a810122e0606150c22015539834c939285bd69e175c5"
+        },
+        {
+          "id": "primrose-0019",
+          "seed": 19,
+          "hash": "8f3c0d35bbca9519932cecee7f1b0cc77cfd5c8912c42371a9c704fff53a2340"
+        },
+        {
+          "id": "primrose-0020",
+          "seed": 20,
+          "hash": "86039f487b5a72edb23036efedb957dc5170fe29c6c51831471ca99bc41ea2f3"
+        },
+        {
+          "id": "primrose-0021",
+          "seed": 21,
+          "hash": "5992aecdd332ba5893909f1eecdcba159583389029d48945dad4398a596fa34c"
+        },
+        {
+          "id": "primrose-0022",
+          "seed": 22,
+          "hash": "12e528884b9328a3e2bdcedb63d9e64add80ea38b5e36067c83b5a9bbf6f535d"
+        },
+        {
+          "id": "primrose-0023",
+          "seed": 23,
+          "hash": "40bfda0bac70ee7277d59f0c5419f0ba9f0a0ee7566232d892d799f4250d384b"
+        },
+        {
+          "id": "primrose-0024",
+          "seed": 24,
+          "hash": "5bcdb49ac14fc72fde1abfb8066fe33fa715e7339c4ac87e2065079cccabda19"
+        },
+        {
+          "id": "primrose-0025",
+          "seed": 25,
+          "hash": "e8fc018f5dbaec9a84a1ec294b80b957e4df8da8f6d4c3728bfb218e72952de0"
+        },
+        {
+          "id": "primrose-0026",
+          "seed": 26,
+          "hash": "37fe2293af181af4ab37b252328a007f1a3d5928dfaada8940077396b4b1bf53"
+        },
+        {
+          "id": "primrose-0027",
+          "seed": 27,
+          "hash": "c23eeac62479d27a9e07141ba2e6bca1f7abe76588040a2d206679d41cb52a59"
+        },
+        {
+          "id": "primrose-0028",
+          "seed": 28,
+          "hash": "5cd3b23d31cfd2c366c33c876bb07e64b97220c959ed47e50d3986a64380906a"
+        },
+        {
+          "id": "primrose-0029",
+          "seed": 29,
+          "hash": "c93a6a4c2512f223709723cb34ed37f16da10cf5d97db2d05fb2c57fcceb75b5"
+        },
+        {
+          "id": "primrose-0030",
+          "seed": 30,
+          "hash": "8a3e49f95c7770b07dcea0602560a320632f84ef2f993322c09d766c2a6c1a71"
+        },
+        {
+          "id": "primrose-0031",
+          "seed": 31,
+          "hash": "2f911ce500f46ebc8321d31b911cad73c0b95efe50bc0474ef9a8d1ae7728c58"
+        },
+        {
+          "id": "primrose-0032",
+          "seed": 32,
+          "hash": "1ce731132531fd8963040f810606b37c6e50ea1ef8885220423c3f43d2569850"
+        },
+        {
+          "id": "primrose-0033",
+          "seed": 33,
+          "hash": "b3f1771d72d0b3e278d20c13767c465cd81bb51946f65040f58cf2df13e8382f"
+        },
+        {
+          "id": "primrose-0034",
+          "seed": 34,
+          "hash": "fe49c4f9912ffcd9a73842350a8f7b741de4906aa3d94cd92fb3ea004450e57f"
+        },
+        {
+          "id": "primrose-0035",
+          "seed": 35,
+          "hash": "d70a0336a58377ed0724b36e3cbc7b37c80b674e7f024d92b35108ec3c1b8409"
+        },
+        {
+          "id": "primrose-0036",
+          "seed": 36,
+          "hash": "8a26b1ecda9c47939ab02e4effc5ff574b70108231d00136380631d361ef8062"
+        }
+      ]
+    }
+  ]
+}

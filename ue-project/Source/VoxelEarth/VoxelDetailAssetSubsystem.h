@@ -53,6 +53,7 @@ class VOXELEARTH_API UVoxelDetailAssetSubsystem : public UTickableWorldSubsystem
 	GENERATED_BODY()
 
 public:
+	bool IsPlacementSettled(uint64& LiveInstances) const;
 	UVoxelDetailAssetSubsystem();
 	// Declared (not defaulted) here and defined in the .cpp:
 	// TUniquePtr<FVoxelDetailAssetImpl>'s destructor needs the full definition,

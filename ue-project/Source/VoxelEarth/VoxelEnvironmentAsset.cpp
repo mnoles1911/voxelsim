@@ -6,6 +6,11 @@ bool SafeText(const FString& S,int32 Max,bool Empty=false){
     if(S.Len()>Max||(!Empty&&S.IsEmpty()))return false;
     for(TCHAR C:S)if(C<32||C>126)return false;return true;
 }
+bool Md5Text(const FString& S){
+    if(S.Len()!=32)return false;
+    for(TCHAR C:S)if(!((C>='0'&&C<='9')||(C>='a'&&C<='f')||(C>='A'&&C<='F')))return false;
+    return true;
+}
 bool TextField(FArchive& Ar,FString& S,int32 Max){
     int32 N=S.Len();Ar<<N;
     if(Ar.IsError()||N<0||N>Max||(Ar.IsLoading()&&int64(N)>Ar.TotalSize()-Ar.Tell()))return false;
@@ -17,8 +22,10 @@ bool TextField(FArchive& Ar,FString& S,int32 Max){
 bool FVoxelEnvironmentAssetDescriptor::IsValid() const {
     if(!SafeText(SpecId,128)||!SafeText(Kind,64)||Category!=TEXT("environment"))return false;
     if(!SafeText(SpecHash,128,true)||!SafeText(CatalogHash,128,true)||!SafeText(ProviderHash,128,true))return false;
+    if(SourceYawQuarter>3||(!HasComposition()&&SourceYawQuarter!=0))return false;
+    if(HasComposition()&&(Legacy||!Md5Text(ClippedGeometryHash)))return false;
     if(Legacy){for(const auto Name:LegacyEnvironmentNames)if(SpecId==Name)return true;return false;}
-    if(SourceHash.Len()!=32)return false;for(TCHAR C:SourceHash)if(!FChar::IsHexDigit(C))return false;return true;
+    return Md5Text(SourceHash);
 }
 FVoxelEnvironmentAssetDescriptor FVoxelEnvironmentAssetDescriptor::Prototype(const FString& Name){
     FVoxelEnvironmentAssetDescriptor D;
@@ -33,10 +40,17 @@ bool VoxelEnvironmentAsset::SerializeIdentity(FArchive& Ar,FVoxelEnvironmentAsse
     Ar<<Marker;if(Ar.IsError())return false;
     if(Marker>=0&&Marker<4){if(Ar.IsLoading())D=FVoxelEnvironmentAssetDescriptor::Prototype(LegacyEnvironmentNames[Marker]);return true;}
     if(Marker!=-1)return false;
-    uint32 Version=1;Ar<<Version;if(Version!=1||Ar.IsError())return false;
+    uint32 Version=D.HasComposition()?2:1;Ar<<Version;if((Version!=1&&Version!=2)||Ar.IsError())return false;
     if(!TextField(Ar,D.SpecId,128)||!TextField(Ar,D.Kind,64)||!TextField(Ar,D.Category,64)||!TextField(Ar,D.SourceHash,32)||
        !TextField(Ar,D.SpecHash,128)||!TextField(Ar,D.CatalogHash,128)||!TextField(Ar,D.ProviderHash,128))return false;
     uint8 Flags=D.Fellable?1:0;Ar<<D.SeedIndex<<Flags;if(Flags>1||Ar.IsError())return false;
+    if(Version==2){
+        if(!TextField(Ar,D.ClippedGeometryHash,32))return false;
+        Ar<<D.SourceYawQuarter;
+        if(Ar.IsError()||D.ClippedGeometryHash.IsEmpty())return false;
+    }else if(Ar.IsLoading()){
+        D.ClippedGeometryHash.Reset();D.SourceYawQuarter=0;
+    }
     D.Fellable=Flags!=0;D.Legacy=false;return D.IsValid();
 }
 int32 VoxelEnvironmentAsset::QuarterYaw(const FTransform& T){

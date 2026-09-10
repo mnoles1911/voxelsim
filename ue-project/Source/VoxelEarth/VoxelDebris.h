@@ -8,6 +8,19 @@
 class UStaticMeshComponent;
 class UInstancedStaticMeshComponent;
 class UVoxelDebrisLifecycle;
+class UProceduralMeshComponent;
+
+// Captured before terrain removal. SourceCell is the original zero-based VAC
+// coordinate; all cells use the world 100mm lattice. No live-world lookups.
+struct FVoxelDebrisCellAppearance
+{
+    VoxelCoords::FVoxelCoord Coord{};
+    uint8 Material=0;
+    FColor BaseRGB=FColor::Black;
+    FIntVector SourceCell=FIntVector::ZeroValue;
+    uint8 SourceYawQuarter=0;
+    bool Approved=false,Needle=false,FoliageMask=false;
+};
 
 // M5 destruction (first slice, docs/voxel-earth-implementation-plan.md SS3.5
 // "disconnected islands promoted to rigid voxel debris bodies (Chaos)").
@@ -26,10 +39,9 @@ class UVoxelDebrisLifecycle;
 //     settled onto the voxel surface by a per-tick DDA raycast against the
 //     voxel world (UVoxelWorldSubsystem::RaycastVoxelWorld), NOT by a physical
 //     contact -- full voxel-vs-Chaos collision is later.
-//   * The visible form is an InstancedStaticMesh of one engine cube per island
-//     voxel (the "engine cubes" option in the plan), NOT a re-meshed voxel
-//     proxy -- reusing the chunk scene proxy for a moving local mesh is a
-//     later refinement.
+//   * Coordinate-only callers retain instanced engine cubes. Captured
+//     appearance callers use a bounded procedural surface with original-source
+//     face RGB/UV and explicit foliage policy, retained by object snapshots.
 //   * On settle the island rests as a Chaos body; re-integrating it back into
 //     the static voxel grid as settled voxels is a documented follow-up.
 UCLASS()
@@ -68,10 +80,22 @@ public:
 	// created so the caller can debit its budget.
 	int32 InitFromIsland(const TArray<VoxelCoords::FVoxelCoord>& IslandVoxels, int32 MaxInstances = MaxInstancesPerBody);
 
+    // Coordinate-aligned snapshot: exact count/order required; invalid input
+    // returns zero without mutating the actor. At most 512K captured cells;
+    // returns rendered cell count. Stored stride budget survives restoration.
+    int32 InitFromIslandWithAppearance(const TArray<VoxelCoords::FVoxelCoord>& IslandVoxels,
+        const TArray<FVoxelDebrisCellAppearance>& Cells,int32 MaxInstances=MaxInstancesPerBody);
+
 	// Per-body instance ceiling, independent of the caller's per-edit budget.
 	static constexpr int32 MaxInstancesPerBody = 8192;
 
 private:
+    int32 InitIsland(const TArray<VoxelCoords::FVoxelCoord>& IslandVoxels,int32 MaxInstances);
+    bool GeometryState(FArchive& Ar);
+    void BuildAppearanceShell(const TArray<VoxelCoords::FVoxelCoord>& Shell,int32 Stride,const FVector& Centre);
+    TArray<FVoxelDebrisCellAppearance> PersistentAppearance;
+    int32 PersistentInstanceBudget=MaxInstancesPerBody;
+    UPROPERTY(Transient) TArray<TObjectPtr<UProceduralMeshComponent>> AppearanceMeshes;
 	UPROPERTY(VisibleAnywhere) TObjectPtr<UVoxelDebrisLifecycle> Cleanup;
 	void SettleOnSurface(double SurfaceTopZUU);
 

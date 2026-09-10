@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import hashlib
 import sys
 import time
 from pathlib import Path
@@ -123,6 +124,8 @@ def check_against_layer(name: str, grid, layer_index: int) -> "str | None":
 
 
 def main() -> int:
+    from library_layers import configure
+    configure(ROOT)
     ap = argparse.ArgumentParser()
     ap.add_argument("--kind", nargs="*", default=list(manifest.KINDS_TERRAIN))
     ap.add_argument("--seeds", nargs="*", type=int, default=[1, 2, 3, 4])
@@ -232,6 +235,34 @@ def main() -> int:
         seeds_done: list[int] = []
         for seed in want_seeds:
             dst = banks / name / f"{name}-{seed:04d}.vxa"
+            saved=ROOT/'library'/name/f'{name}-{seed:04d}'
+            if (saved/'meta.json').is_file():
+                try:
+                    meta=json.loads((saved/'meta.json').read_text())
+                    if meta.get('inventory_candidate'):raise ValueError('Variant has not been endorsed')
+                    source_bytes=(saved/'tree.vxa').read_bytes()
+                    expected=meta.get('artifact_hashes',{}).get('tree.vxa')
+                    if expected and hashlib.sha256(source_bytes).hexdigest()!=expected:
+                        raise ValueError('Saved geometry checksum differs from endorsed variant')
+                    grid=vxa.read(saved/'tree.vxa')
+                    why=check_on_ladder(name,grid) or check_against_layer(name,grid,layer)
+                    if why:raise ValueError(why)
+                    if meta.get('review_status')=='endorsed':
+                        from publish_temperate_appearance import publish_endorsed
+                        publish_endorsed(saved,banks.parent/'appearance')
+                    dst.parent.mkdir(parents=True,exist_ok=True)
+                    if dst.exists() and dst.read_bytes()==source_bytes:skipped+=1
+                    else:dst.write_bytes(source_bytes);baked+=1
+                    seeds_done.append(seed)
+                    print(f'  {name} seed {seed}: endorsed library geometry (exact bytes)')
+                except Exception as exc:
+                    failed+=1
+                    print(f'  {name} seed {seed}: LIBRARY EXPORT FAILED: {exc}')
+                continue
+            if (ROOT/'library'/name/'species.json').is_file():
+                failed+=1
+                print(f'  {name} seed {seed}: no endorsed variant in authoritative species collection')
+                continue
             if dst.exists() and not args.force and not moved:
                 skipped += 1
                 seeds_done.append(seed)
@@ -264,6 +295,11 @@ def main() -> int:
     record = {"version": 1, "species": known}
     record_path.write_text(json.dumps(record, indent=1, sort_keys=True) + "\n",
                            encoding="utf-8")
+
+    from publish_temperate_appearance import refresh_published_inventory
+    published=refresh_published_inventory(banks.parent/'appearance',banks)
+    print(f"  approved appearance placement inventory: {published['count']} endorsed variants with exact banks; "
+          f"{len(published['unavailable_banks'])} endorsements await bank export")
 
     print(f"banks: baked {baked}, skipped {skipped} existing, "
           f"re-baked {stale} stale, refused {refused}, "

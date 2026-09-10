@@ -1,0 +1,88 @@
+{
+  "species": "eastern-cottonwood",
+  "status": "passed pilot review",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "findings": [
+    "Broad crown on ascending forks; bark and branching photo supports substantial structure and the second image provides whole-tree habit."
+  ],
+  "reviewed_images": [
+    {
+      "image_id": "20829",
+      "source": "https://plants.ces.ncsu.edu/plants/populus-deltoides/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    },
+    {
+      "image_id": "8771",
+      "source": "https://plants.ces.ncsu.edu/plants/populus-deltoides/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    }
+  ],
+  "taxon": "populus-deltoides",
+  "sources": [
+    "https://plants.ces.ncsu.edu/plants/populus-deltoides/"
+  ],
+  "habitat": "wetland",
+  "art_baseline": {
+    "season": "spring",
+    "foliage": "Species-appropriate spring foliage and fresh growth; flowering only where appropriate to the species.",
+    "reference_policy": "Use spring photographs for finished color and foliage. Other seasons may inform branch structure only.",
+    "out_of_scope": [
+      "seasonal transitions",
+      "seasonal recoloring"
+    ]
+  },
+  "generator_digest": "6d0b2c04db2c83b942e5b228219a87f514e03cf06752831f8ac02256fa4cfa85",
+  "review_date": "2026-09-07",
+  "review_scope": "Stylized spring vertical slice; source acceptance is separate from world variant endorsement.",
+  "pilot_artifacts": {
+    "1": "b150efd637673e407a3d383696840e5064976de9bb69146d97c3729a3c44510a",
+    "4": "4f498317b4f95b484de49881be0b9df2e9c7e747f8c7b7edddf0c632f8c05274",
+    "7": "a2ceb9d45665b9180161b8a602cdff125963d13b3862ee42cb6647a9083ea109"
+  },
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "1b6a5ded85e742e0be9b77a29868fed3e798e6b367941f4605ce929a61c64081"
+  }
+}

@@ -1,4 +1,5 @@
 #include "VoxelEarthFlyPawn.h"
+#include "VoxelFrameProfiling.h"
 
 #include "Camera/CameraComponent.h"
 #include "Components/InputComponent.h"
@@ -283,6 +284,10 @@ void AVoxelEarthFlyPawn::OnCrouchReleased()
 void AVoxelEarthFlyPawn::ToggleCameraMode()
 {
 	bThirdPerson = !bThirdPerson;
+	// Resolve the boom before activating its camera: its hidden position
+	// tracks lag but deliberately skips collision work in first person.
+	// Zero time preserves the accumulated lag and still performs the ray.
+	if (bThirdPerson) UpdateThirdPersonCamera(0.f);
 	if (Camera)
 	{
 		Camera->SetActive(!bThirdPerson);
@@ -483,6 +488,7 @@ void AVoxelEarthFlyPawn::SetScriptedInput(float Forward, float Right)
 
 void AVoxelEarthFlyPawn::Tick(float DeltaTime)
 {
+	CSV_SCOPED_TIMING_STAT(VoxelStream, PawnTickMs);
 	Super::Tick(DeltaTime);
 
 	if (bWalkMode)
@@ -679,7 +685,9 @@ void AVoxelEarthFlyPawn::UpdateThirdPersonCamera(float DeltaTime)
 	FVector FinalPos = ThirdPersonLaggedPos;
 	const FVector ToLagged = ThirdPersonLaggedPos - HeadPos;
 	const double LaggedDist = ToLagged.Size();
-	if (LaggedDist > KINDA_SMALL_NUMBER)
+	// Keep lag warm for a seamless switch, but only the visible third-person
+	// camera needs voxel collision. ToggleCameraMode resolves before activation.
+	if (bThirdPerson && LaggedDist > KINDA_SMALL_NUMBER)
 	{
 		const FVector Dir = ToLagged / LaggedDist;
 		if (UWorld* World = GetWorld())

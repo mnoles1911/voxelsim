@@ -511,7 +511,8 @@ EffectiveGates effectiveGates(const AssetManifestSpecies& r, const AssetManifest
 // override is not a xerophile because its desert row mentions only desert).
 bool foldRow(const AssetManifestSpecies& r, uint16_t bankId, const AssetLayer& L,
              const EffectiveGates& g, const uint16_t* authored,
-             const AssetManifestSpecies& parent, const uint16_t* densityRow, AssetSpecies& s) {
+             const AssetManifestSpecies& parent, const uint16_t* densityRow, AssetSpecies& s,
+             const AssetDensityPolicy* policy) {
     s = AssetSpecies{};
     // The bank reference is the manifest ROW INDEX; AssetBankLibrary maps it
     // back to the name. An index rather than a hash of the name so a bank
@@ -608,8 +609,11 @@ bool foldRow(const AssetManifestSpecies& r, uint16_t bankId, const AssetLayer& L
     bool anyFolded = false;
     for (uint32_t b = 0; b < kBiomeCount; ++b) {
         const int64_t w = int64_t(authored[b]);
-        const int64_t num = w * int64_t(g.abundanceQ10) * cell * cell;
-        const int64_t den = 1024 * spacing * spacing;
+        const bool overridden=policy && (policy->biomeMask & (1u<<b));
+        const int64_t served=overridden?std::max<int64_t>(cell,policy->spacingMm):spacing;
+        const int64_t abundance=overridden?policy->abundanceQ10:g.abundanceQ10;
+        const int64_t num = w * abundance * cell * cell;
+        const int64_t den = 1024 * served * served;
         const int64_t folded = (num + den / 2) / den;
         s.weightPerMille[b] = static_cast<uint16_t>(folded > 1000 ? 1000 : folded);
         if (s.weightPerMille[b] > 0) anyFolded = true;
@@ -620,7 +624,7 @@ bool foldRow(const AssetManifestSpecies& r, uint16_t bankId, const AssetLayer& L
 } // namespace
 
 AssetTableBuildStats assetSpeciesTableFromManifest(const AssetManifest& m,
-                                                   std::vector<AssetSpecies>& speciesOut) {
+    std::vector<AssetSpecies>& speciesOut, const std::vector<AssetDensityPolicy>& policies) {
     AssetTableBuildStats st;
     speciesOut.clear();
     const std::vector<AssetLayer>& layers = m.layers();
@@ -662,8 +666,10 @@ AssetTableBuildStats assetSpeciesTableFromManifest(const AssetManifest& m,
 
         AssetSpecies candidate;
         int emitted = 0;
-        if (foldRow(r, static_cast<uint16_t>(i), L, effectiveGates(r, nullptr), baseW, r,
-                    densityRow, candidate)) {
+        const AssetDensityPolicy* policy=nullptr;
+        for(const auto& p:policies)if(p.bankId==i&&p.spacingMm>0&&p.spacingMm<=1000000&&p.abundanceQ10<=1024){policy=&p;break;}
+        if (foldRow(r, static_cast<uint16_t>(i), L, effectiveGates(r,nullptr), baseW, r,
+                    densityRow, candidate, policy)) {
             speciesOut.push_back(candidate);
             ++emitted;
         }
@@ -671,8 +677,8 @@ AssetTableBuildStats assetSpeciesTableFromManifest(const AssetManifest& m,
             uint16_t variantW[kBiomeCount] = {};
             variantW[ovs[k].biome] = r.biomeWeightPerMille[ovs[k].biome];
             if (variantW[ovs[k].biome] == 0) continue; // override on a dark biome: nothing to carry
-            if (foldRow(r, static_cast<uint16_t>(i), L, effectiveGates(r, &ovs[k]), variantW, r,
-                        densityRow, candidate)) {
+            if (foldRow(r, static_cast<uint16_t>(i), L, effectiveGates(r,&ovs[k]), variantW, r,
+                        densityRow, candidate, policy)) {
                 speciesOut.push_back(candidate);
                 ++emitted;
             }

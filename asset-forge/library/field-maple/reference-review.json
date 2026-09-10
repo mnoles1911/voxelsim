@@ -1,0 +1,93 @@
+{
+  "species": "field-maple",
+  "status": "passed pilot review",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "findings": [
+    "Compact irregular crown and low forks suit an edge tree. Small variants read as young stock; autumn photo informs outline only."
+  ],
+  "reviewed_images": [
+    {
+      "image_id": "11500",
+      "source": "https://plants.ces.ncsu.edu/plants/acer-campestre/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    },
+    {
+      "image_id": "11479",
+      "source": "https://plants.ces.ncsu.edu/plants/acer-campestre/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    }
+  ],
+  "taxon": "acer-campestre",
+  "sources": [
+    "https://plants.ces.ncsu.edu/plants/acer-campestre/"
+  ],
+  "habitat": "edge",
+  "reviewed_generator": "temperate-shoots-v1",
+  "review_date": "2026-09-07",
+  "assessment": "Initial pilot rejected; v2 replacement requires a new comparison.",
+  "art_baseline": {
+    "season": "spring",
+    "foliage": "Species-appropriate spring foliage and fresh growth; flowering only where appropriate to the species.",
+    "reference_policy": "Use spring photographs for finished color and foliage. Other seasons may inform branch structure only.",
+    "out_of_scope": [
+      "seasonal transitions",
+      "seasonal recoloring"
+    ]
+  },
+  "previous_findings": [
+    "Lower trunk and crown are overly regular; leaf groups merge into a featureless mass at this scale."
+  ],
+  "generator_digest": "6d0b2c04db2c83b942e5b228219a87f514e03cf06752831f8ac02256fa4cfa85",
+  "review_scope": "Stylized spring vertical slice; source acceptance is separate from world variant endorsement.",
+  "pilot_artifacts": {
+    "1": "ae1365f1e94303adc15ffb59eff468e362c14bbcee2dccdac763fbfdbc0fbe4c",
+    "4": "c7c4c83607d490a27fd538eddb277ff3ab80e85502cdac99e43ace476fe29493",
+    "7": "a2967360092768b29a4b4b33993e1c0cf69eee03f708dde4b5aca7ad36b2e81f"
+  },
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "a56cc90c11133baf3f65eb8e4deb3884eb9d49a3da7debf09b22cba9975399ac"
+  }
+}

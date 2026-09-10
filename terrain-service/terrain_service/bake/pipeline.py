@@ -4224,6 +4224,9 @@ class BakeResult:
     place_talus: "np.ndarray | None" = None
     place_curv: "np.ndarray | None" = None
     place_heat: "np.ndarray | None" = None
+    # Post-bake source artifact only; not a new runtime wire plane. Includes
+    # final lake, river and sea samples, packed little-endian bits per row.
+    placement_water_mask_packed: "np.ndarray | None" = None
 
 
 def basin_filter(consts: BakeConstants = CONSTANTS) -> "_basins.BasinFilter":
@@ -5548,6 +5551,10 @@ def bake_tile(
         lake_wet_interior=(bathy_depth >= 0),
         river_wet_pad=river_wet_pad,
     )
+    placement_water_mask_packed = _placement.pack_final_water_mask(
+        out["z"][sl, sl], bathy_depth >= 0,
+        None if river_wet_pad is None else river_wet_pad[sl, sl],
+    )
     del river_wet_pad
     out["cpu_seconds"]["B7.placement_channels"] = time.process_time() - c0
 
@@ -5714,6 +5721,7 @@ def bake_tile(
         place_talus=place["talus"],
         place_curv=place["curv"],
         place_heat=place["heat"],
+        placement_water_mask_packed=placement_water_mask_packed,
         superblock_fingerprint=(
             "" if inflow_source is None else inflow_source.fingerprint_hex
         ),

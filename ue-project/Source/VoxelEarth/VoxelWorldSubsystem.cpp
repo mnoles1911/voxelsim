@@ -1,4 +1,13 @@
 #include "VoxelWorldSubsystem.h"
+#include "voxelcore/foundationquery.h"
+#include "VoxelAppearanceBankBinding.h"
+#include "VoxelEcologicalPlacement.h"
+#include "VoxelAppearanceTouchedPage.h"
+#include "VoxelTerrainAppearancePage.h"
+#include "voxelcore/assetrequestbounds.h"
+#include "VoxelDirectCoarseAppearance.h"
+#include "VoxelRecursiveMipTestHook.h"
+#include "ProfilingDebugging/CpuProfilerTrace.h"
 #include "VoxelTreeFellingPrototype.h"
 #include "VoxelDetachedPersistence.h"
 #include "VoxelSaveJobs.h"
@@ -51,7 +60,8 @@
 // shared relay actor itself). Both are ordinary same-module UE classes, not
 // the voxel-core boundary, so including them from this .cpp is fine.
 #include "VoxelEarthPlayerController.h"
-#include "VoxelDebris.h" // M5 destruction: cosmetic falling-debris actor spawned for each detached island
+#include "VoxelDebris.h"
+#include "VoxelDebrisCapture.h" // M5 destruction: cosmetic falling-debris actor spawned for each detached island
 #include "VoxelEditRelay.h"
 // W2 dig-breach hook (docs/voxel-earth-implementation-plan.md SS3.7 item 2):
 // TryDig/CarveSphere notify the water subsystem of newly-cleared voxels so
@@ -95,6 +105,8 @@
 #include "voxelcore/lakes.h"
 #include "voxelcore/tilestore.h"
 #include "voxelcore/world.h"
+#include "voxelcore/worldquery.h"
+#include "Serialization/JsonSerializer.h"
 
 #include "Components/SceneComponent.h"
 #include "Containers/Queue.h"
@@ -818,6 +830,8 @@ private:
 // pointer this returns (both cache hits and freshly-built bricks are copied
 // in here) so pointers stay valid for the sampler's whole lifetime, exactly
 // like vxc::MipChain<B>::cache_ did per-job in wave 1.
+using FRecursiveMipTraceFn = vxc::AssetAppearanceTrace;
+
 class FCachedMipBuilder
 {
 public:
@@ -923,6 +937,46 @@ public:
 		return &It->second;
 	}
 
+    // Optional source witness. A shared-cache parent is NOT trusted as source
+    // identity: re-evaluate its eight immediate children, verify its material,
+    // and descend only the selected contributor. All reads use the same source
+    // and local/shared material caches as normal geometry generation.
+    bool TraceCell(int32 Level,int64 X,int64 Y,int64 Z,
+        int64& FinestX,int64& FinestY,int64& FinestZ,vxc::MaterialId& Material)
+    {
+        FinestX=FinestY=FinestZ=0;Material=vxc::MAT_AIR;
+        if(Level<0||Level>7||(GlobalEditEpoch&&GlobalEditEpoch->load()!=EpochSnapshot))return false;
+        constexpr int64 B=VoxelCoords::BrickEdgeVoxels;
+        const int64 Scale=int64(1)<<Level;
+        // Preflight the entire finest footprint, so Brick's signed int32 child
+        // keys and every subsequent multiply/add remain representable.
+        const int64 MinCell=vxc::floorDiv(int64(MIN_int32)*B,Scale);
+        const int64 MaxCell=vxc::floorDiv((int64(MAX_int32)+1)*B-1,Scale);
+        for(int64 C:{X,Y,Z})if(C<MinCell||C>MaxCell)return false;
+        auto Read=[&](int32 L,int64 CX,int64 CY,int64 CZ){
+            const vxc::BrickKey Key{int32(vxc::floorDiv(CX,B)),int32(vxc::floorDiv(CY,B)),int32(vxc::floorDiv(CZ,B))};
+            const BrickT* Value=Brick(L,Key);
+            return Value?Value->get(int(vxc::floorMod(CX,B)),int(vxc::floorMod(CY,B)),int(vxc::floorMod(CZ,B))):vxc::MAT_AIR;
+        };
+        const auto Original=Read(Level,X,Y,Z);
+        for(int32 L=Level;L>0;--L){
+            const auto Parent=Read(L,X,Y,Z);
+            const int64 CX=X*2,CY=Y*2,CZ=Z*2;
+            const vxc::BrickKey Key{int32(vxc::floorDiv(CX,B)),int32(vxc::floorDiv(CY,B)),int32(vxc::floorDiv(CZ,B))};
+            const BrickT* Child=Brick(L-1,Key);vxc::MaterialId Cells[8]={};
+            const int LX=int(vxc::floorMod(CX,B)),LY=int(vxc::floorMod(CY,B)),LZ=int(vxc::floorMod(CZ,B));
+            if(Child)for(int I=0;I<8;++I)Cells[I]=Child->get(LX+(I&1),LY+((I>>1)&1),LZ+(I>>2));
+            const auto Pick=vxc::reduceMipCell(Cells,Threshold,bSurfacePreserve);
+            if(Pick.material!=Parent||Parent!=Original)return false;
+            if(Parent==vxc::MAT_AIR)return !GlobalEditEpoch||GlobalEditEpoch->load()==EpochSnapshot;
+            if(Pick.childIndex>=8)return false;
+            X=CX+(Pick.childIndex&1);Y=CY+((Pick.childIndex>>1)&1);Z=CZ+(Pick.childIndex>>2);
+        }
+        const auto Finest=Read(0,X,Y,Z);
+        if(Finest!=Original||(GlobalEditEpoch&&GlobalEditEpoch->load()!=EpochSnapshot))return false;
+        FinestX=X;FinestY=Y;FinestZ=Z;Material=Finest;return true;
+    }
+
 private:
 	Level0SourceFn Level0Source;
 	FSharedMipCache* SharedCache;
@@ -948,7 +1002,8 @@ private:
 std::function<vxc::MaterialId(int64, int64, int64)> MakeLevelSampler(const vxc::GeneratedWorld<VoxelCoords::BrickEdgeVoxels>& Gen,
                                                                        int32 Level, vxc::Counters* PerfCounters,
                                                                        FSharedMipCache* SharedCache,
-                                                                       const std::atomic<uint64>* GlobalEditEpoch, uint64 EpochSnapshot)
+                                                                       const std::atomic<uint64>* GlobalEditEpoch, uint64 EpochSnapshot,
+                                                                       FRecursiveMipTraceFn* OutTrace = nullptr)
 {
 	using namespace vxc;
 	constexpr int32 B = VoxelCoords::BrickEdgeVoxels;
@@ -983,6 +1038,10 @@ std::function<vxc::MaterialId(int64, int64, int64)> MakeLevelSampler(const vxc::
 	};
 
 	TSharedPtr<FJobMipState> State = MakeShared<FJobMipState>(Gen, PerfCounters, SharedCache, GlobalEditEpoch, EpochSnapshot);
+    if(OutTrace)*OutTrace=[State,Level](int64 X,int64 Y,int64 Z,int64& FX,int64& FY,int64& FZ,vxc::MaterialId& M){
+        return State->Builder.TraceCell(Level,X,Y,Z,FX,FY,FZ,M);
+    };
+
 
 	return [State, Level](int64 X, int64 Y, int64 Z) -> MaterialId
 	{
@@ -1081,7 +1140,7 @@ std::function<vxc::MaterialId(int64, int64, int64)> MakeCoarseLevelSampler(const
 	};
 }
 
-// Phase 2 of the streaming plan (docs/marcher-handoff-2026-08-22.md §5):
+// Phase 2 of the streaming plan (docs/marcher-handoff-2026-08-22.md Â§5):
 // share the (32+2)^2 column grid across the Z-siblings of one footprint.
 //
 // THE WASTE THIS REMOVES, measured: the level-0 grid build is ~72% of a
@@ -1632,7 +1691,7 @@ bool VoxelChunkQuadsIdentical(const TArray<FVoxelChunkQuad>& A, const TArray<FVo
 // is job-local (this single re-mesh call) only, same cost profile a per-job
 // vxc::MipChain<8> had in wave 1.
 std::function<vxc::MaterialId(int64, int64, int64)> MakeOverlayAwareLevelSampler(const vxc::World<VoxelCoords::BrickEdgeVoxels>& Voxels,
-                                                                                   int32 Level)
+                                                                                   int32 Level, FRecursiveMipTraceFn* OutTrace = nullptr)
 {
 	using namespace vxc;
 	constexpr int32 B = VoxelCoords::BrickEdgeVoxels;
@@ -1663,6 +1722,10 @@ std::function<vxc::MaterialId(int64, int64, int64)> MakeOverlayAwareLevelSampler
 	};
 
 	TSharedPtr<FOverlayMipState> State = MakeShared<FOverlayMipState>(Voxels);
+    if(OutTrace)*OutTrace=[State,Level](int64 X,int64 Y,int64 Z,int64& FX,int64& FY,int64& FZ,vxc::MaterialId& M){
+        return State->Builder.TraceCell(Level,X,Y,Z,FX,FY,FZ,M);
+    };
+
 
 	return [State, Level](int64 X, int64 Y, int64 Z) -> MaterialId
 	{
@@ -1681,7 +1744,7 @@ std::function<vxc::MaterialId(int64, int64, int64)> MakeOverlayAwareLevelSampler
 
 // Overlay-aware COARSE chunk sampler -- the game-thread counterpart of
 // FCoarseChunkGridSampler, and the reason a shoreline edit no longer parks the
-// game thread for minutes (backlog §14).
+// game thread for minutes (backlog Â§14).
 //
 // MakeOverlayAwareLevelSampler above is the 8^L mip recursion with World::brickAt
 // as its level-0 source, and it was still the ONLY level>=1 game-thread sampler
@@ -2063,6 +2126,27 @@ void ComputeCubeMinCorner(int64 AnchorX, int64 AnchorY, int64 AnchorZ, int32 Fac
 }
 } // namespace
 
+#if WITH_DEV_AUTOMATION_TESTS
+FVoxelRecursiveMipTestResult VoxelTestRecursiveMipTrace(
+    std::function<const vxc::Brick<8>*(const vxc::BrickKey&)> Source,
+    const TArray<FVoxelRecursiveMipSeed>& Seeds,int32 Level,int64 X,int64 Y,int64 Z,
+    bool Shared,bool WarmJob,bool AdvanceEpoch,int32 Threshold)
+{
+    FSharedMipCache Cache;std::atomic<uint64> Epoch{17};
+    if(Shared)for(const auto& Seed:Seeds)Cache.Insert(Seed.Level,Seed.Key,Seed.Brick);
+    if(WarmJob){
+        FCachedMipBuilder First(Source,Shared?&Cache:nullptr,&Epoch,17,Threshold);
+        int64 FX,FY,FZ;vxc::MaterialId M;
+        First.TraceCell(Level,X,Y,Z,FX,FY,FZ,M);
+    }
+    FCachedMipBuilder Builder(std::move(Source),Shared?&Cache:nullptr,&Epoch,17,Threshold);
+    if(AdvanceEpoch)Epoch.store(18);
+    FVoxelRecursiveMipTestResult Result;
+    Result.Valid=Builder.TraceCell(Level,X,Y,Z,Result.X,Result.Y,Result.Z,Result.Material);
+    return Result;
+}
+#endif
+
 // Streaming bookkeeping types. File-scope (not exposed to the UHT-parsed
 // header -- see VoxelWorldSubsystem.h comment on FVoxelWorldImpl).
 namespace VoxelStreaming
@@ -2261,6 +2345,11 @@ struct FJobResult
 {
 	VoxelCoords::FVoxelLevelChunkKey Key;
 	uint64 GenerationId = 0;
+    // Exact CPU level-zero appearance preparation, retained with its geometry.
+    // Null means not prepared; non-null empty words explicitly mean fallback.
+    TSharedPtr<const FVoxelTerrainAppearancePage,ESPMode::ThreadSafe> AppearancePage;
+    uint64 AppearanceEditEpoch=0;
+    FString AppearancePreparationError;
 	TArray<FVoxelChunkQuad> Quads;
 	// CPU worker arm ONLY: wall time inside the worker task body, pickup to
 	// enqueue (docs/debug-tooling-plan.md P1 "Worker timings"). This is SERVICE
@@ -2721,9 +2810,10 @@ namespace VoxelBrickCpuArm
 	// already holds Root for the quad path's identical call, does the sampling.
 	inline void Publish(const VoxelCoords::FVoxelLevelChunkKey& LevelKey,
 	                    const FVoxelBrickCpuPackRef& Pack,
-	                    const FVoxelBrickChunkShading& Shading)
+	                    const FVoxelBrickChunkShading& Shading,
+                        TSharedPtr<const FVoxelTerrainAppearanceUpload,ESPMode::ThreadSafe> Appearance=nullptr)
 	{
-		// Hook 5 (docs/apply-fast-path-2026-08-23.md §3): ONE definition of
+		// Hook 5 (docs/apply-fast-path-2026-08-23.md Â§3): ONE definition of
 		// the will-this-publish predicate, shared with VoxelApplyFast's guard
 		// arm. The guard's correctness depends on this test and Publish's
 		// early-out never drifting apart, and nothing could observe the drift
@@ -2732,7 +2822,7 @@ namespace VoxelBrickCpuArm
 		{
 			return;
 		}
-		GetGlobalVoxelBrickPool().AddChunkFromCpu(Pack, MakeKey(LevelKey), Shading);
+		GetGlobalVoxelBrickPool().AddChunkFromCpu(Pack, MakeKey(LevelKey), Shading, MoveTemp(Appearance));
 	}
 }
 
@@ -3424,7 +3514,7 @@ bool L0GridScratchEnabled()
 // worldgen.ush's version lock exists to prevent. Worker pool chosen; GPU
 // rejected on the bank-residency problem, not on cost.
 //
-// DEFAULT OFF so a control leg is byte-identical: with the switch off nothing
+// Legacy worlds default OFF so a control leg is byte-identical: with the switch off nothing
 // below is read, no cache is consulted and no task is launched -- one bool test
 // per resolve site.
 //
@@ -3435,7 +3525,13 @@ bool L0GridScratchEnabled()
 // interesting.
 bool AsyncAssetResolveEnabled()
 {
-	static const bool bEnabled = FParse::Param(FCommandLine::Get(), TEXT("VoxelAsyncAssetResolve"));
+	static const bool bEnabled = []
+	{
+		if (FParse::Param(FCommandLine::Get(), TEXT("VoxelAsyncAssetResolve"))) return true;
+		FString EcologyPath;
+		return !FParse::Param(FCommandLine::Get(), TEXT("VoxelNoEcologyResolveCache")) &&
+			FParse::Value(FCommandLine::Get(), TEXT("VoxelEcologyConfig="), EcologyPath) && !EcologyPath.IsEmpty();
+	}();
 	return bEnabled;
 }
 
@@ -3450,6 +3546,12 @@ bool AsyncAssetResolveEnabled()
 // resolved twice, and the pending queue is ~2,048 deep against ~96 dispatches
 // per tick, so a warm task has tens of ticks of head start. NOT TUNED BY
 // MEASUREMENT -- nothing has been run.
+bool PredictiveAssetResolveEnabled()
+{
+	static const bool Enabled = FParse::Param(FCommandLine::Get(), TEXT("VoxelPredictiveAssetResolve"));
+	return Enabled && AsyncAssetResolveEnabled();
+}
+
 int32 AsyncAssetResolveWarmPerTick()
 {
 	static const int32 N = []
@@ -3626,7 +3728,7 @@ int32 L0GridCacheProbeEntries()
 	return Entries;
 }
 
-// Phase 2 (docs/marcher-handoff-2026-08-22.md §5): the REAL cross-job column
+// Phase 2 (docs/marcher-handoff-2026-08-22.md Â§5): the REAL cross-job column
 // grid cache the probe above only simulates -- see FSharedColumnGridCache's
 // doc comment for the design and, above all, the residency gate.
 //
@@ -6511,7 +6613,7 @@ struct FVoxelWorldImpl
 	// actually render: the amplifier consumes an ITileSampler and treats what
 	// it returns as the carrier's control lattice, so pointing it at
 	// FVoxelFineTileStreamer::WorldSampler() (pixelSizeMm() == 1875) evaluates
-	// docs/vxtl-v2-format.md §8's spline on the baked control points using the
+	// docs/vxtl-v2-format.md Â§8's spline on the baked control points using the
 	// already-shipped v9 carrier, and amplifier.cpp's isFineTier() branch
 	// selects kFineDetailOctaves so the client stops synthesising the 25.6 m /
 	// 6.4 m bands the raster now carries for real.
@@ -6614,7 +6716,19 @@ struct FVoxelWorldImpl
 						// nothing without the 382 detail entities beside it.
 						const vxc::AssetTableBuildStats Stats =
 							vxc::assetSpeciesTableFromManifest(AssetManifestData, AssetSpeciesTable);
-						AssetBanks.configure(&AssetManifestData, TCHAR_TO_UTF8(*FPaths::Combine(AssetDir, TEXT("banks"))));
+						FString AppearanceError;
+                        auto AppearanceCatalog=FVoxelPublishedAppearanceCatalog::Load(AssetDir,AppearanceError);
+                        if(AppearanceCatalog) {
+                            AppearanceBankBinding=MakeShared<FVoxelAppearanceBankBinding,ESPMode::ThreadSafe>(AppearanceCatalog);
+                            const auto Binding=AppearanceBankBinding;
+                            AssetBanks.configure(&AssetManifestData,TCHAR_TO_UTF8(*FPaths::Combine(AssetDir,TEXT("banks"))),
+                                [Binding](const vxc::AssetGrid& Grid,const uint8_t* Bytes,size_t Size){Binding->Observe(Grid,Bytes,Size);});
+                            UE_LOG(LogVoxelEarth,Log,TEXT("Approved appearance source snapshot: %d resources"),AppearanceCatalog->Sources().Num()-1);
+                        } else {
+                            AppearanceBankBinding.Reset();
+                            AssetBanks.configure(&AssetManifestData,TCHAR_TO_UTF8(*FPaths::Combine(AssetDir,TEXT("banks"))));
+                            UE_LOG(LogVoxelEarth,Warning,TEXT("Approved appearance unavailable: %s"),*AppearanceError);
+                        }
 						// TIGHTEN BEFORE INSTALL, never after: every bound downstream
 						// is made of these caps, so the field must never see the
 						// authored ones. vxc_assetprobe calls the same function for
@@ -6636,6 +6750,20 @@ struct FVoxelWorldImpl
 						AssetBankTap.Resize(AssetManifestData.species().size());
 						AssetFieldObj.setBankSource(&AssetBankTap);
 						AssetFieldObj.setSeed(Seed);
+                        FString EcologyPath;
+                        if(FParse::Value(FCommandLine::Get(),TEXT("VoxelEcologyConfig="),EcologyPath)){
+                            vxc::EcoPlacementConfig Ecology;
+                            FString EcologyError;
+                            if(!AppearanceBankBinding ||
+                               !VoxelEcologicalPlacement::Load(EcologyPath,AssetDir,AssetManifestData,AssetBanks,
+                                   *AppearanceBankBinding,Ecology,EcologyError) || !VoxelEcologicalPlacement::Install(Ecology,AssetManifestData,AssetFieldObj,AssetSpeciesTable)){
+                                UE_LOG(LogVoxelEarth,Error,TEXT("VoxelEcology: configuration refused: %s"),
+                                    EcologyError.IsEmpty()?TEXT("missing publication binding or layer-bound mismatch"):*EcologyError);
+                            }else{
+                                UE_LOG(LogVoxelEarth,Log,TEXT("VoxelEcology: installed %d species / %d communities from %s"),
+                                    int(Ecology.species.size()),int(Ecology.fields.communityCount),*EcologyPath);
+                            }
+                        }
 						if (AssetFieldObj.empty())
 						{
 							UE_LOG(LogVoxelEarth, Error,
@@ -6701,7 +6829,10 @@ struct FVoxelWorldImpl
 							       (long long)AssetTallestTerrainVox,
 							       double(AssetTallestTerrainVox) / double(VoxelCoords::ChunkEdgeVoxels),
 							       (long long)(CapMm > 0 ? vxc::floorDiv(CapMm, int64(vxc::kVoxelSizeMm)) + 1 : 0));
-							Voxels.setAssetField(&AssetFieldObj);
+                            if(FParse::Param(FCommandLine::Get(),TEXT("VoxelAssetScatterOff"))){
+                                AssetTallestTerrainVox=0;
+                                UE_LOG(LogVoxelEarth,Log,TEXT("VoxelAssets: automatic scatter explicitly disabled for isolated actor preview"));
+                            }else Voxels.setAssetField(&AssetFieldObj);
 							// THE CHANNEL BINDING RIDES WITH THE FIELD (see
 							// FVoxelAssetChannelSource). Installed here, in bring-up,
 							// before any worker reads -- the same narrow-door rule as
@@ -6900,6 +7031,7 @@ struct FVoxelWorldImpl
 	// as TileDir and FineTileDir above, deliberately.
 	vxc::AssetManifest AssetManifestData;
 	TWeakObjectPtr<UWorld> EnvironmentObjectWorld;
+	TSharedPtr<FVoxelAppearanceBankBinding,ESPMode::ThreadSafe> AppearanceBankBinding;
 	vxc::AssetBankLibrary AssetBanks;
 
 	// THE TALLEST ASSET THAT ACTUALLY EXISTS, in level-0 voxels above its anchor,
@@ -7098,6 +7230,7 @@ struct FVoxelWorldImpl
 	TUniquePtr<FVoxelAssetChannelSource> AssetChannels;
 
 	vxc::World<VoxelCoords::BrickEdgeVoxels> Voxels;
+	TUniquePtr<vxc::WorldQueryBatch<VoxelCoords::BrickEdgeVoxels>> MovementCollisionQueries;
 
 	// THE COARSE-TIER AMPLIFIER, for ring levels at or above
 	// VoxelTier::kFirstCoarseLevel.
@@ -7682,7 +7815,7 @@ struct FVoxelWorldImpl
 	// makes for GenPtr/QueuePtr/CounterPtr).
 	FSharedMipCache SharedMipCache;
 
-	// Phase 2 (marcher handoff §5): shared cross-job (Level, ChunkX, ChunkY)
+	// Phase 2 (marcher handoff Â§5): shared cross-job (Level, ChunkX, ChunkY)
 	// -> column-grid cache, consulted by the level-0 worker arm and
 	// FCoarseChunkGridSampler when -VoxelSharedGridCache= is set. Owned here
 	// for the same lifetime argument as SharedMipCache directly above -- and
@@ -7940,8 +8073,11 @@ struct FVoxelWorldImpl
 		uint64 GenerationId = 0;
 		// T4-1: a speculative result is PARKED on arrival, not applied -- nothing
 		// has asked for it, so it must not create a record or become visible.
-		bool bSpeculative = false;
-	};
+        bool bSpeculative = false;
+        TSharedPtr<const FVoxelTerrainAppearancePage,ESPMode::ThreadSafe> AppearancePage;
+        uint64 AppearanceEditEpoch=0;
+    };
+    uint64 AppearanceSpeculativeDeclines=0;
 	TMap<uint64, FGpuPendingJob> GpuJobsPending;
 
 	// Creates the runner on first use and returns it. Null only if the RHI
@@ -8190,7 +8326,7 @@ struct FVoxelWorldImpl
 	// parked adoption, budget, cutoff, nearest-admit routing, then
 	// AdmitCandidateCommit -- extracted from the entry loop's AddCandidate
 	// lambda so the GPU-delta consumer runs the ONE spelling of it the cell
-	// sweep runs (§7 of docs/gpu-residency-t42-plan.md: "extracted
+	// sweep runs (Â§7 of docs/gpu-residency-t42-plan.md: "extracted
 	// AddCandidate -- fine gate, parks, caps, overlay routing all intact").
 	// The per-cell captures the lambda closed over (ChunkEdge, CenterX,
 	// CenterY) are recomputed from the key with the identical expressions --
@@ -8342,6 +8478,19 @@ struct FVoxelWorldImpl
 	// footprint -- without it the warm pass would be a work MULTIPLIER, not a
 	// mover.
 	mutable TSet<VoxelCoords::FVoxelLevelChunkKey> AssetResolveInFlight;
+	// Opt-in admission prewarm: bounded queue and a subset of shared in-flight keys.
+	TArray<VoxelCoords::FVoxelLevelChunkKey> PredictiveAssetQueue;
+	TMap<VoxelCoords::FVoxelLevelChunkKey, uint64> PredictiveAssetInFlight;
+	FVector PredictiveAssetPreviousAnchor = FVector::ZeroVector;
+	VoxelCoords::FVoxelChunkKey PredictiveAssetQueueAnchor{};
+	bool bPredictiveAssetHasAnchor = false;
+	int32 PredictiveAssetCursor = 0;
+	uint64 PredictiveAssetProbes = 0, PredictiveAssetLaunched = 0, PredictiveAssetLanded = 0;
+	uint64 PredictiveAssetRaced = 0, PredictiveAssetNotResident = 0, PredictiveAssetRejected = 0, PredictiveAssetEpochRejected = 0;
+	double PredictiveAssetTickMs = 0, PredictiveAssetMaxTickMs = 0, PredictiveAssetNextRefresh = 0;
+	double PredictiveAssetNextEmptyRefresh = 0, PredictiveAssetQueueBuildMs = 0, PredictiveAssetMaxQueueBuildMs = 0;
+	uint64 PredictiveAssetQueueBuilds = 0, PredictiveAssetQueueCells = 0;
+
 
 	// Every key EVER stored in AssetResolveCache this session. Game thread
 	// only, diagnosis only: it exists to split a dispatch-peek miss into
@@ -8749,7 +8898,7 @@ struct FVoxelWorldImpl
 	float LogTimerAccumSeconds = 0.f;
 	// S0-2: TotalChunksLoaded as of the previous MaybeLogCounters window, so
 	// the periodic log can report a per-window rate (apply rate decaying
-	// across a leg is the §2.2 prediction this counter tests) rather than
+	// across a leg is the Â§2.2 prediction this counter tests) rather than
 	// only the leg-long mean TotalChunksLoaded already gives.
 	int64 ChunksLoadedAtLastLog = 0;
 
@@ -9195,7 +9344,7 @@ struct FVoxelWorldImpl
 	// zero for the entire flight. Anything reading GetVelocity() reports a
 	// stationary camera while the world streams past at 20 m/s -- and it reports
 	// it on exactly the runs this is meant to explain
-	// (docs/speculative-generation-plan.md §2.4).
+	// (docs/speculative-generation-plan.md Â§2.4).
 	//
 	// The anchor is also the RIGHT point to measure: it is what every ring
 	// radius, admission cutoff and retention decision is computed against, so
@@ -9358,6 +9507,20 @@ struct FVoxelWorldImpl
 	double AccumGpuSubmitRasterMs = 0.0;  // atlas PrepareRequest / FillRasterWindow
 	double AccumGpuSubmitAssetsMs = 0.0;  // resolve + span tables + instance marshal
 	double AccumGpuSubmitPoolMs = 0.0;    // direct-to-pool decision incl. GI probe
+	double AccumSubmitAssetResolveMs = 0.0;
+	double AccumSubmitAssetAppearanceMs = 0.0;
+    struct FAppearanceStageWindow { FVoxelAppearancePrepareStats Total,Max;uint64 Calls=0; };
+    FAppearanceStageWindow AppearanceStageWindows[8];
+	uint64 AccumAssetRequestCandidates = 0, AccumAssetRequestPruned = 0;
+	double AccumSubmitAssetMarshalMs = 0.0;
+    enum class EAssetResolveCaller : uint8 {Admission,GpuSubmit,EditedPage};
+    struct FAssetResolveCallerStats {
+        uint64 Calls=0,Hits=0,ColdMisses=0,ForcedInline=0,Level0Calls=0,CoarseCalls=0;
+        double TotalMs=0,InlineMs=0,RawResolveMs=0,MaxCallMs=0,MaxRawResolveMs=0;
+    };
+    // Mutable only because admission queries are logically const. All three
+    // callers and the window report/reset execute on the game thread.
+    mutable FAssetResolveCallerStats AssetResolveCallerStats[3];
 	double AccumGpuSubmitMgrMs = 0.0;     // Manager->Submit + GpuJobsPending insert
 	double AccumGpuSubmitTotalMs = 0.0;   // whole SubmitGpuMeshJob wall
 	int64 GpuSubmitCallsSinceLog = 0;     // calls entered (success, decline, speculative)
@@ -9631,7 +9794,7 @@ struct FVoxelWorldImpl
 	int64 ZeroQuadAppliesSinceLog = 0;  // ...of which meshed to zero quads (buried: real work, no component)
 
 	// WHICH EXIT DrainResults TOOK, per 5s window. Wave S0
-	// (docs/speculative-generation-plan.md §4, executing T0-1).
+	// (docs/speculative-generation-plan.md Â§4, executing T0-1).
 	//
 	// This exists because the open P0's headline reading may be an artifact of a
 	// metric. The published claim is "apply budget only 8.5% saturated -- results
@@ -9654,14 +9817,14 @@ struct FVoxelWorldImpl
 	int64 DrainExitSmoothCapSinceLog = 0;   // Applied hit the SMOOTHED ceiling (cruise-burst spread)
 	int64 DrainExitDrainCapSinceLog = 0;    // Drains hit kMaxResultDrainsPerFrame (stale backlog)
 
-	// WHERE PER-APPLY TIME GOES, per 5s window. §1a prices the table push as the
+	// WHERE PER-APPLY TIME GOES, per 5s window. Â§1a prices the table push as the
 	// dominant term and the batching wave is built on that, but the split has
 	// never been measured. Milliseconds accumulated across the window; divide by
 	// AppliesTimedSinceLog for a per-apply figure.
 	//
 	// POOLED BRANCH ONLY -- the component branch is the control arm and is not
 	// split; see the note at the top of it in ApplyMeshResult. The fourth stage
-	// §1a names, the table push, is not here either: it happens inside the pool
+	// Â§1a names, the table push, is not here either: it happens inside the pool
 	// add, and splitting it needs the pool's own clocks. That is
 	// UVoxelGpuPoolComponent::GetAndResetPushStats, and poolAdd below is its
 	// total, so the two lines add up.
@@ -10256,7 +10419,7 @@ private:
 	// nothing waits on a warm task. Valid until the next call or the next prune.
 	const std::vector<vxc::AssetField::ResolvedAssetInstance>* ResolvedAssetsForFootprint(
 		int32 Level, int32 ChunkX, int32 ChunkY,
-		std::vector<vxc::AssetField::ResolvedAssetInstance>& OutScratch) const;
+		std::vector<vxc::AssetField::ResolvedAssetInstance>& OutScratch,EAssetResolveCaller Caller) const;
 	// Is this footprint's resolve derived from RESIDENT fine tiles? The dilation
 	// by the tallest terrain layer's radius is the same one FootprintChunkZRangeCached
 	// applies, and for the same reason: level-0 resolves read asset anchors up to
@@ -10266,6 +10429,8 @@ private:
 	void DrainAssetResolveResults();
 	// Game thread: launch warm tasks for queued-but-uncached footprints.
 	void WarmAssetResolves();
+	bool LaunchAssetResolveWarm(const VoxelCoords::FVoxelLevelChunkKey& CacheKey);
+	void WarmPredictiveAssetResolves(const FVector& Anchor, float DeltaTime);
 
 	// Load-before-unload, ring-gap fix: the Z half of "is the replacement chunk
 	// this stand-in is waiting on actually DESIRED" -- see
@@ -10342,7 +10507,8 @@ private:
 	                      const VoxelCoords::FVoxelLevelChunkKey& Key, VoxelStreaming::FChunkRecord& Rec, TArray<FVoxelChunkQuad>&& Quads,
 	                      bool bIsGameThreadMesh,
 	                      const FVoxelGpuQuadPayloadRef& GpuQuads = FVoxelGpuQuadPayloadRef(),
-	                      int32 GpuQuadCount = 0);
+	                      int32 GpuQuadCount = 0,
+                          TSharedPtr<const FVoxelTerrainAppearanceUpload,ESPMode::ThreadSafe> Appearance = nullptr);
 	// M1 hitch-gap wave (component pooling): returns a pooled component
 	// (popped + counted as a reuse) if ComponentPool is non-empty, else falls
 	// back to the pre-pooling NewObject+SetupAttachment+RegisterComponent
@@ -10510,8 +10676,9 @@ public:
 	// (subsystem, which has UWorld) can spawn the COSMETIC AVoxelDebris bodies.
 	// bOutRegionClamped is set true if the region hit the size cap. Returns the
 	// island count. No-op returning 0 if ClearedVoxels is empty.
+	bool CaptureDebrisAppearance(const TArray<VoxelCoords::FVoxelCoord>& Cells,TArray<FVoxelDebrisCellAppearance>& Out);
 	int32 DetectAndRemoveIslands(const TArray<VoxelCoords::FVoxelCoord>& ClearedVoxels,
-	                             TArray<TArray<VoxelCoords::FVoxelCoord>>& OutIslands, bool& bOutRegionClamped);
+	                             TArray<TArray<VoxelCoords::FVoxelCoord>>& OutIslands, bool& bOutRegionClamped, TArray<TArray<FVoxelDebrisCellAppearance>>& OutAppearance);
 
 	// M5 LARGE-EDIT structural collapse (docs/status.md "Structural collapse
 	// (M5, large-edit)"; model + soundness argument in
@@ -10532,7 +10699,7 @@ public:
 	// OutPieces for the caller to hand to cosmetic AVoxelDebris bodies.
 	// Returns the number of collapsed pieces. Authority side, game thread.
 	int32 DetectAndRemoveCollapse(const TArray<VoxelCoords::FVoxelCoord>& ClearedVoxels,
-	                              TArray<TArray<VoxelCoords::FVoxelCoord>>& OutPieces);
+	                              TArray<TArray<VoxelCoords::FVoxelCoord>>& OutPieces, TArray<TArray<FVoxelDebrisCellAppearance>>& OutAppearance);
 private:
 
 	// --- Debug-tooling helpers (docs/debug-tooling-plan.md P1) ----------------
@@ -10623,10 +10790,7 @@ void FVoxelWorldImpl::TickHeightPyramid(const FVector& AnchorUU)
 	int64 ReachMm = 0;
 	if (const vxc::AssetField* Field = Voxels.assetField(); Field != nullptr && !Field->empty())
 	{
-		for (const vxc::AssetLayer& L : Field->layers())
-		{
-			if (L.terrainLattice && L.maxRadiusMm > ReachMm) { ReachMm = L.maxRadiusMm; }
-		}
+		ReachMm = Field->columnSamplingReachMm(true);
 	}
 
 	const double BudgetSec =
@@ -11335,10 +11499,26 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 	// None of these is a correctness hazard at the tens-of-milliseconds the
 	// bound imposes; all of them are latency, and maxHeldMs is the number that
 	// says how much.
+	// Unlike dispatch warming, this runs before exact R0 crown admission, every
+	// tick. It never waits or changes admission decisions on a cold miss.
+	if (VoxelStreamAdmission::PredictiveAssetResolveEnabled())
+	{
+		DrainAssetResolveResults();
+		WarmPredictiveAssetResolves(Anchor, DeltaTime);
+	}
+	// RECOMPUTE SPLIT (voxel.Stream.RecomputeBudgetMs, see FRecomputeSplitState):
+	// a parked pass is the strongest possible reason to recompute -- half the
+	// desired set exists and DispatchJobs is holding until the rest does. It is
+	// URGENT, not merely wanted, which is deliberate: -VoxelRecomputeDutyPct
+	// may delay a WHOLE recompute (that is latency), but it must never be able
+	// to leave one half-built (that is a world with a hole in it). Never true
+	// at the default budget of 0.
+	const bool bRecomputeSplitPending = RecomputeSplit.bActive;
 	const bool bRecomputeWanted = !bHasRecomputed || AnchorChunk.X != LastAnchorChunk.X ||
 	                              AnchorChunk.Y != LastAnchorChunk.Y || bUndergroundChanged ||
-	                              (bAnchorUnderground && AnchorChunk.Z != LastAnchorChunk.Z) || bAdmissionRefill;
-	const bool bRecomputeUrgent = !bHasRecomputed || bUndergroundChanged;
+	                              (bAnchorUnderground && AnchorChunk.Z != LastAnchorChunk.Z) ||
+	                              bAdmissionRefill || bRecomputeSplitPending;
+	const bool bRecomputeUrgent = !bHasRecomputed || bUndergroundChanged || bRecomputeSplitPending;
 	if (bRecomputeWanted && (bRecomputeUrgent || AllowRateBoundedRecompute()) &&
 	    VoxelTickBudget::MayStartRecompute(bRecomputeUrgent))
 	{
@@ -13188,6 +13368,11 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 				// VoxelSizeUU converts to voxels, which is what the amplifier takes.
 				const int64 CamVX = int64(FMath::FloorToDouble(LastAnchorLocation.X / VoxelCoords::VoxelSizeUU));
 				const int64 CamVY = int64(FMath::FloorToDouble(LastAnchorLocation.Y / VoxelCoords::VoxelSizeUU));
+				// Cover both the +/-64 column scan and the additional +/-60
+				// crown scan. Reuse one exact shortlist instead of resolving the
+				// ecological neighborhood for each of 272,250 sampled voxels.
+				const vxc::WorldQuery<VoxelCoords::BrickEdgeVoxels> ProbeQuery(
+					Voxels, {CamVX - 124, CamVY - 124, CamVX + 124, CamVY + 124});
 				for (int32 dy = -64; dy <= 64; dy += 4)
 				{
 					for (int32 dx = -64; dx <= 64; dx += 4)
@@ -13207,7 +13392,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 						// 25 m of headroom: cecropia bakes to 17.1 m.
 						for (int64 vz = TopSolid + 1; vz <= TopSolid + 250; ++vz)
 						{
-							if (Voxels.materialAt(vx, vy, vz) != vxc::MAT_AIR)
+							if (ProbeQuery.materialAt(vx, vy, vz) != vxc::MAT_AIR)
 							{
 								AnySolid = true; ++Run;
 								const int32 Z = int32(vz - TopSolid);
@@ -13262,10 +13447,10 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 						bool AnyAtR = false;
 						for (int32 K = -R; K <= R && !AnyAtR; ++K)
 						{
-							if (Voxels.materialAt(TallestVX + K, TallestVY + R, CrownZ) != vxc::MAT_AIR ||
-							    Voxels.materialAt(TallestVX + K, TallestVY - R, CrownZ) != vxc::MAT_AIR ||
-							    Voxels.materialAt(TallestVX + R, TallestVY + K, CrownZ) != vxc::MAT_AIR ||
-							    Voxels.materialAt(TallestVX - R, TallestVY + K, CrownZ) != vxc::MAT_AIR)
+							if (ProbeQuery.materialAt(TallestVX + K, TallestVY + R, CrownZ) != vxc::MAT_AIR ||
+							    ProbeQuery.materialAt(TallestVX + K, TallestVY - R, CrownZ) != vxc::MAT_AIR ||
+							    ProbeQuery.materialAt(TallestVX + R, TallestVY + K, CrownZ) != vxc::MAT_AIR ||
+							    ProbeQuery.materialAt(TallestVX - R, TallestVY + K, CrownZ) != vxc::MAT_AIR)
 							{ AnyAtR = true; }
 						}
 						if (AnyAtR) { ReachVox = R; }
@@ -13440,7 +13625,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		// from the outside. capacityPct is beside it so the approach to the cliff
 		// is visible before the cliff.
 		const uint32 CapacityQuads = Pool->GetHighWaterMarkQuads() + Pool->GetFreeQuads();
-		// S0-2: allocsEver tests §2.2 -- Allocations is append-only by default
+		// S0-2: allocsEver tests Â§2.2 -- Allocations is append-only by default
 		// (see GetNumAllocationsEver), so this is chunks-ever-added, not resident
 		// (liveChunks is resident). Watch it against liveChunks over a leg: if
 		// it grows while liveChunks plateaus, BuildChunkRuns's per-publication
@@ -14231,7 +14416,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	UE_LOG(LogVoxelPerf, Log, TEXT("Voxel EOF-dirty ledger (window): %s"),
 	       *VoxelEofLedger::FormatAndResetWindow());
 
-	// Hook 6 (docs/apply-fast-path-2026-08-23.md §3): flush VoxelApplyFast's
+	// Hook 6 (docs/apply-fast-path-2026-08-23.md Â§3): flush VoxelApplyFast's
 	// window on THIS line's clock, so apply-us/chunk (its sampleUs over this
 	// window's drained=) divides two numbers from the same window.
 	VoxelApplyFast::FlushStats(/*bForce*/ true);
@@ -14258,10 +14443,31 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		       AccumGpuSubmitTotalMs * 1000.0 / double(GpuSubmitCallsSinceLog),
 		       AccumDispatchSubmitGpuMs,
 		       AccumDispatchSubmitGpuMs - AccumGpuSubmitTotalMs);
+		UE_LOG(LogVoxelPerf, Log, TEXT("Voxel submit assets nested (window): resolveMs=%.3f appearanceMs=%.3f marshalMs=%.3f"),
+			AccumSubmitAssetResolveMs, AccumSubmitAssetAppearanceMs, AccumSubmitAssetMarshalMs);
+		UE_LOG(LogVoxelPerf, Log, TEXT("Voxel asset request overlap (window): candidates=%llu pruned=%llu"),
+			AccumAssetRequestCandidates, AccumAssetRequestPruned);
 	}
+    // Independent of GPU-submit activity: admission can spend time before a
+    // request ever reaches the GPU submit path. These are nested CPU timings,
+    // not additive to the existing submission/tick totals.
+    if (VoxelStreamAdmission::PredictiveAssetResolveEnabled())
+        UE_LOG(LogVoxelPerf,Log,TEXT("Voxel predictive asset resolve (window): probes=%llu launched=%llu landed=%llu raced=%llu nonresident=%llu rejected=%llu epochRejected=%llu pending=%d queueRemaining=%d tickMs=%.3f maxTickMs=%.3f queueBuilds=%llu queueCells=%llu queueBuildMs=%.3f maxQueueBuildMs=%.3f launchCap=8 inFlightCap=32 probeCap=256 queueCap=2048"),
+            PredictiveAssetProbes,PredictiveAssetLaunched,PredictiveAssetLanded,PredictiveAssetRaced,PredictiveAssetNotResident,PredictiveAssetRejected,PredictiveAssetEpochRejected,
+            PredictiveAssetInFlight.Num(),PredictiveAssetQueue.Num()-PredictiveAssetCursor,PredictiveAssetTickMs,PredictiveAssetMaxTickMs,PredictiveAssetQueueBuilds,PredictiveAssetQueueCells,PredictiveAssetQueueBuildMs,PredictiveAssetMaxQueueBuildMs);
+    for(int L=0;L<8;++L){const auto& W=AppearanceStageWindows[L];if(!W.Calls)continue;
+        UE_LOG(LogVoxelPerf,Log,TEXT("Voxel appearance stages (window, nested): level=%d calls=%llu input=%llu filtered=%llu cells=%llu words=%llu filterMs=%.3f resourceMs=%.3f canonicalMs=%.3f winnerMs=%.3f packMs=%.3f uploadMs=%.3f maxFilterMs=%.3f maxResourceMs=%.3f maxCanonicalMs=%.3f maxWinnerMs=%.3f maxPackMs=%.3f maxUploadMs=%.3f"),
+            L,W.Calls,W.Total.Input,W.Total.Filtered,W.Total.Cells,W.Total.Words,W.Total.FilterMs,W.Total.ResourceMs,W.Total.CanonicalMs,W.Total.WinnerMs,W.Total.PackMs,W.Total.UploadMs,
+            W.Max.FilterMs,W.Max.ResourceMs,W.Max.CanonicalMs,W.Max.WinnerMs,W.Max.PackMs,W.Max.UploadMs);
+    }
+    const TCHAR* ResolveCallerNames[]={TEXT("Admission"),TEXT("GpuSubmit"),TEXT("EditedPage")};
+    for(int32 I=0;I<3;++I){const auto& R=AssetResolveCallerStats[I];if(!R.Calls)continue;
+        UE_LOG(LogVoxelPerf,Log,TEXT("Voxel asset resolve caller (window): caller=%s calls=%llu hits=%llu coldMisses=%llu forcedInline=%llu level0=%llu coarse=%llu totalMs=%.3f inlineMs=%.3f rawResolveMs=%.3f maxCallMs=%.3f maxRawResolveMs=%.3f"),
+            ResolveCallerNames[I],R.Calls,R.Hits,R.ColdMisses,R.ForcedInline,R.Level0Calls,R.CoarseCalls,R.TotalMs,R.InlineMs,R.RawResolveMs,R.MaxCallMs,R.MaxRawResolveMs);
+    }
 	// S0-2: apply throughput for THIS window, alongside the leg-long mean
 	// TotalChunksLoaded already gives on the "Voxel streaming" line above.
-	// §2.2's testable prediction is that this decays monotonically across a
+	// Â§2.2's testable prediction is that this decays monotonically across a
 	// leg as Allocations.Num() (see GetNumAllocationsEver) grows -- this is
 	// the number that decay would show up in. Divides by the actual elapsed
 	// window (ThisLogWindowSeconds), not the nominal LogIntervalSeconds, so a
@@ -14960,7 +15166,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		           }));
 	}
 
-	// Wave S0 (docs/speculative-generation-plan.md §4, executing T0-1). Two
+	// Wave S0 (docs/speculative-generation-plan.md Â§4, executing T0-1). Two
 	// questions in one line, both of which the open P0 currently answers by
 	// assumption:
 	//
@@ -15448,8 +15654,10 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 				GpuMeshJobs->GetAndResetTickStageMs();
 			UE_LOG(LogVoxelPerf, Log,
 			       TEXT("Voxel GPU mesh tick (window): promoteMs=%.1f (of which enqueueMs=%.1f) "
-			            "pollMs=%.1f brickFlushMs=%.1f"),
-			       Stages.PromoteMs, Stages.EnqueueMs, Stages.PollMs, Stages.BrickFlushMs);
+			            "pollMs=%.1f brickFlushMs=%.1f | enqueueSplit shellMs=%.1f recordsMs=%.1f handoffMs=%.1f | recordsNested payloadMs=%.1f flushMs=%.1f"),
+			       Stages.PromoteMs, Stages.EnqueueMs, Stages.PollMs, Stages.BrickFlushMs,
+                   Stages.ShellMs, Stages.WorkRecordsMs, Stages.HandoffMs,
+                   Stages.RecordPayloadMs, Stages.RecordFlushMs);
 
 			// AND WHAT THAT FLUSH IS MADE OF. Summed across BOTH call sites (this
 			// tick's and the subsystem's own), because the pool owns the counter
@@ -16921,6 +17129,16 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	AccumDispatchOverlayMs = AccumDispatchLoopMs = AccumGpuManagerTickMs = 0.0;
 	AccumGpuSubmitReqHdrMs = AccumGpuSubmitBandMs = AccumGpuSubmitRasterMs = 0.0;
 	AccumGpuSubmitAssetsMs = AccumGpuSubmitPoolMs = AccumGpuSubmitMgrMs = AccumGpuSubmitTotalMs = 0.0;
+	AccumSubmitAssetResolveMs = AccumSubmitAssetAppearanceMs = AccumSubmitAssetMarshalMs = 0.0;
+    for(auto& W:AppearanceStageWindows)W={};
+    for(auto& R:AssetResolveCallerStats)R={};
+    PredictiveAssetProbes=PredictiveAssetLaunched=PredictiveAssetLanded=0;
+    PredictiveAssetRaced=PredictiveAssetNotResident=PredictiveAssetRejected=PredictiveAssetEpochRejected=0;
+    PredictiveAssetTickMs=PredictiveAssetMaxTickMs=0;
+    PredictiveAssetQueueBuilds=PredictiveAssetQueueCells=0;
+    PredictiveAssetQueueBuildMs=PredictiveAssetMaxQueueBuildMs=0;
+
+	AccumAssetRequestCandidates = AccumAssetRequestPruned = 0;
 	AccumDispatchSubmitGpuMs = 0.0;
 	GpuSubmitCallsSinceLog = 0;
 	// The cold-burst census, zeroed with the submit split it belongs to and in
@@ -17620,10 +17838,7 @@ int64 FVoxelWorldImpl::FootprintSurfaceUpperBoundMmCached(int32 Level, int32 Chu
 		if (const vxc::AssetField* Field = Voxels.assetField(); Field != nullptr && !Field->empty())
 		{
 			int64 ReachMm = 0;
-			for (const vxc::AssetLayer& L : Field->layers())
-			{
-				if (L.terrainLattice && L.maxRadiusMm > ReachMm) { ReachMm = L.maxRadiusMm; }
-			}
+			ReachMm = Field->columnSamplingReachMm(true);
 			X0Mm -= ReachMm; Y0Mm -= ReachMm; X1Mm += ReachMm; Y1Mm += ReachMm;
 		}
 
@@ -17922,10 +18137,7 @@ void FVoxelWorldImpl::MarkOpenSkyColumn(int32 Level, int32 Cx, int32 Cy, int32 A
 		if (const vxc::AssetField* Field = Voxels.assetField(); Field != nullptr && !Field->empty())
 		{
 			int64 ReachMm = 0;
-			for (const vxc::AssetLayer& L : Field->layers())
-			{
-				if (L.terrainLattice && L.maxRadiusMm > ReachMm) { ReachMm = L.maxRadiusMm; }
-			}
+			ReachMm = Field->columnSamplingReachMm(true);
 			RectX0Mm -= ReachMm; RectY0Mm -= ReachMm; RectX1Mm += ReachMm; RectY1Mm += ReachMm;
 		}
 		if (!FineStreamer->IsFootprintResident(RectX0Mm, RectY0Mm, RectX1Mm, RectY1Mm))
@@ -18615,7 +18827,7 @@ void FVoxelWorldImpl::ComputeFootprintChunkZRange(int32 ChunkX, int32 ChunkY, in
 			// exactly the work that was written here before.
 			std::vector<vxc::AssetField::ResolvedAssetInstance> ResolveScratch;
 			const std::vector<vxc::AssetField::ResolvedAssetInstance>& Resolved =
-				*ResolvedAssetsForFootprint(0, ChunkX, ChunkY, ResolveScratch);
+				*ResolvedAssetsForFootprint(0, ChunkX, ChunkY, ResolveScratch,EAssetResolveCaller::Admission);
 			int64 MaxCrownTop = INT64_MIN;
 			for (const vxc::AssetField::ResolvedAssetInstance& R : Resolved)
 			{
@@ -18734,10 +18946,7 @@ void FVoxelWorldImpl::FootprintChunkZRangeCached(int32 ChunkX, int32 ChunkY, int
 			if (const vxc::AssetField* Field = Voxels.assetField(); Field != nullptr && !Field->empty())
 			{
 				int64 ReachMm = 0;
-				for (const vxc::AssetLayer& L : Field->layers())
-				{
-					if (L.terrainLattice && L.maxRadiusMm > ReachMm) { ReachMm = L.maxRadiusMm; }
-				}
+				ReachMm = Field->columnSamplingReachMm(true);
 				X0Mm -= ReachMm; Y0Mm -= ReachMm; X1Mm += ReachMm; Y1Mm += ReachMm;
 			}
 		}
@@ -18841,10 +19050,7 @@ bool FVoxelWorldImpl::AssetResolveFootprintResident(int32 Level, int32 ChunkX, i
 	if (const vxc::AssetField* Field = Voxels.assetField(); Field != nullptr && !Field->empty())
 	{
 		int64 ReachMm = 0;
-		for (const vxc::AssetLayer& L : Field->layers())
-		{
-			if (L.terrainLattice && L.maxRadiusMm > ReachMm) { ReachMm = L.maxRadiusMm; }
-		}
+		ReachMm = Field->columnSamplingReachMm(true);
 		X0Mm -= ReachMm; Y0Mm -= ReachMm; X1Mm += ReachMm; Y1Mm += ReachMm;
 	}
 	return FineStreamer->IsFootprintResident(X0Mm, Y0Mm, X1Mm, Y1Mm);
@@ -18852,15 +19058,23 @@ bool FVoxelWorldImpl::AssetResolveFootprintResident(int32 Level, int32 ChunkX, i
 
 const std::vector<vxc::AssetField::ResolvedAssetInstance>* FVoxelWorldImpl::ResolvedAssetsForFootprint(
 	int32 Level, int32 ChunkX, int32 ChunkY,
-	std::vector<vxc::AssetField::ResolvedAssetInstance>& OutScratch) const
+	std::vector<vxc::AssetField::ResolvedAssetInstance>& OutScratch,EAssetResolveCaller Caller) const
 {
 	check(IsInGameThread());
+    auto& CallerStats=AssetResolveCallerStats[uint8(Caller)];
+    struct FCallerTimer {
+        FAssetResolveCallerStats& Stats;double Start=FPlatformTime::Seconds();bool bHit=false;
+        ~FCallerTimer(){const double Ms=(FPlatformTime::Seconds()-Start)*1000.0;
+            Stats.TotalMs+=Ms;Stats.MaxCallMs=FMath::Max(Stats.MaxCallMs,Ms);if(!bHit)Stats.InlineMs+=Ms;}
+    } CallerTimer{CallerStats};
+    ++CallerStats.Calls;if(Level==0)++CallerStats.Level0Calls;else ++CallerStats.CoarseCalls;
 	const VoxelCoords::FVoxelLevelChunkKey CacheKey{Level, VoxelCoords::FVoxelChunkKey{ChunkX, ChunkY, 0}};
 	if (VoxelStreamAdmission::AsyncAssetResolveEnabled())
 	{
 		if (const std::vector<vxc::AssetField::ResolvedAssetInstance>* Hit = AssetResolveCache.Find(CacheKey))
 		{
 			VoxelStreamAdmission::GAssetResolveCacheHits.fetch_add(1, std::memory_order_relaxed);
+			++CallerStats.Hits;CallerTimer.bHit=true;
 			return Hit;
 		}
 	}
@@ -18871,8 +19085,19 @@ const std::vector<vxc::AssetField::ResolvedAssetInstance>* FVoxelWorldImpl::Reso
 	// late task produces a hole, and with the switch OFF this is the only path
 	// and it is what the three call sites did before this change.
 	const double T0 = FPlatformTime::Seconds();
+    if(VoxelStreamAdmission::AsyncAssetResolveEnabled())++CallerStats.ColdMisses;else ++CallerStats.ForcedInline;
+	static const bool bTraceEcologyResolve = FParse::Param(FCommandLine::Get(), TEXT("VoxelEcologyWorldCapture"));
+	if (bTraceEcologyResolve && Level > 0)
+	{
+		const auto TraceRect = VoxelAssetRectForFootprint(Level, ChunkX, ChunkY);
+		UE_LOG(LogVoxelEarth, Log, TEXT("EcologyWorld INLINE_RESOLVE_BEGIN level=%d chunk=%d,%d widthVox=%lld"),
+			Level, ChunkX, ChunkY, TraceRect.vx1 - TraceRect.vx0 + 1);
+	}
+    const double RawResolveStart=FPlatformTime::Seconds();
 	OutScratch = VoxelResolveTerrainInstances(Voxels.generated(),
 	                                          VoxelAssetRectForFootprint(Level, ChunkX, ChunkY));
+    const double RawResolveMs=(FPlatformTime::Seconds()-RawResolveStart)*1000.0;
+    CallerStats.RawResolveMs+=RawResolveMs;CallerStats.MaxRawResolveMs=FMath::Max(CallerStats.MaxRawResolveMs,RawResolveMs);
 	VoxelStreamAdmission::GAssetResolveInline.fetch_add(1, std::memory_order_relaxed);
 	VoxelStreamAdmission::GAssetResolveGameThreadUs.fetch_add(
 		int64((FPlatformTime::Seconds() - T0) * 1e6), std::memory_order_relaxed);
@@ -18925,6 +19150,21 @@ void FVoxelWorldImpl::DrainAssetResolveResults()
 	{
 		VoxelStreamAdmission::GAssetResolveWarmLanded.fetch_add(1, std::memory_order_relaxed);
 		AssetResolveInFlight.Remove(Landed.Key);
+		const uint64* PredictiveEpoch = PredictiveAssetInFlight.Find(Landed.Key);
+		const bool bPredictive = PredictiveEpoch != nullptr;
+		const bool bPredictiveEpochChanged = PredictiveEpoch &&
+			*PredictiveEpoch != (FineStreamer ? FineStreamer->ResidencyEpoch() : 0);
+		PredictiveAssetInFlight.Remove(Landed.Key);
+		// Predictive work must not cache a transient-empty answer across travel.
+		// Epoch advances on successful sync/async publication and missing-memo
+		// reset. Eviction alone is caught by the resident check below; eviction
+		// followed by reload advances this epoch, even if resident again now.
+		// This intentionally also rejects harmless unrelated tile publication.
+		if (bPredictiveEpochChanged)
+		{
+			++PredictiveAssetEpochRejected;
+			continue; // preserve any exact inline cache winner; never erase it
+		}
 		if (AssetResolveCache.Contains(Landed.Key))
 		{
 			// The game thread resolved it inline before the task came back. Keep
@@ -18932,6 +19172,7 @@ void FVoxelWorldImpl::DrainAssetResolveResults()
 			// the same function of the same inputs, but the resident one has
 			// already been checked and this one has not.
 			VoxelStreamAdmission::GAssetResolveWarmRaced.fetch_add(1, std::memory_order_relaxed);
+			if (bPredictive) ++PredictiveAssetRaced;
 			continue;
 		}
 		// RESIDENCY CHECKED HERE TOO, not only at launch. Residency can only be
@@ -18943,11 +19184,135 @@ void FVoxelWorldImpl::DrainAssetResolveResults()
 		if (!AssetResolveFootprintResident(Landed.Key.Level, Landed.Key.Key.X, Landed.Key.Key.Y))
 		{
 			VoxelStreamAdmission::GAssetResolveWarmNotResident.fetch_add(1, std::memory_order_relaxed);
+			if (bPredictive) ++PredictiveAssetRejected;
 			continue;
 		}
+		if (bPredictive) ++PredictiveAssetLanded;
 		AssetResolveCache.Add(Landed.Key, MoveTemp(Landed.Resolved));
 		AssetResolveEverStored.Add(Landed.Key);
 	}
+}
+
+bool FVoxelWorldImpl::LaunchAssetResolveWarm(const VoxelCoords::FVoxelLevelChunkKey& CacheKey)
+{
+	check(IsInGameThread());
+	if (AssetResolveCache.Contains(CacheKey) || AssetResolveInFlight.Contains(CacheKey) ||
+	    !AssetResolveFootprintResident(CacheKey.Level, CacheKey.Key.X, CacheKey.Key.Y)) return false;
+	const vxc::GeneratedWorld<VoxelCoords::BrickEdgeVoxels>* GenPtr = &Voxels.generated();
+	TQueue<FAssetResolveResult, EQueueMode::Mpsc>* QueuePtr = &AssetResolveQueue;
+	AssetResolveInFlight.Add(CacheKey);
+	VoxelStreamAdmission::GAssetResolveWarmLaunched.fetch_add(1, std::memory_order_relaxed);
+	const vxc::AssetVoxelRect Rect = VoxelAssetRectForFootprint(CacheKey.Level, CacheKey.Key.X, CacheKey.Key.Y);
+	// GenPtr and QueuePtr are raw pointers into Impl-owned data, exactly
+	// as the mesh job's GenPtr/QueuePtr are, and safe for exactly the
+	// same reason: the task goes into InFlightTasks and Deinitialize
+	// waits on it in WaitForInFlightTasks before Impl is destroyed. A
+	// warm task that is NOT registered there would outlive Impl on
+	// teardown and read freed worldgen -- which is why this is added to
+	// the array on the very next line rather than fired and forgotten.
+	UE::Tasks::TTask<void> Task = UE::Tasks::Launch(
+		TEXT("VoxelAssetResolveWarm"),
+		[GenPtr, QueuePtr, CacheKey, Rect]()
+		{
+			const double T0 = FPlatformTime::Seconds();
+			FAssetResolveResult Out;
+			Out.Key = CacheKey;
+			Out.Resolved = VoxelResolveTerrainInstances(*GenPtr, Rect);
+			VoxelStreamAdmission::GAssetResolveWorkerUs.fetch_add(
+				int64((FPlatformTime::Seconds() - T0) * 1e6), std::memory_order_relaxed);
+			QueuePtr->Enqueue(MoveTemp(Out));
+		},
+		// Background, below the mesh jobs' own priority band by intent:
+		// this is speculative work whose miss costs a counter, and it
+		// must never take a slot from a chunk somebody is waiting for.
+		UE::Tasks::ETaskPriority::BackgroundLow);
+	InFlightTasks.Add(MoveTemp(Task));
+	return true;
+}
+
+void FVoxelWorldImpl::WarmPredictiveAssetResolves(const FVector& Anchor, float DeltaTime)
+{
+	check(IsInGameThread());
+	const double Start = FPlatformTime::Seconds();
+	const vxc::AssetField* Field = Voxels.assetField();
+	if (!Field || Field->empty()) return;
+	// Fixed pilot limits: retain 2,048 queued keys, 256 probes/tick, eight
+	// launches/tick and 32 predictive tasks outstanding. No residency loads.
+	constexpr int32 QueueCap = 2048, ProbeCap = 256, LaunchCap = 8, InFlightCap = 32;
+	const double Edge = VoxelCoords::ChunkEdgeUUForLevel(0);
+	FVector Lead = FVector::ZeroVector;
+	if (bPredictiveAssetHasAnchor && DeltaTime > 0.f)
+	{
+		Lead = (Anchor - PredictiveAssetPreviousAnchor) * (0.5 / double(DeltaTime));
+		Lead.Z = 0;
+		Lead = Lead.GetClampedToMaxSize(2.0 * Edge);
+	}
+	PredictiveAssetPreviousAnchor = Anchor;
+	const auto Center = VoxelCoords::ChunkKeyForVoxel(VoxelCoords::WorldToVoxel(Anchor + Lead));
+	// Restrict speculative reach even when experimental ring scales are huge.
+	// Missing this pilot window falls back to the unchanged exact admission.
+	const double Radius = FMath::Min(VoxelStreamAdmission::AdmitOuterUU(0) + 2.0 * Edge, 64.0 * Edge);
+	if (!bPredictiveAssetHasAnchor ||
+	    (Start >= PredictiveAssetNextRefresh && (Center.X != PredictiveAssetQueueAnchor.X || Center.Y != PredictiveAssetQueueAnchor.Y)) ||
+	    (PredictiveAssetCursor >= PredictiveAssetQueue.Num() && Start >= PredictiveAssetNextEmptyRefresh))
+	{
+		PredictiveAssetQueue.Reset();
+		const double QueueStart = FPlatformTime::Seconds();
+		PredictiveAssetNextRefresh = Start + 0.125; // at most eight moving rebuilds/second
+		PredictiveAssetNextEmptyRefresh = Start + 0.25;
+		++PredictiveAssetQueueBuilds;
+		PredictiveAssetCursor = 0;
+		PredictiveAssetQueueAnchor = Center;
+		bPredictiveAssetHasAnchor = true;
+		// Bound construction scratch to 129 squared keys (under 267 KB at
+		// 16 bytes/key before allocator slack); sort then truncate to
+		// nearest-first. Only XY keys are retained, never candidate/source copies.
+		const int32 Span = FMath::Min(64, FMath::CeilToInt32(Radius / Edge));
+		for (int32 DY = -Span; DY <= Span; ++DY)
+		for (int32 DX = -Span; DX <= Span; ++DX)
+		{
+			++PredictiveAssetQueueCells;
+			const int64 X = int64(Center.X) + DX, Y = int64(Center.Y) + DY;
+			if (X < MIN_int32 || X > MAX_int32 || Y < MIN_int32 || Y > MAX_int32) continue;
+			const double CX = (double(X) + 0.5) * Edge, CY = (double(Y) + 0.5) * Edge;
+			if (FMath::Square(CX - Anchor.X) + FMath::Square(CY - Anchor.Y) > FMath::Square(Radius)) continue;
+			const VoxelCoords::FVoxelLevelChunkKey Key{0, {int32(X), int32(Y), 0}};
+			if (!AssetResolveCache.Contains(Key) && !AssetResolveInFlight.Contains(Key)) PredictiveAssetQueue.Add(Key);
+		}
+		PredictiveAssetQueue.Sort([Center](const auto& A, const auto& B)
+		{
+			const int64 AX = int64(A.Key.X) - Center.X, AY = int64(A.Key.Y) - Center.Y;
+			const int64 BX = int64(B.Key.X) - Center.X, BY = int64(B.Key.Y) - Center.Y;
+			const int64 DA = AX * AX + AY * AY, DB = BX * BX + BY * BY;
+			return DA != DB ? DA < DB : (A.Key.X != B.Key.X ? A.Key.X < B.Key.X : A.Key.Y < B.Key.Y);
+		});
+		if (PredictiveAssetQueue.Num() > QueueCap) PredictiveAssetQueue.SetNum(QueueCap);
+		const double QueueMs = (FPlatformTime::Seconds() - QueueStart) * 1000.0;
+		PredictiveAssetQueueBuildMs += QueueMs;
+		PredictiveAssetMaxQueueBuildMs = FMath::Max(PredictiveAssetMaxQueueBuildMs, QueueMs);
+	}
+	int32 Launched = 0;
+	for (int32 Probe = 0; Probe < ProbeCap && PredictiveAssetCursor < PredictiveAssetQueue.Num() &&
+	     Launched < LaunchCap && PredictiveAssetInFlight.Num() < InFlightCap; ++Probe)
+	{
+		const auto Key = PredictiveAssetQueue[PredictiveAssetCursor++];
+		++PredictiveAssetProbes;
+		if (AssetResolveCache.Contains(Key) || AssetResolveInFlight.Contains(Key)) continue;
+		// A moving anchor can make queued work stale before its turn.
+		const double CX = (double(Key.Key.X) + 0.5) * Edge, CY = (double(Key.Key.Y) + 0.5) * Edge;
+		if (FMath::Square(CX - Anchor.X) + FMath::Square(CY - Anchor.Y) > FMath::Square(Radius)) continue;
+		if (!AssetResolveFootprintResident(0, Key.Key.X, Key.Key.Y)) { ++PredictiveAssetNotResident; continue; }
+		const uint64 LaunchEpoch = FineStreamer ? FineStreamer->ResidencyEpoch() : 0;
+		if (LaunchAssetResolveWarm(Key))
+		{
+			PredictiveAssetInFlight.Add(Key, LaunchEpoch);
+			++Launched;
+			++PredictiveAssetLaunched;
+		}
+	}
+	const double ElapsedMs = (FPlatformTime::Seconds() - Start) * 1000.0;
+	PredictiveAssetTickMs += ElapsedMs;
+	PredictiveAssetMaxTickMs = FMath::Max(PredictiveAssetMaxTickMs, ElapsedMs);
 }
 
 void FVoxelWorldImpl::WarmAssetResolves()
@@ -19006,8 +19371,6 @@ void FVoxelWorldImpl::WarmAssetResolves()
 	// Levels walked in ascending order anyway, because the Contains() test makes
 	// an already-warm level 0 cost a hash probe and the budget then flows to the
 	// levels that need it.
-	const vxc::GeneratedWorld<VoxelCoords::BrickEdgeVoxels>* GenPtr = &Voxels.generated();
-	TQueue<FAssetResolveResult, EQueueMode::Mpsc>* QueuePtr = &AssetResolveQueue;
 	int32 Launched = 0;
 	for (int32 Level = 0; Level < VoxelCoords::kNumLevels && Launched < Budget; ++Level)
 	{
@@ -19016,44 +19379,7 @@ void FVoxelWorldImpl::WarmAssetResolves()
 		{
 			const VoxelCoords::FVoxelLevelChunkKey CacheKey{
 				Level, VoxelCoords::FVoxelChunkKey{Queue[I].Key.Key.X, Queue[I].Key.Key.Y, 0}};
-			if (AssetResolveCache.Contains(CacheKey) || AssetResolveInFlight.Contains(CacheKey))
-			{
-				continue; // already answered, or already being answered
-			}
-			// Don't spend a worker on a footprint whose answer we would throw
-			// away at drain time anyway.
-			if (!AssetResolveFootprintResident(Level, CacheKey.Key.X, CacheKey.Key.Y))
-			{
-				continue;
-			}
-			AssetResolveInFlight.Add(CacheKey);
-			++Launched;
-			VoxelStreamAdmission::GAssetResolveWarmLaunched.fetch_add(1, std::memory_order_relaxed);
-			const vxc::AssetVoxelRect Rect = VoxelAssetRectForFootprint(Level, CacheKey.Key.X, CacheKey.Key.Y);
-			// GenPtr and QueuePtr are raw pointers into Impl-owned data, exactly
-			// as the mesh job's GenPtr/QueuePtr are, and safe for exactly the
-			// same reason: the task goes into InFlightTasks and Deinitialize
-			// waits on it in WaitForInFlightTasks before Impl is destroyed. A
-			// warm task that is NOT registered there would outlive Impl on
-			// teardown and read freed worldgen -- which is why this is added to
-			// the array on the very next line rather than fired and forgotten.
-			UE::Tasks::TTask<void> Task = UE::Tasks::Launch(
-				TEXT("VoxelAssetResolveWarm"),
-				[GenPtr, QueuePtr, CacheKey, Rect]()
-				{
-					const double T0 = FPlatformTime::Seconds();
-					FAssetResolveResult Out;
-					Out.Key = CacheKey;
-					Out.Resolved = VoxelResolveTerrainInstances(*GenPtr, Rect);
-					VoxelStreamAdmission::GAssetResolveWorkerUs.fetch_add(
-						int64((FPlatformTime::Seconds() - T0) * 1e6), std::memory_order_relaxed);
-					QueuePtr->Enqueue(MoveTemp(Out));
-				},
-				// Background, below the mesh jobs' own priority band by intent:
-				// this is speculative work whose miss costs a counter, and it
-				// must never take a slot from a chunk somebody is waiting for.
-				UE::Tasks::ETaskPriority::BackgroundLow);
-			InFlightTasks.Add(MoveTemp(Task));
+			if (LaunchAssetResolveWarm(CacheKey)) ++Launched;
 		}
 	}
 }
@@ -19574,14 +19900,7 @@ bool FVoxelWorldImpl::AdmitCandidateCommit(const VoxelCoords::FVoxelLevelChunkKe
 			if (const vxc::AssetField* AFieldGate = Voxels.assetField();
 			    AFieldGate != nullptr && !AFieldGate->empty())
 			{
-				int32 ReachMm = 0;
-				for (const vxc::AssetLayer& L : AFieldGate->layers())
-				{
-					if (L.terrainLattice && L.maxRadiusMm > ReachMm)
-					{
-						ReachMm = L.maxRadiusMm;
-					}
-				}
+				const int64 ReachMm = AFieldGate->columnSamplingReachMm(true);
 				// mm -> UU via the documented identity (1 UU = 10 mm,
 				// VoxelCoords.h:71), written as the ratio so a
 				// change to either constant moves this with it.
@@ -24079,6 +24398,12 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
                                        uint8 RingSkirtMask, bool bSpeculative,
                                        const FColdShadingVerdict* PrecomputedCold)
 {
+    const auto AppearanceBindingSnapshot=AppearanceBankBinding;
+    const bool bPrepareAppearance=LevelKey.Level<=7 && AppearanceBindingSnapshot &&
+        AppearanceBindingSnapshot->SourceSnapshot() && AppearanceBindingSnapshot->SourceSnapshot()->Sources().Num()>1;
+    if(bPrepareAppearance && (bSpeculative || !GenId)){++AppearanceSpeculativeDeclines;return false;}
+    const uint64 AppearanceEpoch=EditEpoch.load();
+    TSharedPtr<const FVoxelTerrainAppearancePage,ESPMode::ThreadSafe> PreparedAppearance;
 	FVoxelGpuMeshJobManager* Manager = EnsureGpuMeshJobs();
 	if (Manager == nullptr)
 	{
@@ -24120,7 +24445,7 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 	// every tick rather than only when the quad pool is constructed.
 	if (const USceneComponent* PoolRootForShading = GpuPoolRoot.Get())
 	{
-		// Hook 4 (docs/apply-fast-path-2026-08-23.md §3), applied on the
+		// Hook 4 (docs/apply-fast-path-2026-08-23.md Â§3), applied on the
 		// condition that document set: "read reqHdr off a leg first". Read
 		// 2026-08-23 (ahead-off.log, the uncapped regime that produced the
 		// 1,547 ms dispatch= figure): reqHdr climbed to 1,302.9 ms per 5 s
@@ -24526,8 +24851,46 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 			// returns resolveForCompose's own vector unmodified, so the order is
 			// resolveForCompose's, which is instancesForRect's -- unchanged.
 			std::vector<vxc::AssetField::ResolvedAssetInstance> ResolveScratch;
+			const double AssetResolveStart = FPlatformTime::Seconds();
 			const std::vector<vxc::AssetField::ResolvedAssetInstance>& Resolved =
-				*ResolvedAssetsForFootprint(LevelKey.Level, LevelKey.Key.X, LevelKey.Key.Y, ResolveScratch);
+				*ResolvedAssetsForFootprint(LevelKey.Level, LevelKey.Key.X, LevelKey.Key.Y, ResolveScratch,EAssetResolveCaller::GpuSubmit);
+			AccumSubmitAssetResolveMs += (FPlatformTime::Seconds()-AssetResolveStart)*1000.0;
+			CSV_CUSTOM_STAT(VoxelStream, SubmitAssetResolveMs,
+				(FPlatformTime::Seconds()-AssetResolveStart)*1000.0, ECsvCustomStatOp::Accumulate);
+            const double AssetAppearanceStart=FPlatformTime::Seconds();
+            if(bPrepareAppearance){
+                CSV_SCOPED_TIMING_STAT(VoxelStream, SubmitAssetAppearanceMs);
+                TRACE_CPUPROFILER_EVENT_SCOPE(VoxelAppearance_PrepareGpuPage);
+                const int64 Scale=int64(1)<<LevelKey.Level,Half=LevelKey.Level?Scale/2:0;
+                const int64 OX=int64(LevelKey.Key.X)*32*Scale+Half,OY=int64(LevelKey.Key.Y)*32*Scale+Half;
+                TArray<vxc::ColumnSample> AppearanceColumns;AppearanceColumns.SetNumUninitialized(1024);
+                TBitArray<> AppearanceColumnsReady(false,1024);
+                // Prepare filters actual page contributors before invoking this
+                // callback. Pages with no approved source need no terrain samples.
+                // Keep each needed XY column once across all 32 height samples.
+                const bool Preserve=VoxelGpuWorldGen::SurfaceMipEnabled();
+                FString AppearanceError;FVoxelAppearancePrepareStats AppearanceStats;
+                PreparedAppearance=FVoxelTerrainAppearancePage::Prepare(FIntVector(LevelKey.Key.X,LevelKey.Key.Y,LevelKey.Key.Z),LevelKey.Level,GenId,
+                    Resolved,*AppearanceBindingSnapshot,[this,&AppearanceColumns,&AppearanceColumnsReady,OX,OY,Scale,Preserve](int64 X,int64 Y,int64 Z){
+                        const int32 Index=int32((X-OX)/Scale)+32*int32((Y-OY)/Scale);
+                        if(!AppearanceColumnsReady[Index]){AppearanceColumns[Index]=Voxels.amplifier().column(X,Y);AppearanceColumnsReady[Index]=true;}
+                        return vxc::Amplifier::coarseSurfaceMaterialAt(AppearanceColumns[Index],Z,Scale,Scale>1&&Preserve);
+                    },
+                    [](int64,int64,int64){return false;},AppearanceError,{},&AppearanceStats);
+                if(PreparedAppearance)Req.Appearance=PreparedAppearance->MakeUpload(*AppearanceBindingSnapshot,AppearanceError,&AppearanceStats);
+                // GT-owned aggregate; local per-call stats never enter a page/upload.
+                if(LevelKey.Level>=0&&LevelKey.Level<8){auto& W=AppearanceStageWindows[LevelKey.Level];++W.Calls;
+                    W.Total.Input+=AppearanceStats.Input;W.Total.Filtered+=AppearanceStats.Filtered;W.Total.Cells+=AppearanceStats.Cells;W.Total.Words+=AppearanceStats.Words;
+                    const double Values[]={AppearanceStats.FilterMs,AppearanceStats.ResourceMs,AppearanceStats.CanonicalMs,AppearanceStats.WinnerMs,AppearanceStats.PackMs,AppearanceStats.UploadMs};
+                    double* Totals[]={&W.Total.FilterMs,&W.Total.ResourceMs,&W.Total.CanonicalMs,&W.Total.WinnerMs,&W.Total.PackMs,&W.Total.UploadMs};
+                    double* Maxima[]={&W.Max.FilterMs,&W.Max.ResourceMs,&W.Max.CanonicalMs,&W.Max.WinnerMs,&W.Max.PackMs,&W.Max.UploadMs};
+                    for(int I=0;I<6;++I){*Totals[I]+=Values[I];*Maxima[I]=FMath::Max(*Maxima[I],Values[I]);}
+                }
+                if(!PreparedAppearance || !Req.Appearance){
+                    UE_LOG(LogVoxelEarth,Warning,TEXT("Approved GPU appearance preparation declined: %s"),*AppearanceError);return false;
+                }
+            }
+			AccumSubmitAssetAppearanceMs += (FPlatformTime::Seconds()-AssetAppearanceStart)*1000.0;
 			// Same mesher-side accounting as the CPU job: a GPU-meshed chunk
 			// resolves here and never runs the worker's block.
 			//
@@ -24560,15 +24923,46 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 			// declaration says "Game thread only, like every other streaming
 			// structure on Impl". A worker touching it would be a concurrent TMap
 			// insert -- a rehash racing a lookup, which corrupts silently rather
-			// than crashing. It is also not worth moving: the span table is built
-			// ONCE PER GRID for the whole process (the cache is keyed on a grid
-			// pointer the bank library never frees), so on a warm run this loop is
-			// a hash lookup and a few Appends per instance, with no worldgen in it
-			// at all. The expensive half -- the amplifier columns -- is the half
-			// that moved.
-			TMap<const vxc::AssetGrid*, uint32> BaseForGrid;
-			for (const vxc::AssetField::ResolvedAssetInstance& R : Resolved)
+			// than crashing. Grid span construction is cached, but copying those
+			// spans into each request still costs CPU time and memory bandwidth.
 			{
+			CSV_SCOPED_TIMING_STAT(VoxelStream, SubmitAssetMarshalMs);
+			const double AssetMarshalStart=FPlatformTime::Seconds();
+			// Preserve potential winners across the entire original mesh halo.
+			// The manager may shrink this request to its interior, never expand it.
+			// Filter geometry only: appearance preparation above retains its own
+			// canonical ordering and source validation.
+			TArray<const vxc::AssetField::ResolvedAssetInstance*> Contributors;
+			Contributors.Reserve(int32(Resolved.size()));
+			for(const auto& R:Resolved)
+			{
+				++AccumAssetRequestCandidates;
+				if(vxc::assetMayContributeToRequest(R,Req.OriginVx,Req.OriginVy,int64(Req.BrickZMin)*8,
+					Req.DispatchColumns.X,Req.DispatchColumns.Y,uint64(Req.BricksZ)*8,Req.CoarseLevel))
+					Contributors.Add(&R);
+				else ++AccumAssetRequestPruned;
+			}
+			TSet<const vxc::AssetGrid*> UniqueGrids;
+			int64 ColumnCount=Req.AssetColStarts.Num(),SpanCount=Req.AssetSpans.Num();
+			for(const auto* Contributor:Contributors)
+			{
+				const auto& R=*Contributor;
+				if(UniqueGrids.Contains(R.grid))continue;
+				UniqueGrids.Add(R.grid);
+				const auto& S=GpuSpansForGrid(R.grid);
+				ColumnCount+=S.ColStarts.Num();SpanCount+=S.Spans.Num();
+			}
+			const int64 InstanceCount=int64(Req.AssetInstances.Num())+Contributors.Num();
+			checkf(ColumnCount<=MAX_int32&&SpanCount<=MAX_int32&&InstanceCount<=MAX_int32,
+				TEXT("Asset request exceeds TArray capacity"));
+			Req.AssetColStarts.Reserve(int32(ColumnCount));
+			Req.AssetSpans.Reserve(int32(SpanCount));
+			Req.AssetInstances.Reserve(int32(InstanceCount));
+			TMap<const vxc::AssetGrid*, uint32> BaseForGrid;
+			BaseForGrid.Reserve(UniqueGrids.Num());
+			for (const auto* Contributor : Contributors)
+			{
+				const auto& R=*Contributor;
 				const FGpuAssetGridSpans& S = GpuSpansForGrid(R.grid);
 				if (S.bTooTall)
 				{
@@ -24635,6 +25029,8 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 					}
 				}
 				Req.AssetInstances.Add(Inst);
+			}
+			AccumSubmitAssetMarshalMs += (FPlatformTime::Seconds()-AssetMarshalStart)*1000.0;
 			}
 		}
 	}
@@ -24709,7 +25105,7 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 
 	const uint64 JobId = Manager->Submit(MoveTemp(Req), /*UserTag*/ 0, bDirectToPool,
 	                                     /*bLowPriority*/ bSpeculative);
-	GpuJobsPending.Add(JobId, FGpuPendingJob{ LevelKey, GenId, bSpeculative });
+	GpuJobsPending.Add(JobId, FGpuPendingJob{ LevelKey, GenId, bSpeculative, MoveTemp(PreparedAppearance), AppearanceEpoch });
 
 	// The gpu-submit split's normal exit (the decline path above mirrors it).
 	{
@@ -24883,6 +25279,8 @@ void FVoxelWorldImpl::OnGpuMeshJobComplete(FVoxelGpuMeshJobResult&& GpuResult)
 	VoxelStreaming::FJobResult Result;
 	Result.Key = Pending.Key;
 	Result.GenerationId = Pending.GenerationId;
+    Result.AppearancePage=MoveTemp(Pending.AppearancePage);
+    Result.AppearanceEditEpoch=Pending.AppearanceEditEpoch;
 	// Into its OWN field, not JobMs. This line used to write SubmitToDeliverMs
 	// -- an end-to-end latency including the manager's queue wait -- into
 	// JobMs, whose CPU-arm meaning is worker service time, and DrainResults
@@ -25747,6 +26145,7 @@ void FVoxelWorldImpl::DispatchJobs()
 		// insert time, EditEpochSnapshot is this moment's value.
 		const std::atomic<uint64>* EditEpochPtr = &EditEpoch;
 		const uint64 EditEpochSnapshot = EditEpoch.load();
+        const auto AppearanceBindingSnapshot=AppearanceBankBinding;
 		// Ring-boundary skirt mask -- computed here on the game thread where the
 		// anchor and RingPresets are live, then baked into this job's mesh.
 		const uint8 RingSkirtMask = ComputeRingSkirtMask(LevelKey, LastAnchorLocation);
@@ -26155,7 +26554,7 @@ void FVoxelWorldImpl::DispatchJobs()
 		// spelling (-VoxelWorkerPool routes it to a dedicated pool; default
 		// is UE::Tasks exactly as before). Captures unchanged.
 		auto JobBody =
-			[GenPtr, LevelKey, GenId, QueuePtr, CounterPtr, BacklogPtr, CpuCounterPtr, PerfCountersPtr, SharedMipCachePtr, EditEpochPtr, EditEpochSnapshot,
+			[GenPtr, LevelKey, GenId, QueuePtr, CounterPtr, BacklogPtr, CpuCounterPtr, PerfCountersPtr, SharedMipCachePtr, EditEpochPtr, EditEpochSnapshot, AppearanceBindingSnapshot,
 			 bPredictedEmpty, bComputeBand, bLatencyStatsEnabled, bPackBricksOnCpu, bSuppressQuadMesh,
 			 bReuseMesherVoxels, RingSkirtMask,
 			 AssetTallestVoxSnapshot, SharedGridCachePtr, bColumnGridResident,
@@ -26541,6 +26940,18 @@ void FVoxelWorldImpl::DispatchJobs()
 						Result.Band = VoxelStreaming::MakeFootprintBand(MaxTop, MinAir);
 						Result.bBandValid = true;
 					}
+                    if(AppearanceBindingSnapshot && AppearanceBindingSnapshot->SourceSnapshot() &&
+                       AppearanceBindingSnapshot->SourceSnapshot()->Sources().Num()>1){
+                        TRACE_CPUPROFILER_EVENT_SCOPE(VoxelAppearance_PrepareCpuPage);
+                        Result.AppearanceEditEpoch=EditEpochSnapshot;
+                        Result.AppearancePage=FVoxelTerrainAppearancePage::Prepare(
+                            FIntVector(Key.X,Key.Y,Key.Z),0,GenId,AResolved,*AppearanceBindingSnapshot,
+                            [Columns,BaseVX,BaseVY](int64 X,int64 Y,int64 Z){
+                                const int32 LX=int32(X-BaseVX)+1,LY=int32(Y-BaseVY)+1;
+                                checkSlow(LX>=0&&LX<GridEdge&&LY>=0&&LY<GridEdge);
+                                return vxc::Amplifier::materialAt(Columns[LX+GridEdge*LY],Z);
+                            },[](int64,int64,int64){return false;},Result.AppearancePreparationError);
+                    }
 					const auto GridSampler = [Columns, BaseVX, BaseVY, AResolvedPtr](int64 X, int64 Y, int64 Z)
 					{
 						const int32 LX = int32(X - BaseVX) + 1;
@@ -26819,6 +27230,16 @@ void FVoxelWorldImpl::DispatchJobs()
 						                                            // exist precisely to have it ready here.
 						                                            bAssetResolveFromCache ? &AssetResolveList : nullptr);
 						Result.GridMs = float((FPlatformTime::Seconds() - GridStartSeconds) * 1000.0);
+                        if(AppearanceBindingSnapshot&&AppearanceBindingSnapshot->SourceSnapshot()&&AppearanceBindingSnapshot->SourceSnapshot()->Sources().Num()>1){
+                            TRACE_CPUPROFILER_EVENT_SCOPE(VoxelAppearance_PrepareCoarseCpuPage);
+                            const int64 Scale=int64(1)<<LevelKey.Level,Half=Scale/2;Result.AppearanceEditEpoch=EditEpochSnapshot;
+                            Result.AppearancePage=FVoxelTerrainAppearancePage::Prepare(FIntVector(Key.X,Key.Y,Key.Z),LevelKey.Level,GenId,CoarseSampler.Resolved,*AppearanceBindingSnapshot,
+                                [&CoarseSampler,Scale,Half](int64 X,int64 Y,int64 Z){
+                                    const int32 LX=int32((X-Half)/Scale-CoarseSampler.BaseVX)+1,LY=int32((Y-Half)/Scale-CoarseSampler.BaseVY)+1;
+                                    checkSlow(LX>=0&&LX<FCoarseChunkGridSampler::GridEdge&&LY>=0&&LY<FCoarseChunkGridSampler::GridEdge);
+                                    return vxc::Amplifier::coarseSurfaceMaterialAt(CoarseSampler.Cols[LX+FCoarseChunkGridSampler::GridEdge*LY],Z,Scale,CoarseSampler.bSurfacePreserve);
+                                },[](int64,int64,int64){return false;},Result.AppearancePreparationError);
+                        }
 						// P2 coverage, coarse levels. FCoarseChunkGridSampler satisfies the
 						// same (int64,int64,int64) -> MaterialId contract the packer wants,
 						// so a coarse chunk packs by substituting the sampler and nothing
@@ -26857,7 +27278,9 @@ void FVoxelWorldImpl::DispatchJobs()
 						if (VoxelStreamAdmission::CoarseGridVerifyEnabled() && !bSuppressQuadMesh)
 						{
 							TArray<FVoxelChunkQuad> RefQuads;
-							const auto RefSampler = MakeCoarseLevelSampler(*GenPtr, LevelKey.Level, /*PerfCounters*/ nullptr);
+							const auto RefSampler = VoxelDirectCoarseAppearance::MakeSampler(
+                                MakeCoarseLevelSampler(*GenPtr, LevelKey.Level, /*PerfCounters*/ nullptr),
+                                CoarseSampler.Resolved, LevelKey.Level);
 							MeshChunkBricks(Key, RefSampler, RefQuads, /*PerfCounters*/ nullptr, RingSkirtMask);
 							int32 FirstDiff = -1;
 							VoxelStreamAdmission::GCoarseGridVerifyChecked.fetch_add(1, std::memory_order_relaxed);
@@ -26872,10 +27295,30 @@ void FVoxelWorldImpl::DispatchJobs()
 					}
 					else
 					{
-						const auto LevelSampler =
+                        FRecursiveMipTraceFn RecursiveTrace;
+						auto LevelSampler =
 							bCoarseLevel
 								? MakeCoarseLevelSampler(*GenPtr, LevelKey.Level, PerfCountersPtr)
-								: MakeLevelSampler(*GenPtr, LevelKey.Level, PerfCountersPtr, SharedMipCachePtr, EditEpochPtr, EditEpochSnapshot);
+								: MakeLevelSampler(*GenPtr, LevelKey.Level, PerfCountersPtr, SharedMipCachePtr, EditEpochPtr, EditEpochSnapshot,&RecursiveTrace);
+                        if(bCoarseLevel){
+                            // The alternate makeCoarseBrick path supplies terrain only.
+                            // Match the default coarse path's terrain-first representative
+                            // asset composition even when no appearance catalog is installed.
+                            const auto Ordered=bAssetResolveFromCache?AssetResolveList:VoxelResolveTerrainInstances(*GenPtr,VoxelAssetRectForFootprint(LevelKey.Level,Key.X,Key.Y));
+                            LevelSampler=VoxelDirectCoarseAppearance::MakeSampler(std::move(LevelSampler),Ordered,LevelKey.Level);
+                            if(AppearanceBindingSnapshot&&AppearanceBindingSnapshot->SourceSnapshot()&&AppearanceBindingSnapshot->SourceSnapshot()->Sources().Num()>1){
+                                TRACE_CPUPROFILER_EVENT_SCOPE(VoxelAppearance_PrepareDirectCoarseFallback);
+                                Result.AppearanceEditEpoch=EditEpochSnapshot;
+                                Result.AppearancePage=VoxelDirectCoarseAppearance::Prepare(*GenPtr,FIntVector(Key.X,Key.Y,Key.Z),LevelKey.Level,GenId,Ordered,*AppearanceBindingSnapshot,VoxelGpuWorldGen::SurfaceMipEnabled(),LevelSampler,Result.AppearancePreparationError);
+                            }
+                        }
+                        if(!bCoarseLevel&&RecursiveTrace&&AppearanceBindingSnapshot&&AppearanceBindingSnapshot->SourceSnapshot()&&AppearanceBindingSnapshot->SourceSnapshot()->Sources().Num()>1){
+                            const auto Ordered=bAssetResolveFromCache?AssetResolveList:VoxelResolveTerrainInstances(*GenPtr,VoxelAssetRectForFootprint(LevelKey.Level,Key.X,Key.Y));
+                            Result.AppearanceEditEpoch=EditEpochSnapshot;
+                            Result.AppearancePage=FVoxelTerrainAppearancePage::Prepare(FIntVector(Key.X,Key.Y,Key.Z),LevelKey.Level,GenId,Ordered,*AppearanceBindingSnapshot,
+                                [GenPtr](int64 X,int64 Y,int64 Z){return vxc::Amplifier::materialAt(GenPtr->amplifier().columnCached(X,Y),Z);},
+                                [](int64,int64,int64){return false;},Result.AppearancePreparationError,RecursiveTrace);
+                        }
 						if (bSuppressQuadMesh)
 						{
 							Result.BrickPack = VoxelBrickCpuArm::PackChunkMaterialising(LevelKey, LevelSampler);
@@ -27338,7 +27781,7 @@ UVoxelGpuPoolComponent* FVoxelWorldImpl::GetOrCreateGpuPool(AActor& Owner, UScen
 	// 64M = 49,349 peak chunks x ~902 quads/chunk (44.5M) + ~44% headroom for the
 	// fragmentation first-fit produces under this churn. 512 MB at 8 B/quad, plus
 	// the same again in the chunk-id buffer and 12 B/quad of CPU shadow -- see
-	// docs/speculative-generation-plan.md §2.6 for the full memory arithmetic and
+	// docs/speculative-generation-plan.md Â§2.6 for the full memory arithmetic and
 	// why the shadow is what makes further raises expensive.
 	//
 	// SIZED 2026-07-28 FROM A MEASURED PLATEAU, replacing the plan's 104M guess.
@@ -28379,7 +28822,8 @@ void FVoxelWorldImpl::EvictParkedOverCap(int32 Cap)
 bool FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMaterialInterface* Material,
                                        const VoxelCoords::FVoxelLevelChunkKey& Key, VoxelStreaming::FChunkRecord& Rec,
                                        TArray<FVoxelChunkQuad>&& Quads, bool bIsGameThreadMesh,
-                                       const FVoxelGpuQuadPayloadRef& GpuQuads, int32 GpuQuadCount)
+                                       const FVoxelGpuQuadPayloadRef& GpuQuads, int32 GpuQuadCount,
+                                       TSharedPtr<const FVoxelTerrainAppearanceUpload,ESPMode::ThreadSafe> Appearance)
 {
 	// WAVE D / D1: TWO WAYS TO BE HANDED A CHUNK'S GEOMETRY.
 	//
@@ -28493,12 +28937,12 @@ bool FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMat
 			// dropped.
 			UE_LOG(LogVoxelStream, Error,
 			       TEXT("voxel.GPU.MeshDirectToPool: chunk L%d (%d,%d,%d) acquired a component while its GPU "
-			            "mesh was in flight — %d quads DROPPED rather than draw the same chunk twice."),
+			            "mesh was in flight â€” %d quads DROPPED rather than draw the same chunk twice."),
 			       Key.Level, Key.Key.X, Key.Key.Y, Key.Key.Z, NumQuads);
 			return false;
 		}
 
-		// Wave S0 stage timing (docs/speculative-generation-plan.md §4, executing
+		// Wave S0 stage timing (docs/speculative-generation-plan.md Â§4, executing
 		// T0-1), gated on voxel.Stream.ApplyStageStats: these are
 		// FPlatformTime::Seconds pairs on a path that runs up to 64 times a frame,
 		// which is exactly the kind of instrument that becomes what it measures.
@@ -28568,7 +29012,7 @@ bool FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMat
 			// successful run with disappointing numbers.
 			bLoggedFirstDirectChunk = true;
 			UE_LOG(LogVoxelStream, Log,
-			       TEXT("voxel.GPU.MeshDirectToPool: first chunk written GPU-side — level=%d chunk=(%d,%d,%d) "
+			       TEXT("voxel.GPU.MeshDirectToPool: first chunk written GPU-side â€” level=%d chunk=(%d,%d,%d) "
 			            "quads=%d, no readback, no CPU staging, no re-upload."),
 			       Key.Level, Key.Key.X, Key.Key.Y, Key.Key.Z, NumQuads);
 		}
@@ -28581,7 +29025,7 @@ bool FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMat
 		// UpdateChunk path never sampled params and still must not, or this
 		// instrument would add a full Amplifier::column to every re-mesh.
 		//
-		// §1c is the reason it gets its own bucket: SampleChunkParamsForPool runs
+		// Â§1c is the reason it gets its own bucket: SampleChunkParamsForPool runs
 		// GetSurfaceHeightUU, which is a whole column with the cave lattice and
 		// cavern passes, on the GAME THREAD, once per applied chunk -- for a value
 		// the producing job already computed. If this bucket is large, T1-3's
@@ -28637,19 +29081,19 @@ bool FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMat
 			if (!bWasFirstLoad)
 			{
 				UE_LOG(LogVoxelStream, Error,
-				       TEXT("voxel.GPU.MeshDirectToPool: chunk L%d (%d,%d,%d) already holds pool slot %d — the "
+				       TEXT("voxel.GPU.MeshDirectToPool: chunk L%d (%d,%d,%d) already holds pool slot %d â€” the "
 				            "direct path has no in-place update, so %d quads were DROPPED. A re-mesh reached "
 				            "the fork, which is supposed to be impossible."),
 				       Key.Level, Key.Key.X, Key.Key.Y, Key.Key.Z, Rec.PoolSlot, NumQuads);
 				return false;
 			}
 			Rec.PoolSlot = Pool->AddChunkFromGpu(
-				GpuQuads, uint32(NumQuads), FVector3f(OriginInPool), Key.Level, PoolParams);
+				GpuQuads, uint32(NumQuads), FVector3f(OriginInPool), Key.Level, PoolParams, Appearance);
 		}
 		else if (bWasFirstLoad)
 		{
 			Rec.PoolSlot = Pool->AddChunk(
-				Packed, FVector3f(OriginInPool), Key.Level, PoolParams);
+				Packed, FVector3f(OriginInPool), Key.Level, PoolParams, nullptr, Appearance);
 		}
 		else
 		{
@@ -28657,7 +29101,7 @@ bool FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMat
 			// the new quad count fits it, which is the common case for a dig --
 			// free+realloc would fragment the pool hardest on exactly the
 			// chunks that re-mesh most often.
-			Rec.PoolSlot = Pool->UpdateChunk(Rec.PoolSlot, Packed);
+			Rec.PoolSlot = Pool->UpdateChunk(Rec.PoolSlot, Packed, Appearance);
 		}
 		if (bStageStats)
 		{
@@ -28749,7 +29193,7 @@ bool FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMat
 	}
 
 	// NOT TIMED, deliberately. The component-renderer branch is the CONTROL arm,
-	// and S0's question is entirely about the pooled path -- §1a's claim is that
+	// and S0's question is entirely about the pooled path -- Â§1a's claim is that
 	// the POOLED apply carries an O(resident) tax the component apply does not.
 	// The comparison that answers it is already the head-to-head's avgChunks/s;
 	// a stage split here would need its own timed-apply counter and a scope guard
@@ -29286,6 +29730,11 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 			continue;
 		}
 
+        if(!Result.AppearancePreparationError.IsEmpty()){
+            UE_LOG(LogVoxelEarth,Warning,TEXT("Approved appearance CPU preparation failed for L%d (%d,%d,%d) generation %llu: %s"),
+                Result.Key.Level,Result.Key.Key.X,Result.Key.Key.Y,Result.Key.Key.Z,
+                static_cast<unsigned long long>(Result.GenerationId),*Result.AppearancePreparationError);
+        }
 		// -VoxelVerifySkyBand: the verdict was computed at dispatch but the job
 		// ran anyway, so this is the real mesh to check it against. A violation
 		// is a chunk the skip would have dropped that in fact had geometry --
@@ -29331,9 +29780,19 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 		// Return value doubles as "the quad path counted this as a first load"
 		// (both bWasFirstLoad increments return true through it) -- the
 		// exclusion the brick-side count below needs.
+        TSharedPtr<const FVoxelTerrainAppearanceUpload,ESPMode::ThreadSafe> AppearanceUpload;
+        if(Result.AppearancePage && AppearanceBankBinding){
+            FString AppearanceError;
+            const FIntVector ExpectedKey(Result.Key.Key.X,Result.Key.Key.Y,Result.Key.Key.Z);
+            if(Result.Key.Level<=7 && Result.AppearancePage->PageLevel()==uint32(Result.Key.Level) && Result.AppearancePage->PageKey()==ExpectedKey &&
+               Result.AppearancePage->PageGeneration()==Result.GenerationId){
+                AppearanceUpload=Result.AppearancePage->MakeUpload(*AppearanceBankBinding,AppearanceError);
+            }else AppearanceError=TEXT("prepared CPU page key/generation mismatch");
+            if(!AppearanceError.IsEmpty())UE_LOG(LogVoxelEarth,Warning,TEXT("Approved appearance CPU upload refused: %s"),*AppearanceError);
+        }
 		const bool bQuadFirstLoad =
 		    ApplyMeshResult(Owner, Root, Material, Result.Key, *Rec, MoveTemp(Result.Quads),
-		                    /*bIsGameThreadMesh*/ false, Result.GpuQuads, int32(Result.GpuQuadCount));
+		                    /*bIsGameThreadMesh*/ false, Result.GpuQuads, int32(Result.GpuQuadCount), AppearanceUpload);
 		if (bQuadFirstLoad)
 		{
 			++ProxiesCreated;
@@ -29350,6 +29809,7 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 		// samples it for ChunkParams -- same function, same Root, same origin
 		// convention -- so the two renderers cannot disagree about the climate or
 		// the surface plane.
+
 		VoxelBrickCpuArm::Publish(
 			Result.Key, Result.BrickPack,
 			// ChunkOriginWorldForLevel WITH NO REBASE, exactly as the quad path
@@ -29359,7 +29819,7 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 			// climate and the surface plane at the wrong place on the map, and
 			// the result would still look like terrain.
 			VoxelApplyFast::ShadingForPublish(Result.Key, Result.BrickPack, Root,
-			                                  &SampleChunkParamsForPool, &ShadingFromChunkParams));
+			                                  &SampleChunkParamsForPool, &ShadingFromChunkParams),MoveTemp(AppearanceUpload));
 
 		// THE MARCHER-PATH LOAD COUNT (2026-08-28; see TotalChunksLoaded's
 		// declaration for the dated semantics). Under voxel.Terrain.RetireQuads
@@ -29519,6 +29979,7 @@ void FVoxelWorldImpl::DrainGameThreadMesh(AActor& Owner, USceneComponent& Root, 
 		// GPU-resident branch cannot fire with bDirectToPool forced off.
 		const bool bRetireQuads = VoxelTerrainQuadsRetired();
 		FVoxelBrickCpuPackRef BrickPack;
+        TSharedPtr<const FVoxelTerrainAppearanceUpload,ESPMode::ThreadSafe> EditedAppearanceUpload;
 		TArray<FVoxelChunkQuad> Quads;
 		if (LevelKey.Level == 0)
 		{
@@ -29526,6 +29987,22 @@ void FVoxelWorldImpl::DrainGameThreadMesh(AActor& Owner, USceneComponent& Root, 
 			// mesh and the bricks must be two encodings of the same answers, and the
 			// cheapest way to guarantee that is for there to be one thing to answer.
 			const auto EditSampler = [this](int64 X, int64 Y, int64 Z) { return Voxels.materialAt(X, Y, Z); };
+            if(AppearanceBankBinding && AppearanceBankBinding->SourceSnapshot() && AppearanceBankBinding->SourceSnapshot()->Sources().Num()>1){
+                TRACE_CPUPROFILER_EVENT_SCOPE(VoxelAppearance_PrepareEditedPage);
+                const int64 OX=int64(LevelKey.Key.X)*32,OY=int64(LevelKey.Key.Y)*32;
+                FVoxelAppearanceTouchedPage Touched;verify(Touched.Build(Voxels,FIntVector(LevelKey.Key.X,LevelKey.Key.Y,LevelKey.Key.Z),0));
+                std::vector<vxc::AssetField::ResolvedAssetInstance> Scratch;
+                const auto& Ordered=*ResolvedAssetsForFootprint(0,LevelKey.Key.X,LevelKey.Key.Y,Scratch,EAssetResolveCaller::EditedPage);
+                TArray<vxc::ColumnSample> Columns;Columns.SetNumUninitialized(1024);
+                for(int Y=0;Y<32;++Y)for(int X=0;X<32;++X)Columns[X+32*Y]=Voxels.amplifier().column(OX+X,OY+Y);
+                FString AppearanceError;
+                auto Page=FVoxelTerrainAppearancePage::Prepare(FIntVector(LevelKey.Key.X,LevelKey.Key.Y,LevelKey.Key.Z),0,Rec->GenerationId,Ordered,*AppearanceBankBinding,
+                    [&Columns,OX,OY](int64 X,int64 Y,int64 Z){return vxc::Amplifier::materialAt(Columns[int32(X-OX)+32*int32(Y-OY)],Z);},
+                    [&Touched](int64 X,int64 Y,int64 Z){return Touched.IsTouched(X,Y,Z);},AppearanceError);
+                if(Page)EditedAppearanceUpload=Page->MakeUpload(*AppearanceBankBinding,AppearanceError);
+                if(!AppearanceError.IsEmpty())UE_LOG(LogVoxelEarth,Warning,TEXT("Approved edited appearance preparation failed: %s"),*AppearanceError);
+            }
+
 			if (bRetireQuads)
 			{
 				// No mesher, so the packer materialises the chunk itself. Quads
@@ -29564,7 +30041,7 @@ void FVoxelWorldImpl::DrainGameThreadMesh(AActor& Owner, USceneComponent& Root, 
 			// evidence that a distant edit actually re-meshed a mip ring chunk.
 			//
 			// WHICH SAMPLER IS THE SAME QUESTION THE WORKER ASKS, and it was not
-			// being asked here (backlog §14). The worker went coarse for every
+			// being asked here (backlog Â§14). The worker went coarse for every
 			// level>=GetCoarseMinLevel() (default 1) because the mip recursion's
 			// 8^L fold capped the voxel radius at ~250m; this path kept folding,
 			// on the game thread, with a level-0 source that rebuilds its own
@@ -29602,15 +30079,41 @@ void FVoxelWorldImpl::DrainGameThreadMesh(AActor& Owner, USceneComponent& Root, 
 			};
 			if (bCoarseLevel)
 			{
-				MeshWithOverlaySampler(FOverlayCoarseChunkSampler(Voxels, LevelKey.Level, LevelKey.Key));
+                const FOverlayCoarseChunkSampler Sampler(Voxels,LevelKey.Level,LevelKey.Key);
+                if(AppearanceBankBinding&&AppearanceBankBinding->SourceSnapshot()&&AppearanceBankBinding->SourceSnapshot()->Sources().Num()>1){
+                    TRACE_CPUPROFILER_EVENT_SCOPE(VoxelAppearance_PrepareEditedCoarsePage);
+                    const int64 Scale=int64(1)<<LevelKey.Level,Half=Scale/2;
+                    const FIntVector PageKey(LevelKey.Key.X,LevelKey.Key.Y,LevelKey.Key.Z);
+                    FVoxelAppearanceTouchedPage Touched;verify(Touched.Build(Voxels,PageKey,LevelKey.Level));FString Error;
+                    auto Page=FVoxelTerrainAppearancePage::Prepare(PageKey,LevelKey.Level,Rec->GenerationId,Sampler.Coarse.Resolved,*AppearanceBankBinding,
+                        [&Sampler,Scale,Half](int64 X,int64 Y,int64 Z){
+                            const int32 LX=int32((X-Half)/Scale-Sampler.Coarse.BaseVX)+1,LY=int32((Y-Half)/Scale-Sampler.Coarse.BaseVY)+1;
+                            return vxc::Amplifier::coarseSurfaceMaterialAt(Sampler.Coarse.Cols[LX+FCoarseChunkGridSampler::GridEdge*LY],Z,Scale,Sampler.Coarse.bSurfacePreserve);
+                        },[&Touched](int64 X,int64 Y,int64 Z){return Touched.IsTouched(X,Y,Z);},Error);
+                    if(Page)EditedAppearanceUpload=Page->MakeUpload(*AppearanceBankBinding,Error);
+                    if(!Error.IsEmpty())UE_LOG(LogVoxelEarth,Warning,TEXT("Approved edited coarse appearance preparation failed: %s"),*Error);
+                }
+                MeshWithOverlaySampler(Sampler);
 			}
 			else
 			{
 				// -VoxelCoarseMinLevel=99 restores the pre-coarse mip behaviour on
 				// this path too, so the A/B stays a rule A/B on both producers.
-				MeshWithOverlaySampler(MakeOverlayAwareLevelSampler(Voxels, LevelKey.Level));
+				FRecursiveMipTraceFn RecursiveTrace;
+                auto RecursiveSampler=MakeOverlayAwareLevelSampler(Voxels,LevelKey.Level,&RecursiveTrace);
+                if(RecursiveTrace&&AppearanceBankBinding&&AppearanceBankBinding->SourceSnapshot()&&AppearanceBankBinding->SourceSnapshot()->Sources().Num()>1){
+                    const FIntVector PageKey(LevelKey.Key.X,LevelKey.Key.Y,LevelKey.Key.Z);
+                    const auto Ordered=VoxelResolveTerrainInstances(Voxels.generated(),VoxelAssetRectForFootprint(LevelKey.Level,PageKey.X,PageKey.Y));
+                    FVoxelAppearanceTouchedPage Touched;verify(Touched.Build(Voxels,PageKey,LevelKey.Level,true));FString Error;
+                    auto Page=FVoxelTerrainAppearancePage::Prepare(PageKey,LevelKey.Level,Rec->GenerationId,Ordered,*AppearanceBankBinding,
+                        [this](int64 X,int64 Y,int64 Z){return vxc::Amplifier::materialAt(Voxels.generated().amplifier().columnCached(X,Y),Z);},
+                        [&Touched](int64 X,int64 Y,int64 Z){return Touched.IsTouched(X,Y,Z);},Error,RecursiveTrace);
+                    if(Page)EditedAppearanceUpload=Page->MakeUpload(*AppearanceBankBinding,Error);
+                    if(!Error.IsEmpty())UE_LOG(LogVoxelEarth,Warning,TEXT("Approved edited recursive appearance preparation failed: %s"),*Error);
+                }
+                MeshWithOverlaySampler(RecursiveSampler);
 			}
-			// ms= is the §14 measurement, kept in the shipping line rather than
+			// ms= is the Â§14 measurement, kept in the shipping line rather than
 			// behind a switch: the failure it names was a single re-mesh, and a
 			// per-level wall time is the only thing that distinguishes this path
 			// working from this path hanging.
@@ -29624,7 +30127,7 @@ void FVoxelWorldImpl::DrainGameThreadMesh(AActor& Owner, USceneComponent& Root, 
 		// instead of the workers) and re-meshes, and only the former may count.
 		const bool bBrickFirstSettle = !Rec->bMeshSettled;
 		const bool bQuadFirstLoad =
-		    ApplyMeshResult(Owner, Root, Material, LevelKey, *Rec, MoveTemp(Quads), /*bIsGameThreadMesh*/ true);
+		    ApplyMeshResult(Owner, Root, Material, LevelKey, *Rec, MoveTemp(Quads), /*bIsGameThreadMesh*/ true, FVoxelGpuQuadPayloadRef(), 0, EditedAppearanceUpload);
 		if (bQuadFirstLoad)
 		{
 			++ProxiesCreated;
@@ -29635,7 +30138,7 @@ void FVoxelWorldImpl::DrainGameThreadMesh(AActor& Owner, USceneComponent& Root, 
 		VoxelBrickCpuArm::Publish(
 			LevelKey, BrickPack,
 			VoxelApplyFast::ShadingForPublish(LevelKey, BrickPack, Root,
-			                                  &SampleChunkParamsForPool, &ShadingFromChunkParams));
+			                                  &SampleChunkParamsForPool, &ShadingFromChunkParams),MoveTemp(EditedAppearanceUpload));
 		// Marcher-path load count, the DrainResults twin (2026-08-28 -- the full
 		// WHY, the rule and every guard's reason live at that site and on
 		// TotalChunksLoaded's declaration). Here it covers the one demand
@@ -29954,8 +30457,32 @@ void FVoxelWorldImpl::DrainUnloads()
 
 // --- dig / place (edit-log authority path) -----------------------------
 
+// Both callers retain their original rounded integer ray and hit conversion.
+// Mode 0 is the reference path; mode 2 audits every visited cell against it.
+static vxc::RaycastHit VoxelRaycastWithQuery(const vxc::World<VoxelCoords::BrickEdgeVoxels>& World,
+    int64 Ox,int64 Oy,int64 Oz,int64 Dx,int64 Dy,int64 Dz)
+{
+    static const int32 Mode=[](){int32 Value=1;FParse::Value(FCommandLine::Get(),TEXT("VoxelRayQuery="),Value);return FMath::Clamp(Value,0,2);}();
+    if(Mode==0)return vxc::raycastVoxels([&](int64 X,int64 Y,int64 Z){return World.materialAt(X,Y,Z);},Ox,Oy,Oz,Dx,Dy,Dz);
+    vxc::AssetVoxelRect Rect;vxc::worldQueryRayRect(Ox,Oy,Dx,Dy,Rect);
+    const auto Query=[&](){TRACE_CPUPROFILER_EVENT_SCOPE(VoxelRay_QueryPrepare);return vxc::WorldQuery<VoxelCoords::BrickEdgeVoxels>(World,Rect);}();
+    static uint64 AuditSamples=0,AuditMismatches=0,AuditRays=0;
+    const auto Sample=[&](int64 X,int64 Y,int64 Z){
+        const auto Fast=Query.materialAt(X,Y,Z);
+        if(Mode!=2)return Fast;
+        const auto Reference=World.materialAt(X,Y,Z);++AuditSamples;
+        if(Fast!=Reference){++AuditMismatches;UE_LOG(LogVoxelEarth,Error,TEXT("VoxelRayQuery MISMATCH xyz=%lld,%lld,%lld fast=%u reference=%u"),X,Y,Z,uint32(Fast),uint32(Reference));}
+        return Reference;
+    };
+    const auto Hit=vxc::raycastVoxels(Sample,Ox,Oy,Oz,Dx,Dy,Dz);
+    if(Mode==2 && (++AuditRays==1 || AuditRays%256==0))
+        UE_LOG(LogVoxelEarth,Log,TEXT("VoxelRayQuery AUDIT rays=%llu samples=%llu mismatches=%llu"),AuditRays,AuditSamples,AuditMismatches);
+    return Hit;
+}
+
 vxc::RaycastHit FVoxelWorldImpl::CastFromCamera(const FVector& CameraLoc, const FVector& Dir) const
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(VoxelDig_CastFromCamera);
 	const int64 OxMm = VoxelCoords::WorldToMm(CameraLoc.X);
 	const int64 OyMm = VoxelCoords::WorldToMm(CameraLoc.Y);
 	const int64 OzMm = VoxelCoords::WorldToMm(CameraLoc.Z);
@@ -29968,8 +30495,7 @@ vxc::RaycastHit FVoxelWorldImpl::CastFromCamera(const FVector& CameraLoc, const 
 	// table: "call vxc::raycastVoxels against the subsystem's
 	// World::materialAt (game thread)"). Game thread only -- Voxels.overlay_
 	// is not thread-safe.
-	const auto MaterialFn = [this](int64 X, int64 Y, int64 Z) { return Voxels.materialAt(X, Y, Z); };
-	return vxc::raycastVoxels(MaterialFn, OxMm, OyMm, OzMm, DxMm, DyMm, DzMm);
+	return VoxelRaycastWithQuery(Voxels, OxMm, OyMm, OzMm, DxMm, DyMm, DzMm);
 }
 
 void FVoxelWorldImpl::CollectDirtyChunks(int64 Vx, int64 Vy, int64 Vz, TSet<VoxelCoords::FVoxelChunkKey>& Out) const
@@ -30332,8 +30858,14 @@ int32 FVoxelWorldImpl::StampVoxels(const TArray<VoxelCoords::FVoxelCoord>& Coord
 	return Count;
 }
 
+bool FVoxelWorldImpl::CaptureDebrisAppearance(const TArray<VoxelCoords::FVoxelCoord>& Cells,TArray<FVoxelDebrisCellAppearance>& Out)
+{
+    TRACE_CPUPROFILER_EVENT_SCOPE(VoxelAppearance_CaptureDebris);
+    return VoxelDebrisCapture::Capture(Voxels,AppearanceBankBinding.Get(),Cells,Out);
+}
+
 int32 FVoxelWorldImpl::DetectAndRemoveIslands(const TArray<VoxelCoords::FVoxelCoord>& ClearedVoxels,
-                                              TArray<TArray<VoxelCoords::FVoxelCoord>>& OutIslands, bool& bOutRegionClamped)
+                                              TArray<TArray<VoxelCoords::FVoxelCoord>>& OutIslands, bool& bOutRegionClamped, TArray<TArray<FVoxelDebrisCellAppearance>>& OutAppearance)
 {
 	bOutRegionClamped = false;
 	if (ClearedVoxels.Num() == 0)
@@ -30404,7 +30936,7 @@ int32 FVoxelWorldImpl::DetectAndRemoveIslands(const TArray<VoxelCoords::FVoxelCo
 		       TEXT("Destruction: edit region exceeded the voxel-resolution cap (%lldx%lldx%lld) -- handing off to large-edit ")
 		       TEXT("structural collapse (brick-resolution differential support)"),
 		       (long long)RegionMaxXY, (long long)RegionMaxXY, (long long)RegionMaxZ);
-		return DetectAndRemoveCollapse(ClearedVoxels, OutIslands);
+		return DetectAndRemoveCollapse(ClearedVoxels, OutIslands, OutAppearance);
 	}
 
 	// Ragged carves (jittered CarveSphere) can genuinely isolate a handful of
@@ -30484,6 +31016,9 @@ int32 FVoxelWorldImpl::DetectAndRemoveIslands(const TArray<VoxelCoords::FVoxelCo
 		{
 			continue;
 		}
+		TArray<FVoxelDebrisCellAppearance> Appearance;
+        if(!CaptureDebrisAppearance(IslandCoords,Appearance)){UE_LOG(LogVoxelEdit,Error,TEXT("Island removal refused: pre-removal appearance snapshot invalid"));continue;}
+        OutAppearance.Add(MoveTemp(Appearance));
 		ApplyGroupedEdits(EditsByBrick, DirtyChunks);
 		UE_LOG(LogVoxelEdit, Log, TEXT("Destruction: island %d promoted -> %d voxels removed from static grid (edit-log)"),
 		       IslandCount, IslandCoords.Num());
@@ -30504,7 +31039,7 @@ int32 FVoxelWorldImpl::DetectAndRemoveIslands(const TArray<VoxelCoords::FVoxelCo
 // plus the argument for why it stays sound at any region size where the
 // voxel-resolution bounded box did not.
 int32 FVoxelWorldImpl::DetectAndRemoveCollapse(const TArray<VoxelCoords::FVoxelCoord>& ClearedVoxels,
-                                               TArray<TArray<VoxelCoords::FVoxelCoord>>& OutPieces)
+                                               TArray<TArray<VoxelCoords::FVoxelCoord>>& OutPieces, TArray<TArray<FVoxelDebrisCellAppearance>>& OutAppearance)
 {
 	if (!CVarVoxelCollapseEnabled.GetValueOnGameThread())
 	{
@@ -30752,6 +31287,9 @@ int32 FVoxelWorldImpl::DetectAndRemoveCollapse(const TArray<VoxelCoords::FVoxelC
 		}
 		TArray<VoxelCoords::FVoxelCoord> PieceCoords;
 		PieceCoords.Reserve((int32)Piece.voxels.size());
+        for(const auto& V:Piece.voxels)PieceCoords.Add(VoxelCoords::FVoxelCoord{V.x,V.y,V.z});
+        TArray<FVoxelDebrisCellAppearance> Appearance;
+        if(!CaptureDebrisAppearance(PieceCoords,Appearance)){UE_LOG(LogVoxelEdit,Error,TEXT("Collapse piece removal refused: pre-removal appearance snapshot invalid"));continue;}
 		for (const vxc::VoxelCoord& V : Piece.voxels)
 		{
 			const vxc::BrickKey BKey = vxc::ChunkMap<B>::keyForVoxel(V.x, V.y, V.z);
@@ -30760,9 +31298,9 @@ int32 FVoxelWorldImpl::DetectAndRemoveCollapse(const TArray<VoxelCoords::FVoxelC
 			const int LocalZ = (int)vxc::floorMod(V.z, B);
 			EditsByBrick[BKey].push_back(vxc::EditCell{(uint16_t)vxc::Brick<B>::cellIndex(LocalX, LocalY, LocalZ), vxc::MAT_AIR});
 			CollectDirtyChunks(V.x, V.y, V.z, DirtyChunks);
-			PieceCoords.Add(VoxelCoords::FVoxelCoord{V.x, V.y, V.z});
 		}
 		RemovedVoxels += PieceCoords.Num();
+		OutAppearance.Add(MoveTemp(Appearance));
 		OutPieces.Add(MoveTemp(PieceCoords));
 		++PieceCount;
 	}
@@ -30771,6 +31309,7 @@ int32 FVoxelWorldImpl::DetectAndRemoveCollapse(const TArray<VoxelCoords::FVoxelC
 		UE_LOG(LogVoxelEdit, Log, TEXT("Collapse: %d chip(s) below %d voxels only -- nothing removed"), SkippedSmall,
 		       MinPieceVoxels);
 		OutPieces.Reset();
+		OutAppearance.Reset();
 		return 0;
 	}
 	ApplyGroupedEdits(EditsByBrick, DirtyChunks);
@@ -31531,7 +32070,8 @@ void PromoteDetachedIslands(FVoxelWorldImpl& Impl, UWorld& World, const TArray<V
 	}
 	TArray<TArray<VoxelCoords::FVoxelCoord>> Islands;
 	bool bRegionClamped = false;
-	const int32 IslandCount = Impl.DetectAndRemoveIslands(ClearedVoxels, Islands, bRegionClamped);
+	TArray<TArray<FVoxelDebrisCellAppearance>> CapturedAppearance;
+	const int32 IslandCount = Impl.DetectAndRemoveIslands(ClearedVoxels, Islands, bRegionClamped, CapturedAppearance);
 	if (IslandCount <= 0)
 	{
 		return;
@@ -31634,7 +32174,9 @@ void PromoteDetachedIslands(FVoxelWorldImpl& Impl, UWorld& World, const TArray<V
 		{
 			continue;
 		}
-		const int32 Used = Debris->InitFromIsland(Islands[I], InstanceBudget);
+		if(!CapturedAppearance.IsValidIndex(I)){Debris->Destroy();++Skipped;UE_LOG(LogVoxelEdit,Error,TEXT("Debris handoff missing captured appearance"));continue;}
+        const int32 Used = Debris->InitFromIslandWithAppearance(Islands[I], CapturedAppearance[I], InstanceBudget);
+        if(Used<=0){Debris->Destroy();++Skipped;UE_LOG(LogVoxelEdit,Error,TEXT("Debris handoff refused captured appearance"));continue;}
 		InstanceBudget -= Used;
 		TotalInstances += Used;
 		++Spawned;
@@ -32310,7 +32852,7 @@ void UVoxelWorldSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 
 	// Resolve the terrain material once (deliverable 4: load by path,
 	// fallback to the engine default material, never crash).
-	// -VoxelDefaultMaterial: diagnostic switch — skip the authored material
+	// -VoxelDefaultMaterial: diagnostic switch â€” skip the authored material
 	// and use the engine default, to isolate material bugs from geometry
 	// bugs (an invisible-terrain failure with the authored material and a
 	// visible one with the default indicts the asset, not the mesh).
@@ -33131,6 +33673,7 @@ TStatId UVoxelWorldSubsystem::GetStatId() const
 // authoritatively (see TryDigReplica above).
 bool UVoxelWorldSubsystem::GetDigPreview(const FVector& CameraLocation, const FVector& CameraDirection, int32 SizeVoxels, FBox& OutBounds) const
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(VoxelDig_GetPreview);
 	if (!Impl || CameraDirection.IsNearlyZero()) return false;
 	if (VoxelEnvironmentLODPrototype::GetDigPreview(GetWorld(), CameraLocation, CameraDirection.GetSafeNormal(), SizeVoxels, OutBounds)) return true;
 	return Impl->GetDigPreview(CameraLocation, CameraDirection, SizeVoxels, OutBounds);
@@ -33509,6 +34052,11 @@ const vxc::IAssetBankSource* UVoxelWorldSubsystem::GetAssetBankSource() const
 	return (Impl && Impl->AssetBankTap.Inner != nullptr) ? &Impl->AssetBankTap : nullptr;
 }
 
+TSharedPtr<const FVoxelAppearanceBankBinding,ESPMode::ThreadSafe> UVoxelWorldSubsystem::GetAssetAppearanceBinding() const
+{
+    return Impl ? Impl->AppearanceBankBinding : nullptr;
+}
+
 const vxc::Amplifier* UVoxelWorldSubsystem::GetWorldgenAmplifier() const
 {
 	return Impl ? &Impl->Voxels.amplifier() : nullptr;
@@ -33570,8 +34118,174 @@ bool UVoxelWorldSubsystem::IsSolidAtVoxel(int64 Vx, int64 Vy, int64 Vz) const
 	// Overlay-aware (World::materialAt, not GeneratedWorld::materialAt): a
 	// dug voxel must read back as non-solid immediately, and a placed one as
 	// solid, for walk-mode collision to agree with what dig/place just did.
-	return Impl->Voxels.materialAt(Vx, Vy, Vz) != vxc::MAT_AIR ||
+    // Synchronous water/ground probes inside movement share its prepared
+    // asset shortlist. Worker queries and calls outside that scope keep the
+    // exact standalone path; overlay reads remain live in either case.
+    const auto Material = [&]() {
+        if (!IsInGameThread() || !Impl->MovementCollisionQueries)
+            return Impl->Voxels.materialAt(Vx,Vy,Vz);
+        auto& Queries=*Impl->MovementCollisionQueries;
+        const auto Before=Queries.preparationCount();
+        const double Start=FPlatformTime::Seconds();
+        const auto& Query=Queries.prepare({Vx,Vy,Vx,Vy});
+        CSV_CUSTOM_STAT(VoxelStream, CollisionPrepareMs, (FPlatformTime::Seconds()-Start)*1000., ECsvCustomStatOp::Accumulate);
+        CSV_CUSTOM_STAT(VoxelStream, CollisionPreparations, int32(Queries.preparationCount()-Before), ECsvCustomStatOp::Accumulate);
+        CSV_CUSTOM_STAT(VoxelStream, MovementSolidPointCalls, 1, ECsvCustomStatOp::Accumulate);
+        return Query.materialAt(Vx,Vy,Vz);
+    }();
+	return Material != vxc::MAT_AIR ||
         VoxelEnvironmentLODPrototype::IsSolid(GetWorld(), FVector((Vx+.5)*10.,(Vy+.5)*10.,(Vz+.5)*10.));
+}
+
+bool UVoxelWorldSubsystem::DiagnoseRouteBodyBox(const FVector& CenterUU,const FVector& HalfExtentUU,FString& Json) const
+{
+    check(IsInGameThread());
+    auto O=MakeShared<FJsonObject>();O->SetBoolField(TEXT("composed_known"),false);O->SetBoolField(TEXT("amplifier_known"),false);
+    O->SetStringField(TEXT("scan_order"),TEXT("ascending z,y,x; first occupied voxel, not swept first impact"));
+    O->SetStringField(TEXT("scope"),TEXT("Composed WorldQuery including edit overlay and terrain assets; excludes separate prototype instanced collision"));
+    auto Save=[&](const TCHAR* Reason,bool Known){O->SetStringField(TEXT("reason"),Reason);return FJsonSerializer::Serialize(O,TJsonWriterFactory<>::Create(&Json))&&Known;};
+    int64 Lo[3],Hi[3];int64 Count=1;
+    for(int A=0;A<3;++A){
+        if(!FMath::IsFinite(CenterUU[A])||!FMath::IsFinite(HalfExtentUU[A])||FMath::Abs(CenterUU[A])>1.e9||
+           HalfExtentUU[A]<=0||HalfExtentUU[A]>200)return Save(TEXT("Invalid bounded body coordinates/extents"),false);
+        Lo[A]=FMath::FloorToInt64((CenterUU[A]-HalfExtentUU[A])/VoxelCoords::VoxelSizeUU);
+        // Identical inclusive range convention to mover AxisVoxelRange.
+        Hi[A]=FMath::Max(Lo[A],FMath::FloorToInt64((CenterUU[A]+HalfExtentUU[A]-KINDA_SMALL_NUMBER)/VoxelCoords::VoxelSizeUU));
+        Count*=Hi[A]-Lo[A]+1;
+    }
+    if(Count>4096)return Save(TEXT("Body query exceeds 4096 cells"),false);
+    O->SetNumberField(TEXT("max_cells"),Count);
+    for(int A=0;A<3;++A){O->SetNumberField(FString::Printf(TEXT("min_%d_voxel"),A),Lo[A]);O->SetNumberField(FString::Printf(TEXT("max_%d_voxel"),A),Hi[A]);}
+    if(!Impl||!Impl->FineStreamer)return Save(TEXT("Fine terrain residency service unavailable"),false);
+    const auto Field=GetAssetField();const int64 Reach=Field?Field->columnSamplingReachMm():0;
+    const uint64 Epoch=Impl->FineStreamer->ResidencyEpoch();O->SetStringField(TEXT("residency_epoch"),LexToString(Epoch));
+    if(!Impl->FineStreamer->IsFootprintResident(Lo[0]*100,Lo[1]*100,(Hi[0]+1)*100,(Hi[1]+1)*100))
+        return Save(TEXT("Body terrain footprint not resident"),false);
+    const bool HaloResident=Impl->FineStreamer->IsFootprintResident(Lo[0]*100-Reach,Lo[1]*100-Reach,(Hi[0]+1)*100+Reach,(Hi[1]+1)*100+Reach);
+    bool ChannelsKnown=Impl->AssetChannels!=nullptr;
+    for(int64 Y=Lo[1];Y<=Hi[1]&&ChannelsKnown;++Y)for(int64 X=Lo[0];X<=Hi[0]&&ChannelsKnown;++X){
+        const auto C=Impl->AssetChannels->channelsAt(X,Y);
+        ChannelsKnown=C.distanceToWaterMm!=vxc::kAssetNoWaterDistanceMm&&C.twiMilli!=vxc::kAssetNoTwiMilli&&
+            vxc::assetColumnFactsFromSample(Impl->Voxels.amplifier().column(X,Y),C).known;
+    }
+    O->SetBoolField(TEXT("asset_halo_resident"),HaloResident);O->SetBoolField(TEXT("body_channels_known"),ChannelsKnown);
+    const bool ComposedKnown=HaloResident&&ChannelsKnown;
+    TUniquePtr<vxc::WorldQuery<VoxelCoords::BrickEdgeVoxels>> Query;
+    if(ComposedKnown)Query=MakeUnique<vxc::WorldQuery<VoxelCoords::BrickEdgeVoxels>>(Impl->Voxels,vxc::AssetVoxelRect{Lo[0],Lo[1],Hi[0],Hi[1]});
+    TSharedPtr<FJsonObject> ComposedHit,TerrainHit;
+    for(int64 Z=Lo[2];Z<=Hi[2];++Z)for(int64 Y=Lo[1];Y<=Hi[1];++Y)for(int64 X=Lo[0];X<=Hi[0];++X){
+        const auto Terrain=Impl->Voxels.amplifier().materialAt(X,Y,Z);
+        auto Hit=[&](vxc::MaterialId M,const TCHAR* Source){auto H=MakeShared<FJsonObject>();
+            H->SetNumberField(TEXT("x_voxel"),X);H->SetNumberField(TEXT("y_voxel"),Y);H->SetNumberField(TEXT("z_voxel"),Z);
+            H->SetNumberField(TEXT("material_id"),M);H->SetNumberField(TEXT("amplifier_material_id"),Terrain);H->SetStringField(TEXT("source"),Source);return H;};
+        if(!TerrainHit&&Terrain!=vxc::MAT_AIR)TerrainHit=Hit(Terrain,TEXT("amplifier"));
+        if(Query&&!ComposedHit){const auto M=Query->materialAt(X,Y,Z);if(M!=vxc::MAT_AIR){
+            const auto Key=vxc::ChunkMap<VoxelCoords::BrickEdgeVoxels>::keyForVoxel(X,Y,Z);
+            ComposedHit=Hit(M,Impl->Voxels.editedBricks().find(Key)?TEXT("edited_brick_overlay"):(Terrain!=vxc::MAT_AIR?TEXT("amplifier"):TEXT("asset")));}}
+    }
+    if(Epoch!=Impl->FineStreamer->ResidencyEpoch())return Save(TEXT("Residency epoch changed during diagnostic"),false);
+    O->SetBoolField(TEXT("amplifier_known"),true);O->SetBoolField(TEXT("composed_known"),ComposedKnown);
+    O->SetBoolField(TEXT("amplifier_occupied"),TerrainHit.IsValid());
+    if(TerrainHit)O->SetObjectField(TEXT("amplifier_first_hit"),TerrainHit);
+    if(ComposedKnown){O->SetBoolField(TEXT("composed_occupied"),ComposedHit.IsValid());if(ComposedHit)O->SetObjectField(TEXT("composed_first_hit"),ComposedHit);}
+    return Save(ComposedKnown?TEXT("Known sampled boxes; occupancy is not step feasibility"):TEXT("Composed query unknown: asset halo/channels unavailable; amplifier-only evidence valid"),ComposedKnown);
+}
+
+bool UVoxelWorldSubsystem::SurveyFoundation(int64 MinX,int64 MinY,int64 PlaneZ,
+    vxc::FoundationSurvey& Out,FString& Reason) const
+{
+    check(IsInGameThread());Reason.Empty();
+    if(MinX < -100000000 || MinX > 100000000 || MinY < -100000000 || MinY > 100000000 ||
+       PlaneZ < -10000000 || PlaneZ > 10000000) {Out={};Reason=TEXT("Foundation coordinates outside bounded survey range");return false;}
+    const auto Unknown=[&](){Out=vxc::surveyFoundation(MinX,MinY,PlaneZ,
+        [](int64_t,int64_t,int64_t){return vxc::FoundationMaterialSample{};},
+        [](int64_t,int64_t){return vxc::FoundationWaterSample{};});return false;};
+    if(!Impl || !Impl->FineStreamer || !Impl->AssetChannels) {Reason=TEXT("Live terrain/channel services unavailable");return Unknown();}
+    const auto Field=GetAssetField();
+    const int64 Reach=Field?Field->columnSamplingReachMm():0;
+    if(!Impl->FineStreamer->IsFootprintResident(MinX*100-Reach,MinY*100-Reach,
+        (MinX+50)*100+Reach,(MinY+50)*100+Reach)) {Reason=TEXT("Foundation and asset-query halo not resident");return Unknown();}
+    const vxc::WorldQuery<VoxelCoords::BrickEdgeVoxels> Query(Impl->Voxels,{MinX,MinY,MinX+49,MinY+49});
+    Out=vxc::surveyFoundation(MinX,MinY,PlaneZ,
+        [&](int64_t X,int64_t Y,int64_t Z){return vxc::FoundationMaterialSample{true,Query.materialAt(X,Y,Z)};},
+        [&](int64_t X,int64_t Y){
+            const auto Channels=Impl->AssetChannels->channelsAt(X,Y);
+            if(Channels.distanceToWaterMm==vxc::kAssetNoWaterDistanceMm || Channels.twiMilli==vxc::kAssetNoTwiMilli)
+                return vxc::FoundationWaterSample{};
+            const auto Facts=vxc::assetColumnFactsFromSample(Impl->Voxels.amplifier().column(X,Y),Channels);
+            return vxc::FoundationWaterSample{Facts.known,Facts.standingWaterMm};
+        });
+    if(Out.unknownColumns)Reason=TEXT("Foundation contains unknown live channel samples");
+    return Out.validRequest && Out.unknownColumns==0;
+}
+
+void UVoxelWorldSubsystem::BeginMovementCollisionQueries()
+{
+    check(IsInGameThread());
+    if (!Impl) return;
+    check(!Impl->MovementCollisionQueries);
+    Impl->MovementCollisionQueries=MakeUnique<vxc::WorldQueryBatch<VoxelCoords::BrickEdgeVoxels>>(Impl->Voxels);
+}
+
+void UVoxelWorldSubsystem::EndMovementCollisionQueries()
+{
+    check(IsInGameThread());
+    if (Impl) Impl->MovementCollisionQueries.Reset();
+}
+
+bool UVoxelWorldSubsystem::FindFirstSolidVoxelSlice(const int64 (&Min)[3], const int64 (&Max)[3],
+    int32 Axis, int32 Step, int64& OutSlice) const
+{
+    TRACE_CPUPROFILER_EVENT_SCOPE(VoxelCollision_BatchedSweep);
+    CSV_SCOPED_TIMING_STAT(VoxelStream, CollisionSweep);
+    if (!Impl || Axis < 0 || Axis > 2 || (Step != 1 && Step != -1)) return false;
+    for (int32 I=0; I<3; ++I) if (Min[I] > Max[I]) return false;
+    const double PrepareStart=FPlatformTime::Seconds();
+    vxc::WorldQueryBatch<VoxelCoords::BrickEdgeVoxels> LocalQueries(Impl->Voxels);
+    auto& Queries=Impl->MovementCollisionQueries ? *Impl->MovementCollisionQueries : LocalQueries;
+    const auto PreviousPreparations=Queries.preparationCount();
+    const auto& Query=Queries.prepare({Min[0],Min[1],Max[0],Max[1]});
+    CSV_CUSTOM_STAT(VoxelStream, CollisionPrepareMs, (FPlatformTime::Seconds()-PrepareStart)*1000., ECsvCustomStatOp::Accumulate);
+    CSV_CUSTOM_STAT(VoxelStream, CollisionPreparations, int32(Queries.preparationCount()-PreviousPreparations), ECsvCustomStatOp::Accumulate);
+    CSV_CUSTOM_STAT(VoxelStream, CollisionSweepCalls, 1, ECsvCustomStatOp::Accumulate);
+    const int32 O1=(Axis+1)%3, O2=(Axis+2)%3;
+    const int64 Start=Step>0?Min[Axis]:Max[Axis], End=Step>0?Max[Axis]:Min[Axis];
+    int64 V[3];
+    for (int64 A=Start;;A+=Step)
+    {
+        V[Axis]=A;
+        for (int64 B=Min[O1];; ++B)
+        {
+            V[O1]=B;
+            for (int64 C=Min[O2];; ++C)
+            {
+                V[O2]=C;
+                if (Query.materialAt(V[0],V[1],V[2]) != vxc::MAT_AIR ||
+                    VoxelEnvironmentLODPrototype::IsSolid(GetWorld(),FVector((V[0]+.5)*10.,(V[1]+.5)*10.,(V[2]+.5)*10.)))
+                { OutSlice=A; return true; }
+                if (C==Max[O2]) break;
+            }
+            if (B==Max[O1]) break;
+        }
+        if (A==End) break;
+    }
+    return false;
+}
+
+int32 UVoxelWorldSubsystem::CountUndergroundRoofSamples(const FVector& CameraUU, double StepUU, double MaxUU, int32 StopAfter) const
+{
+    CSV_SCOPED_TIMING_STAT(VoxelStream, RoofProbeMs);
+	if (!Impl || StepUU <= 0 || MaxUU < StepUU || MaxUU / StepUU > 128 || StopAfter <= 0) return 0;
+	const int64 X = FMath::FloorToInt64(CameraUU.X / VoxelCoords::VoxelSizeUU);
+	const int64 Y = FMath::FloorToInt64(CameraUU.Y / VoxelCoords::VoxelSizeUU);
+	const vxc::WorldQuery<VoxelCoords::BrickEdgeVoxels> Query(Impl->Voxels, {X,Y,X,Y});
+	int32 Count = 0;
+	for (double Up = StepUU; Up <= MaxUU; Up += StepUU)
+	{
+		const int64 Z = FMath::FloorToInt64((CameraUU.Z + Up) / VoxelCoords::VoxelSizeUU);
+		if (Query.undergroundRoofAt(X,Y,Z) && ++Count >= StopAfter) break;
+	}
+	return Count;
 }
 
 void UVoxelWorldSubsystem::SetFluidTerrainDirtyListener(
@@ -33586,6 +34300,8 @@ void UVoxelWorldSubsystem::SetFluidTerrainDirtyListener(
 bool UVoxelWorldSubsystem::RaycastVoxelWorld(const FVector& StartUU, const FVector& DirUU, double MaxDistUU,
                                               FVector& OutHitVoxelCenterUU, FVector& OutPrevVoxelCenterUU) const
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(VoxelDig_RaycastWorld);
+    CSV_SCOPED_TIMING_STAT(VoxelStream, RaycastWorldMs);
 	if (!Impl || MaxDistUU <= 0.0)
 	{
 		return false;
@@ -33608,8 +34324,7 @@ bool UVoxelWorldSubsystem::RaycastVoxelWorld(const FVector& StartUU, const FVect
 	const int64 DyMm = (int64)FMath::RoundToDouble(Dir.Y * RangeMm);
 	const int64 DzMm = (int64)FMath::RoundToDouble(Dir.Z * RangeMm);
 
-	const auto MaterialFn = [this](int64 X, int64 Y, int64 Z) { return Impl->Voxels.materialAt(X, Y, Z); };
-	const vxc::RaycastHit Hit = vxc::raycastVoxels(MaterialFn, OxMm, OyMm, OzMm, DxMm, DyMm, DzMm);
+	const vxc::RaycastHit Hit = VoxelRaycastWithQuery(Impl->Voxels, OxMm, OyMm, OzMm, DxMm, DyMm, DzMm);
 	if (!Hit.hit)
 	{
 		return false;

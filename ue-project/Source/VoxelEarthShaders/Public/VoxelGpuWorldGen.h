@@ -40,6 +40,7 @@ struct FVoxelGpuColumnSample
 // ElevationMm.
 struct FVoxelGpuRegionRequest
 {
+    TSharedPtr<const FVoxelTerrainAppearanceUpload,ESPMode::ThreadSafe> Appearance;
 	// WAVE 2. The per-chunk shading this region's chunk record will carry.
 	// Travels on the REQUEST because the record is written on the GPU at job
 	// completion, long after the game thread that sampled the climate is gone --
@@ -253,6 +254,9 @@ struct FVoxelGpuRegionRequest
 		uint32 SizeY = 0;
 		uint32 SizeZ = 0;        // host-validated <= 4095 (span packing)
 		uint32 ColStartsBase = 0;
+		// Render-only ownership supplied by an immutable placement snapshot.
+		// Keep every instance in canonical order; an owned winner still occludes.
+		uint32 RenderOwned = 0; // exactly 0 or 1; default preserves composition
 	};
 	TArray<FAssetInstance> AssetInstances;
 	TArray<uint32> AssetColStarts;

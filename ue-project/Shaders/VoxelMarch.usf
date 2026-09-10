@@ -3136,6 +3136,23 @@ void VoxelMarchEmitPS(FVoxelMarchEmitInterp In,
 	                                                             : VOXEL_FACE_BOTTOM);
 
 	float3 BaseColor = VoxelMaterialColor(V.Material, FaceClass, WorldVoxel);
+#if VOXEL_MARCH_HAS_BRICKPOOL
+    if(V.Level>=0&&V.Level<=7&&V.FaceAxis>=0) {
+        VoxelMarchBeginLevel(V.Level);
+        const FVoxelMarchChunkCache AppearanceChunk=VoxelMarchLookupChunk(WorldVoxel>>5);
+        uint AppearanceSlotCount,AppearanceSlotStride;
+        VoxelAppearanceSlots.GetDimensions(AppearanceSlotCount,AppearanceSlotStride);
+        const uint AppearanceSlot=AppearanceChunk.BrickBase/64u;
+        if(AppearanceChunk.bValid&&AppearanceSlot<AppearanceSlotCount) {
+            const float3 CellFraction=saturate(HitLocalUU/VoxelMarchVoxelSizeUU(V.Level)-float3(WorldVoxel-VoxelMarchOriginVoxel()));
+            float3 ApprovedRGB;float ApprovedCoverage;float2 ApprovedUV;
+            if(VoxelTerrainSurfaceAppearance(VoxelAppearancePages,VoxelAppearanceSources,VoxelAppearanceRanges,
+                VoxelAppearanceSlots[AppearanceSlot],WorldVoxel,CellFraction,uint(V.FaceAxis),uint(V.FaceSign<0),V.Material,
+                VoxelMarchVoxelSizeUU(V.Level)*10.0f,0.0f,ApprovedRGB,ApprovedCoverage,ApprovedUV))BaseColor=ApprovedRGB;
+        }
+    }
+#endif
+
 
 	// ---- WAVE 2: THE SURFACE-PROXIMITY GATE ---------------------------------
 	//

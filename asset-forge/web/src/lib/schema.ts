@@ -246,6 +246,8 @@ export function allowedBiomes(
 }
 
 export interface SpeciesRow {
+  reference_review?: {status:string;findings:string[];sources:string[];reviewed_seeds:number[];taxon:string} | null;
+  design?: {display_name?:string;reference_variant_id:string;reference_seed:number;baseline_current:boolean;reference_available:boolean;generator:string;generator_approved?:boolean;review_status?:string;habitat?:string;reference_notes?:string;sources?:string[]} | null;
   name: string;
   file: string;
   kind: string;
@@ -277,6 +279,7 @@ export interface LibraryEntry {
   seed: number;
   spec_hash?: string;
   imported?: boolean;
+  inventory_candidate?: boolean;
   visual_approved?: boolean;
   stats?: Record<string, number>;
   problems?: string[];
@@ -374,4 +377,9 @@ export interface CreateResult extends Omit<InterpretResult, "spec"> {
   spec: Record<string, unknown> | null;
   kind: string | null;
   name: string | null;
+}
+export interface ForgeRequest {
+  spec: Record<string, unknown>;
+  seedStart: number;
+  n: number;
 }

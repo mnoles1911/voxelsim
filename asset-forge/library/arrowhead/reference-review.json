@@ -1,0 +1,157 @@
+{
+  "status": "passed pilot review",
+  "source": "https://plants.ces.ncsu.edu/plants/sagittaria-latifolia/",
+  "viewed_photos": [
+    "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Sagittaria_latifolia_T7nmDeYzKwaV.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=WC5Vv3bfugKGweEJxcuYQMvw7HE%3D&Expires=1788863418"
+  ],
+  "photo_reviewer": "Astra understory agent actual browser photo inspection",
+  "photo_observations": {
+    "observations": "Actual Forest/ Kim Starr form photograph viewed: separate long petioles hold sagittate blades with two basal rear lobes. White whorled flowers in photo are summer; spring leaf-only. NC State mature60-80cm; use young35-65cm rosettes.",
+    "viewed_photos": [
+      "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Sagittaria_latifolia_T7nmDeYzKwaV.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=WC5Vv3bfugKGweEJxcuYQMvw7HE%3D&Expires=1788863418"
+    ],
+    "source": "https://plants.ces.ncsu.edu/plants/sagittaria-latifolia/"
+  },
+  "findings": "Inspected all36current variants and seeds1/4/7 at small/medium/large scales. Separate petioles and sagittate blades with backward basal lobes;35-68cm spring rosettes, no summer white flowers. Small lobes coarse at25mm, large pilots maintain blade/petiole separation.",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "batch_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+  ],
+  "generator_digest": "21f726ec1318cfdc16f89086bf435e80c6dac69b805e24f18eb28d1b1a2ee8e4",
+  "sheet_hash": "323e8ec2da5346d5ee2c26de96572a77f7a258cae59ff6038215533586459fc6",
+  "reviewed_at": 1788861145.3837674,
+  "pilot_hashes": {
+    "1": "8a3eb9d547202394b96abd1d6b3956a6be77de65d06375c056bded4feb0839c1",
+    "4": "94939c2255b0a0affaedcf8d93cfafea005fd39c51483af04c1a567983c77639",
+    "7": "570f4ef0be468723e98702815829790cb080716ca0f9d006cde0f9cc8aecdf28"
+  },
+  "profile": "arrowhead",
+  "review_date": "2026-09-08",
+  "additional_sources": [],
+  "reference_catalog_photos": [
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Sagittaria_latifolia_T7nmDeYzKwaV.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=WC5Vv3bfugKGweEJxcuYQMvw7HE%3D&Expires=1788863418",
+      "caption": "Form",
+      "credit": "Forest and Kim Starr",
+      "license": "<a href='https://creativecommons.org/licenses/by/3.0/'>CC BY 3.0</a>",
+      "image_id": "19797"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Sagittaria_latifolia_zWNKFnXmxit7.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=8ghyjHkNlNihZzMgLtQdAs2jkXI%3D&Expires=1788863418",
+      "caption": "Sagittaria latifolia",
+      "credit": "John David Tobe",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc/4.0/legalcode'>CC BY-NC 4.0</a>",
+      "image_id": "42141"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/9876466063_8d8493f6b_knlzxYyVkmHi.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=Xyj60Rha0vb2XBNEESlZF9QjqG0%3D&Expires=1788863418",
+      "caption": "Flowers",
+      "credit": "Fritz Flohr Reynolds",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/2.0/'>CC-BY-SA 2.0</a>",
+      "image_id": "19795"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Screen_Shot_2019-05-11_at_12.02.37_AM.apng?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=mopg%2BlWrBPPShqxVIZFs%2FUVvcE8%3D&Expires=1788863418",
+      "caption": "Flower and leaves",
+      "credit": "Fritz Flohr Reynolds",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/3.0/deed.en'>CC BY-SA 3.0</a>",
+      "image_id": "10711"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Broadleaf_Arrowhead__IYVZq08nWKD6.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=nSO1Eqn96%2FYxT11g0%2BnC1k3Puvo%3D&Expires=1788863418",
+      "caption": "Leaf closeup",
+      "credit": "Andrew C",
+      "license": "<a href='http://creativecommons.org/licenses/by/2.0/legalcode'>CC BY 2.0</a>",
+      "image_id": "19796"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Udo_Schmidt_Attribution-ShareAlike_2.0_Generic_CC_BY-SA_2.0_Sagittaria_latifolia.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=rG3UR3v3N%2FvRxcpLvzdQEpurbWg%3D&Expires=1788863418",
+      "caption": "Leaves",
+      "credit": "Udo Schmidt",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/2.0/'>CC-BY-SA 2.0</a>",
+      "image_id": "10712"
+    }
+  ],
+  "taxon": "Sagittaria latifolia",
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "323e8ec2da5346d5ee2c26de96572a77f7a258cae59ff6038215533586459fc6"
+  }
+}

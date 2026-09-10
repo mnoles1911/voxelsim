@@ -1,4 +1,5 @@
 #include "VoxelWalkTestSubsystem.h"
+#include "VoxelEcologicalRoute.h"
 
 #include "Engine/World.h"
 #include "GameFramework/PlayerController.h"
@@ -8,6 +9,10 @@
 #include "VoxelCharacterMovement.h"
 #include "VoxelEarthFlyPawn.h"
 #include "VoxelMovementTuning.h"
+#include "VoxelWorldSubsystem.h"
+#include "VoxelDetailAssetSubsystem.h"
+#include "voxelcore/assetfield.h"
+#include "voxelcore/amplifier.h"
 
 DEFINE_LOG_CATEGORY(LogVoxelWalkTest);
 
@@ -38,6 +43,8 @@ const TCHAR* PhaseName(int32 P)
 void UVoxelWalkTestSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
 	Super::Initialize(Collection);
+	EcologicalRoute=FVoxelEcologicalRoute::FromCommandLine();
+	if(EcologicalRoute){bArmed=true;return;}
 
 	// Command line read at init, deliberately NOT -ExecCmds: cvars set that way
 	// land after subsystems have already run (VoxelPerfRunSubsystem carries the
@@ -138,12 +145,13 @@ void UVoxelWalkTestSubsystem::EnterPhase(EPhase Next)
 
 	if (Phase != EPhase::Done)
 	{
-		UE_LOG(LogVoxelWalkTest, Verbose, TEXT("VoxelWalkTest: phase %s"), PhaseName(int32(Phase)));
+		UE_LOG(LogVoxelWalkTest, Log, TEXT("VoxelWalkTest: phase %s"), PhaseName(int32(Phase)));
 	}
 }
 
 void UVoxelWalkTestSubsystem::Tick(float DeltaTime)
 {
+	if(EcologicalRoute){EcologicalRoute->Tick(GetWorld(),DeltaTime);return;}
 	if (!bArmed || Phase == EPhase::Done)
 	{
 		return;
@@ -166,6 +174,27 @@ void UVoxelWalkTestSubsystem::Tick(float DeltaTime)
 	// phase's baseline. SetWalkMode is idempotent, so re-entering is harmless.
 	if (PhaseElapsedSeconds == 0.0 && Phase == EPhase::Settle)
 	{
+		bWaitForEcology = FParse::Param(FCommandLine::Get(), TEXT("VoxelWalkWaitForEcology"));
+		if (bWaitForEcology)
+		{
+			auto* Ground=GetWorld()->GetSubsystem<UVoxelWorldSubsystem>();
+			auto* Details=GetWorld()->GetSubsystem<UVoxelDetailAssetSubsystem>();
+			if(!Ground||!Details)return;
+			const auto* Field=Ground->GetAssetField();const auto* Amp=Ground->GetWorldgenAmplifier();
+			if(!Field||!Field->ecologyEnabled()||!Amp)return;
+			const auto Progress=Ground->GetStreamingProgress();int Pending=0;
+			for(int L=0;L<VoxelCoords::kNumLevels;++L)Pending+=Progress.LevelPendingCount[L];
+			int Ready=0,Total=0;uint64 Instances=0;
+			const bool Settled=Ground->IsFineRingSettled(Ready,Total)&&Pending==0&&
+				Progress.TotalJobsInFlight==0&&Details->IsPlacementSettled(Instances);
+			if(!Settled){EcologyQuietSince=-1;return;}
+			if(EcologyQuietSince<0)EcologyQuietSince=ElapsedSeconds;
+			if(ElapsedSeconds-EcologyQuietSince<5)return;
+			GetWorld()->GetFirstPlayerController()->ConsoleCommand(TEXT("csvprofile start"));
+			const FVector Position=Pawn->GetActorLocation();
+			const auto Column=Amp->column(FMath::FloorToInt64(Position.X/10.),FMath::FloorToInt64(Position.Y/10.));
+			UE_LOG(LogVoxelWalkTest,Log,TEXT("VoxelWalkTest ECOLOGY_MEASURE_BEGIN biome=%d liveInstances=%llu"),int(Column.biome),Instances);
+		}
 		RunStartZ = Pawn->GetActorLocation().Z;
 		Pawn->SetWalkMode(true);
 		EnterPhase(EPhase::Settle);
@@ -327,6 +356,8 @@ void UVoxelWalkTestSubsystem::Tick(float DeltaTime)
 
 	if (Phase == EPhase::Done)
 	{
+		if(bWaitForEcology){GetWorld()->GetFirstPlayerController()->ConsoleCommand(TEXT("csvprofile stop"));
+			UE_LOG(LogVoxelWalkTest,Log,TEXT("VoxelWalkTest ECOLOGY_MEASURE_END"));}
 		Pawn->ClearScriptedInput();
 		Mover->SetCrouchHeld(false);
 		Mover->SetSprintHeld(false);

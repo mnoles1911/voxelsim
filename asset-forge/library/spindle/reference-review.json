@@ -1,0 +1,151 @@
+{
+  "status": "passed pilot review",
+  "source": "https://plants.ces.ncsu.edu/plants/euonymus-europaeus/",
+  "viewed_photos": [
+    "Harald Supfle Form",
+    "Meneerke bloem Spring flowers and leaves",
+    "Dr Mary Gillham Archive Flowers"
+  ],
+  "findings": "Opposite leaves and fine green terminal twigs follow actual daughter branches. Varied multi-stem upright and spreading forms, 1.6-3.6 m. Tiny greenish spring flowers remain indistinguishable from foliage at 25 mm; autumn fruit excluded. Actually compared reference photographs, current seeds 1,4,7 and all 36 variants. Accepted as stylized spring source; user endorsement remains separate.",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "batch_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+  ],
+  "generator_digest": "68cb36b364919bf260434786ddd65e2abe865e6ad25f0431e5fe79d90096c601",
+  "sheet_hash": "2a978ed7b752edc80c2afa1c945a390cfcc5655ac26cf21e5a9c5270a80a9ead",
+  "reviewed_at": 1788850912.5470605,
+  "pilot_hashes": {
+    "1": "3b5f627259193c2102e26e4799ebee297d5d20f6c8e35c43e627033a16c47eda",
+    "4": "b1a4f6cc3c1cf553ee508a02ce0cb710be6145e1541eb54a4282bacccf01b225",
+    "7": "450b366226d63db7af16709e92e63b5023cf5b456996cb61dbe0fd04d23b9b50"
+  },
+  "profile": "spindle",
+  "review_date": "2026-09-08",
+  "additional_sources": [],
+  "reference_catalog_photos": [
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Euonymus_europaeus_F_4mAZC12pAqS7.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=EA9lhGkIjYz2gA99o5XpN01BypU%3D&Expires=1788853960",
+      "caption": "Form",
+      "credit": "Harald S\u00fcpfle",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/3.0/deed.en'>CC BY-SA 3.0</a>",
+      "image_id": "36099"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Euonymus_europaeus_f_uI9AAZL1C7nX.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=Y1Pdd%2FyyVN6h%2FprFghtJT%2FWFxEc%3D&Expires=1788853960",
+      "caption": "Spring flowers and leaves",
+      "credit": "Meneerke bloem",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/3.0/deed.en'>CC BY-SA 3.0</a>",
+      "image_id": "36102"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Euonymus_europaeus--Dr_Mary_Gillham_Archive_Project_Photostream--CC-BY.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=IXSBUM8SArieL9U8SscXAIc270c%3D&Expires=1788853960",
+      "caption": "Flowers",
+      "credit": "Dr Mary Gillham Archive Project Photostream",
+      "license": "<a href='http://creativecommons.org/licenses/by/4.0/legalcode'>CC BY 4.0</a>",
+      "image_id": "10346"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Euonymus_europaeus--Ruud_de_Block--CC-BY-SA.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=1b2ehYvPWbMZSjTIlLtkA1f6vMo%3D&Expires=1788853960",
+      "caption": "Summer leaves",
+      "credit": "Ruud de Block",
+      "license": "<a href='http://creativecommons.org/licenses/by-sa/4.0/legalcode'>CC BY-SA 4.0</a>",
+      "image_id": "10347"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Euonymus_europaeus--Randy_Nonemacher--CC-BY-SA.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=1sfLN8QNSstsAMNwDk6mxjglD8Q%3D&Expires=1788853960",
+      "caption": "Leaf close-up",
+      "credit": "Randy Nonenmacher",
+      "license": "<a href='http://creativecommons.org/licenses/by-sa/4.0/legalcode'>CC BY-SA 4.0</a>",
+      "image_id": "10348"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Euonymus_europaeus_b_NdVe4ZKyoMTh.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=0OsPkqWwWJrucSvtiuxVfXNSrg8%3D&Expires=1788853960",
+      "caption": "Bark",
+      "credit": "Krzysztof Ziarnek",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/3.0/deed.en'>CC BY-SA 3.0</a>",
+      "image_id": "36101"
+    }
+  ],
+  "taxon": "Euonymus europaeus",
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "2a978ed7b752edc80c2afa1c945a390cfcc5655ac26cf21e5a9c5270a80a9ead"
+  }
+}

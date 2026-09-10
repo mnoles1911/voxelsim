@@ -1,0 +1,151 @@
+{
+  "status": "passed pilot review",
+  "source": "https://plants.ces.ncsu.edu/plants/cornus-sanguinea/",
+  "viewed_photos": [
+    "Mass planting - UK Garden Photos; winter structure only",
+    "Form - Peter Burch",
+    "Red twigs visible between leaves - Peter Burch"
+  ],
+  "findings": "Compared the spring leafy multi-stem shrub and detailed paired foliage photograph, using leafless mass planting only for stool structure. The initial generic leaf sequence was corrected to opposite pairs along each daughter shoot; spread increased to 1.4 and twig radius reduced to 4 mm. Reviewed current seeds 1/4/7 and all 36 resulting variants. Irregular spreading canopies and separately connected basal stems now match the intended thicket architecture. Selected spring leaf flush before flower clusters; no fruit. The existing bark token does not reproduce red young twigs and leaf veins remain below 25 mm; those color/detail limits are recorded rather than claimed complete. Accepted geometry source, approximately 1.32-3.12 m.",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "batch_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+  ],
+  "generator_digest": "421e80d00cabb36d42639a6555f9e5c9dd3eee7f9b0f9bae069241d9d3b76f2d",
+  "sheet_hash": "ed1e924e677b3b9c156cf0a33b2e50bfe7eea853c23cf180fe81bffcf0456ec9",
+  "reviewed_at": 1788847441.5344777,
+  "pilot_hashes": {
+    "1": "a47dc762da46155bf0b287db3e6269104ae0b3d2d8ea273d54906c8419fcbb4a",
+    "4": "1d2f5a32cb95f66a3f050147ec6224d923c331aca209582d771c2290e02bd193",
+    "7": "5443e72caa47418a58f380fe0f99da02a93fac60b104c56d10f22057f6d8e8f0"
+  },
+  "profile": "common-dogwood",
+  "review_date": "2026-09-08",
+  "additional_sources": [],
+  "reference_catalog_photos": [
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Cornus-sanguinea--ukgardenphotos--CC-BY-NC-ND.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=qTWZhIujC7t11xduoowbVgaF%2FXY%3D&Expires=1788849621",
+      "caption": "Mass planting",
+      "credit": "UK Garden Photos",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc-nd/4.0/legalcode'>CC BY-NC-ND 4.0</a>",
+      "image_id": "4090"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Cornus-sanguinea--Peter-Birch--CC-BY-NC-ND.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=euryFWBlZ9YpXB8ImxQB8HCcH14%3D&Expires=1788849621",
+      "caption": "Form",
+      "credit": "Peter Burch",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc-nd/4.0/legalcode'>CC BY-NC-ND 4.0</a>",
+      "image_id": "4092"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Cornus-sanguinea-stems--Peter-Birch--CC-BY-NC-ND.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=2EXUUPi9bX6MteuL8rznWsB%2BoPs%3D&Expires=1788849621",
+      "caption": "Red twigs are easily visible between the light green foliage.",
+      "credit": "Peter Burch",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc-nd/4.0/legalcode'>CC BY-NC-ND 4.0</a>",
+      "image_id": "7783"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Cornus-sanguinea--Bathyporeiai--CC-BY-NC-ND.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=oJPOeS6vi%2Bbef8wfOVzyrOdOUg8%3D&Expires=1788849621",
+      "caption": "Flowers",
+      "credit": "Bathyporeiai",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc-nd/4.0/legalcode'>CC BY-NC-ND 4.0</a>",
+      "image_id": "7784"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Cornus-sanguinea--Ettore-Balocchi--CC-BY.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=ed9iPpJsg0h82vyhYWi62On503Q%3D&Expires=1788849621",
+      "caption": "",
+      "credit": "Ettore Balocchi",
+      "license": "<a href='http://creativecommons.org/licenses/by/2.0/legalcode'>CC BY 2.0</a>",
+      "image_id": "7785"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Cornus_sanguinea_flower_and_leaves_Andreas_Rockstein_ccbysa20.jpe?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=Og3SwuwYqeEj83EgD6LaI77PX1s%3D&Expires=1788849621",
+      "caption": "Cornus sanguinea flower and leaves",
+      "credit": "Andreas Rockstein",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/2.0/'>CC-BY-SA 2.0</a>",
+      "image_id": "11349"
+    }
+  ],
+  "taxon": "Cornus sanguinea",
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "ed1e924e677b3b9c156cf0a33b2e50bfe7eea853c23cf180fe81bffcf0456ec9"
+  }
+}

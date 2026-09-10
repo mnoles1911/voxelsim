@@ -83,10 +83,11 @@ AssetBankError validateGrid(const AssetGrid& g, const AssetManifestSpecies& sp,
 
 } // namespace
 
-void AssetBankLibrary::configure(const AssetManifest* manifest, std::string root) {
+void AssetBankLibrary::configure(const AssetManifest* manifest, std::string root, AcceptedSourceObserver observer) {
     std::lock_guard<std::mutex> lock(mu_);
     manifest_ = manifest;
     root_ = std::move(root);
+    observer_ = std::move(observer);
     banks_.clear();
     stats_ = Stats{};
 }
@@ -138,8 +139,10 @@ const AssetBankLibrary::Bank& AssetBankLibrary::bankFor(uint16_t bankId) const {
                          assetBankErrorText(ve));
             continue;
         }
+        if (observer_) observer_(*g,bytes.data(),bytes.size());
         stats_.bytesResident += g->footprintBytes();
         ++stats_.filesLoaded;
+        bank.filenames.push_back(f.filename().string());
         bank.seeds.push_back(std::move(g));
     }
     if (bank.seeds.size() != size_t(sp.seedsBaked)) ++stats_.seedCountMismatch;
@@ -164,6 +167,21 @@ const AssetGrid* AssetBankLibrary::bankGrid(uint16_t bankId, uint16_t seedIndex)
     const AssetGrid* g = bank.seeds[size_t(seedIndex) % bank.seeds.size()].get();
     ++stats_.servedGrids;
     return g;
+}
+
+bool AssetBankLibrary::findSeedByFilename(uint16_t bankId,const std::string& filename,
+    uint16_t& slot,const AssetGrid*& grid) const {
+    slot=0;grid=nullptr;
+    if(filename.empty()||filename.find('/')!=std::string::npos||
+       filename.find('\\')!=std::string::npos)return false;
+    std::lock_guard<std::mutex> lock(mu_);
+    if(!manifest_||size_t(bankId)>=manifest_->species().size())return false;
+    const Bank& bank=bankFor(bankId);
+    const auto found=std::find(bank.filenames.begin(),bank.filenames.end(),filename);
+    if(found==bank.filenames.end())return false;
+    const auto index=size_t(found-bank.filenames.begin());
+    if(index>UINT16_MAX)return false;
+    slot=uint16_t(index);grid=bank.seeds[index].get();return true;
 }
 
 int AssetBankLibrary::loadSpecies(uint16_t bankId) const {

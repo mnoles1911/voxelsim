@@ -1,0 +1,130 @@
+{
+  "status": "passed pilot review",
+  "source": "https://gobotany.nativeplanttrust.org/species/isoetes/lacustris/",
+  "viewed_photos": [
+    "https://newfs.s3.amazonaws.com/taxon-images-1000s1000/Isoetaceae/isoetes-lacustris-ha-dcameron-b.jpg"
+  ],
+  "photo_reviewer": "Astra root actual photo review; understory agent geometry comparison",
+  "photo_observations": {
+    "species": "quillwort",
+    "taxon": "Isoetes lacustris",
+    "source": "https://gobotany.nativeplanttrust.org/species/isoetes/lacustris/",
+    "photos": [
+      {
+        "url": "https://newfs.s3.amazonaws.com/taxon-images-1000s1000/Isoetaceae/isoetes-lacustris-ha-dcameron-b.jpg",
+        "credit": "Donald Cameron",
+        "caption": "Whole rooted tuft held by fingertips beside lake"
+      }
+    ],
+    "viewed_photos": true,
+    "observations": "Compact swollen basal crown emits narrow unbranched quills, upright centrally and bending out at edges. No tall central culm, flower head or branch hierarchy.",
+    "metric_notes": "Leaves up to250mm; habitat can exceed3m water depth, which is not plant height.",
+    "spring_notes": "Green vegetative tuft. Spore structures are basal and microscopic, not colored flowers.",
+    "voxel_implications": "Keep tuft roughly10\u00e2\u20ac\u201c25cm high with a few distinguishable one-cell quills. Basal convergence unavoidable; no giant strap leaves."
+  },
+  "findings": "Inspected all36current variants and seeds1/4/7 at small/medium/large scales. Rejected initial20-quill solid cone; reduced to8 and varied outer lean. Current10-20cm rooted tuft has separate upper quills in larger seeds; tiny variants remain coarse. No central culm or flowers; water depth is not plant height.",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "batch_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+  ],
+  "generator_digest": "9ddc258b88497f05c91ae920fa6690e2b89ead358a6224ddeefb5e54dce39752",
+  "sheet_hash": "74a3756fc8f99554686d3b2cfecef482a62cd5be77224996181d27bcf91caff9",
+  "reviewed_at": 1788861146.3080819,
+  "pilot_hashes": {
+    "1": "e88e216efe1a1fdb2245d7ccfdf24ea81f5367fc2b74ef4b76329a1bb7dbb7ae",
+    "4": "73a6380e903a1c9279cac01e1987a45ac31e68f8687961b60409df24f2877236",
+    "7": "d88162ebc9ac43781c596084aad2ad676a5ce2cfafd67abf6b21c68f1c6e4236"
+  },
+  "profile": "quillwort",
+  "review_date": "2026-09-08",
+  "additional_sources": [],
+  "reference_catalog_photos": [
+    {
+      "url": "https://newfs.s3.amazonaws.com/taxon-images-1000s1000/Isoetaceae/isoetes-lacustris-ha-dcameron-b.jpg",
+      "credit": "Donald Cameron",
+      "caption": "Whole rooted tuft held by fingertips beside lake"
+    }
+  ],
+  "taxon": "Isoetes lacustris",
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "74a3756fc8f99554686d3b2cfecef482a62cd5be77224996181d27bcf91caff9"
+  }
+}

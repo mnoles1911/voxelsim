@@ -1,4 +1,6 @@
 #include "VoxelBrickPool.h"
+#include "VoxelTerrainAppearanceGpuState.h"
+#include "VoxelTerrainAppearanceValidation.h"
 #include "VoxelGpuMeshJobManager.h" // VoxelGpuBrickPackEnabled -- the master brick gate
 #include "VoxelGpuWorldGenGraph.h"
 
@@ -1689,7 +1691,7 @@ double VoxelBrickGetCpuPackMs()
 // FVoxelBrickPoolBuffers
 // ---------------------------------------------------------------------------
 
-FVoxelBrickPoolBuffers::FVoxelBrickPoolBuffers() = default;
+FVoxelBrickPoolBuffers::FVoxelBrickPoolBuffers() {Appearance=MakeShared<FVoxelTerrainAppearanceGpuState,ESPMode::ThreadSafe>();}
 FVoxelBrickPoolBuffers::~FVoxelBrickPoolBuffers() = default;
 
 uint64 FVoxelBrickPoolBuffers::GetCapacityBytes() const
@@ -2059,6 +2061,14 @@ FVoxelBrickPool::FRDGRefs FVoxelBrickPool::Register(FRDGBuilder& GraphBuilder)
 	Refs.ChunkTable = GraphBuilder.RegisterExternalBuffer(Buffers->ChunkTablePooled,
 	                                                      TEXT("VoxelBrickPool.ChunkTable"));
 	return Refs;
+}
+
+bool FVoxelBrickPool::CreateAppearanceSRVs(FRDGBuilder& Graph,FRDGBufferSRVRef& Pages,FRDGBufferSRVRef& Sources,FRDGBufferSRVRef& Ranges,FRDGBufferSRVRef& Slots) {
+    check(IsInRenderingThread());
+    if(!Buffers||!Buffers->Appearance)return false;
+    const auto Refs=Buffers->Appearance->Register(Graph);
+    if(!Refs.Pages||!Refs.Sources||!Refs.Ranges||!Refs.Slots)return false;
+    Pages=Graph.CreateSRV(Refs.Pages);Sources=Graph.CreateSRV(Refs.Sources);Ranges=Graph.CreateSRV(Refs.Ranges);Slots=Graph.CreateSRV(Refs.Slots);return true;
 }
 
 bool FVoxelBrickPool::CreateSRVs(FRDGBuilder& GraphBuilder, FRDGBufferSRVRef& OutDesc,
@@ -2751,10 +2761,29 @@ bool FVoxelBrickPool::PublishPreparedBatch(const TArray<FVoxelBrickPreparedRepla
 	Flush();return true;
 }
 
+namespace {
+bool BrickAppearanceAdmitted(const TSharedPtr<const FVoxelTerrainAppearanceUpload,ESPMode::ThreadSafe>& Appearance,const FVoxelBrickChunkKey& Key) {
+    if(Appearance) {
+        const auto& W=Appearance->PageWords;
+        const bool Recursive=W.Num()>=80&&W[0]==3;
+        const bool Header=W.Num()>=80&&W.Num()<=(Recursive?98304:65536)&&
+            (Recursive?VoxelValidateRecursiveAppearancePage(*Appearance):(W[0]==(Key.Level?2u:1u)&&W[15]==0))&&W[1]==uint32(W.Num())&&
+            int32(W[2])==Key.X&&int32(W[3])==Key.Y&&int32(W[4])==Key.Z&&W[5]==uint32(Key.Level)&&
+            (uint64(W[13])|(uint64(W[14])<<32))==Appearance->Generation;
+        if(uint32(Key.Level)>7||Appearance->Level!=uint32(Key.Level)||Appearance->PageKey!=FIntVector(Key.X,Key.Y,Key.Z)||!Appearance->Generation||
+           (!W.IsEmpty()&&(!Header||!Appearance->Sources||Appearance->Sources->SourceRanges.Num()<2))) {
+            return false;
+        }
+    }
+    return true;
+}
+}
 int32 FVoxelBrickPool::AddChunkFromGpu(const FVoxelGpuBrickPayloadRef& Payload,
                                        const FVoxelBrickChunkKey& Key,
-                                       const FVoxelBrickChunkShading& Shading)
+                                       const FVoxelBrickChunkShading& Shading,
+                                       TSharedPtr<const FVoxelTerrainAppearanceUpload,ESPMode::ThreadSafe> Appearance)
 {
+    if(!BrickAppearanceAdmitted(Appearance,Key)){++AllocFailures;return INDEX_NONE;}
 	if (!bInitialised)
 	{
 		Init(FVoxelBrickPoolConfig{});
@@ -2796,7 +2825,9 @@ int32 FVoxelBrickPool::AddChunkFromGpu(const FVoxelGpuBrickPayloadRef& Payload,
 		return INDEX_NONE;
 	}
 
+    Resident.FindChecked(Key).Appearance=Appearance;
 	FPendingWrite Write;
+    Write.Appearance=Appearance;
 	Write.Payload = Payload;
 	Write.Key = Key;
 	Write.ChunkSlot = Chunk.ChunkSlot;
@@ -2818,8 +2849,11 @@ int32 FVoxelBrickPool::AddChunkFromGpu(const FVoxelGpuBrickPayloadRef& Payload,
 // The CPU arm. Same arenas, same allocator, same eviction -- see the header.
 int32 FVoxelBrickPool::AddChunkFromCpu(const FVoxelBrickCpuPackRef& Pack,
                                        const FVoxelBrickChunkKey& Key,
-                                       const FVoxelBrickChunkShading& Shading)
+                                       const FVoxelBrickChunkShading& Shading,
+                                       TSharedPtr<const FVoxelTerrainAppearanceUpload,ESPMode::ThreadSafe> Appearance)
 {
+    if(!BrickAppearanceAdmitted(Appearance,Key)){++AllocFailures;return INDEX_NONE;}
+
 	if (!bInitialised)
 	{
 		Init(FVoxelBrickPoolConfig{});
@@ -2851,10 +2885,11 @@ int32 FVoxelBrickPool::AddChunkFromCpu(const FVoxelBrickCpuPackRef& Pack,
 	if (bGpuAllocArmed)
 	{
 		FResidentChunk Shell;
-		if (!AllocateGpuChunkShell(Key, Pack->OriginVoxel, Shell))
+		if (!AllocateGpuChunkShell(Key, Pack->OriginVoxel, Shell, Appearance))
 		{
 			return INDEX_NONE;
 		}
+		Resident.FindChecked(Key).Appearance=Appearance;
 		++ChunksAddedFromCpu;
 		if (Shading.IsNeutral())
 		{
@@ -2862,6 +2897,7 @@ int32 FVoxelBrickPool::AddChunkFromCpu(const FVoxelBrickCpuPackRef& Pack,
 		}
 		FPendingGpuCpuWrite Write;
 		Write.Pack = Pack;
+        Write.Appearance=Appearance;
 		Write.Key = Key;
 		Write.ChunkSlot = Shell.ChunkSlot;
 		Write.BrickBase = Shell.BrickBase;
@@ -2877,10 +2913,12 @@ int32 FVoxelBrickPool::AddChunkFromCpu(const FVoxelBrickCpuPackRef& Pack,
 	{
 		return INDEX_NONE;
 	}
+    Resident.FindChecked(Key).Appearance=Appearance;
 	++ChunksAddedFromCpu;
 
 	FPendingWrite Write;
 	Write.CpuPack = Pack;
+    Write.Appearance=Appearance;
 	Write.Key = Key;
 	Write.ChunkSlot = Chunk.ChunkSlot;
 	Write.BrickBase = Chunk.BrickBase;
@@ -2951,8 +2989,10 @@ bool FVoxelBrickPool::RemoveChunk(const FVoxelBrickChunkKey& Key)
 
 bool FVoxelBrickPool::AllocateGpuChunkShell(const FVoxelBrickChunkKey& Key,
                                             const FIntVector& OriginVoxel,
-                                            FResidentChunk& OutChunk)
+                                            FResidentChunk& OutChunk,
+                                            TSharedPtr<const FVoxelTerrainAppearanceUpload,ESPMode::ThreadSafe> Appearance)
 {
+    if(!BrickAppearanceAdmitted(Appearance,Key)){++AllocFailures;return false;}
 	if (!bInitialised)
 	{
 		Init(FVoxelBrickPoolConfig{});
@@ -2979,6 +3019,8 @@ bool FVoxelBrickPool::AllocateGpuChunkShell(const FVoxelBrickChunkKey& Key,
 		return false;
 	}
 	FResidentChunk* Entry = Resident.Find(Key);
+	Entry->Appearance=Appearance;
+    OutChunk.Appearance=Appearance;
 	Entry->bGpuArenas = true;
 	OutChunk.bGpuArenas = true;
 
@@ -4557,6 +4599,15 @@ void FVoxelBrickPool::Flush()
 		}
 		IndexDelta.Added.Append(PendingGpuIndexAdds);
 	}
+    TArray<FVoxelTerrainAppearanceGpuState::FEntry> AppearanceEntries;
+    TArray<uint32> AppearanceClears=Clears;
+    for(const auto& Removed:IndexDelta.Removed)AppearanceClears.AddUnique(Removed.ChunkSlot);
+    auto CaptureAppearance=[&](const FVoxelBrickChunkKey& Key,uint32 Slot){
+        const auto* Entry=Resident.Find(Key);
+        if(Entry&&Entry->ChunkSlot==Slot)AppearanceEntries.Add({Slot,Entry->Appearance});
+    };
+    for(const auto& W:Writes)CaptureAppearance(W.Key,W.ChunkSlot);
+    for(const auto& Added:PendingGpuIndexAdds)CaptureAppearance(Added.Key,Added.ChunkSlot);
 	PendingGpuIndexAdds.Reset();
 	for (const FPendingGpuCpuWrite& W : GpuCpuWrites)
 	{
@@ -4583,6 +4634,7 @@ void FVoxelBrickPool::Flush()
 		[Buffers = GetOrCreateBuffers(), Writes = MoveTemp(Writes),
 		 Clears = MoveTemp(Clears), bBatchedFlush, CoalesceMode,
 		 GpuCpuWrites = MoveTemp(GpuCpuWrites),
+         AppearanceEntries=MoveTemp(AppearanceEntries),AppearanceClears=MoveTemp(AppearanceClears),
 		 Layout = GpuAllocLayout](FRHICommandListImmediate& RHICmdList) mutable
 	{
 		VOXEL_RENDER_FRAME_SCOPE_TAIL(TailBrickPool);
@@ -4717,6 +4769,12 @@ void FVoxelBrickPool::Flush()
 		// immediately when the batch holds no CPU writes, which is every batch
 		// under voxel.Brick.PackOnCpu 0.
 		UploadCpuWrites_RenderThread(RHICmdList, Buffers, Writes, CoalesceMode);
+        // Same render command, after geometry and before its index can publish.
+        // Explicit clears also retire a slot whose next tenant has no appearance.
+        FString AppearanceError;
+        if(!Buffers->Appearance->ApplyBatch(RHICmdList,Buffers->ChunkSlots,AppearanceClears,AppearanceEntries,AppearanceError))
+            UE_LOG(LogVoxelBrickPool,Error,TEXT("Terrain appearance upload refused: %s"),*AppearanceError);
+
 	});
 	const double FlushSinkStart = FPlatformTime::Seconds();
 	FlushStageMs.EnqueueMs += (FlushSinkStart - FlushEnqueueStart) * 1000.0;

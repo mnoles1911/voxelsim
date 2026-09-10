@@ -3007,6 +3007,8 @@ def validate(spec: dict) -> tuple[dict, Report]:
 
     known = set(BY_PATH)
     for path in _leaf_paths(spec):
+        if path == "plant_recipe" or path.startswith("plant_recipe."):
+            continue
         # The curation block rides in the spec file but is not a parameter:
         # no slider, no clamp row. It is handled whole, below. The two
         # placement blocks (`biome_allow`, `biome_rules`) ride the same way.
@@ -3060,6 +3062,12 @@ def validate(spec: dict) -> tuple[dict, Report]:
             )
             continue
         set_(out, p.path, val)
+
+    # Opt-in geometry recipe: absent specs retain identical canonical bytes.
+    # Unlike classification metadata this remains in both geometry hashes.
+    if "plant_recipe" in spec:
+        from . import forest
+        out["plant_recipe"] = forest.validate_recipe(spec["plant_recipe"], get(out,"kind"))
 
     # Carry the curation block THROUGH validation rather than stripping it as
     # an unknown key. `save` writes what `validate` returns, so a verdict that

@@ -1,0 +1,157 @@
+{
+  "status": "passed pilot review",
+  "source": "https://plants.ces.ncsu.edu/plants/pontederia-cordata/",
+  "viewed_photos": [
+    "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Pontederia-cordata--Lucy-Bradley-CC_BY-NC-SA.JPG?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=tJDiaAJHCmM64gS6LK6POMY7RuM%3D&Expires=1788863418"
+  ],
+  "photo_reviewer": "Astra understory agent actual browser photo inspection",
+  "photo_observations": {
+    "observations": "Actual Lucy Bradley stand photograph viewed: long petioles and broad upright heart-based leaves with long pointed tips. Summer lilac spikes excluded; source mature<=1.2m, spring0.65m rosette.",
+    "viewed_photos": [
+      "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Pontederia-cordata--Lucy-Bradley-CC_BY-NC-SA.JPG?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=tJDiaAJHCmM64gS6LK6POMY7RuM%3D&Expires=1788863418"
+    ],
+    "source": "https://plants.ces.ncsu.edu/plants/pontederia-cordata/"
+  },
+  "findings": "Inspected all36current variants and seeds1/4/7 at small/medium/large scales. Upright heart-based pointed blades on long petioles;33-70cm spring stand without summer purple spikes. Coarse basal lobes at25mm, no rounded foliage clumps.",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "batch_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+  ],
+  "generator_digest": "c50efea16f2ee9026a8d7a1eba836175b4250c2ffa7c14eb45141e67935549b5",
+  "sheet_hash": "33c6e6e764498d45daaeff2b7227dc4bb54e9243f8cdd8052e8a91493e9c8278",
+  "reviewed_at": 1788861145.4732385,
+  "pilot_hashes": {
+    "1": "08c9f00cf0d91546eb29286c780aecc009e1671dad8acd2da7321546ed01c89f",
+    "4": "02018fea1f908569d152df34a15346757c6abe3df4bb320a717159c4178c74d8",
+    "7": "8d8becf1b17078998f397af9488eed5ad8648baf0a51661122a82b0318ffd964"
+  },
+  "profile": "pickerelweed",
+  "review_date": "2026-09-08",
+  "additional_sources": [],
+  "reference_catalog_photos": [
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Pontederia-cordata--Lucy-Bradley-CC_BY-NC-SA.JPG?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=tJDiaAJHCmM64gS6LK6POMY7RuM%3D&Expires=1788863418",
+      "caption": "Form",
+      "credit": "Lucy Bradley",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc-sa/4.0/legalcode'>CC BY-NC-SA 4.0</a>",
+      "image_id": "5584"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/pickerel_weed_202006_GV0LdrHVBhAi.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=U21sUGzpfkAwomJYKG3nHHwSq2k%3D&Expires=1788863418",
+      "caption": "habitat in summer Cameron Art Museum Wilmington, NC",
+      "credit": "skdavidson",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/2.0/'>CC-BY-SA 2.0</a>",
+      "image_id": "26525"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/BDK_Attribution-ShareAlike_3.0_Unported_CC_BY-SA_3.0_Pontederia_cordata.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=o1kHw3hJT89wlHM9Y9ksk0%2Bc3cc%3D&Expires=1788863418",
+      "caption": "Pontederia cordata",
+      "credit": "BDK",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/3.0/deed.en'>CC BY-SA 3.0</a>",
+      "image_id": "10718"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Bernard_Dupont_Attribution-ShareAlike_2.0_Generic_CC_BY-SA_2.0_Pontederia_cordata.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=FhPMbWUjB1uFGj69DzYpS8aE69I%3D&Expires=1788863418",
+      "caption": "Pontederia cordata",
+      "credit": "Bernard Dupont",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/2.0/'>CC-BY-SA 2.0</a>",
+      "image_id": "10719"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Gail_Hampshire_Attribution_2.0_Generic_CC_BY_2.0_Pontederia_cordata.mpo?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=G3UMZba0KHPMvwONft0s3Tm6WZ8%3D&Expires=1788863418",
+      "caption": "Pontederia cordata",
+      "credit": "Gail Hampshire",
+      "license": "<a href='http://creativecommons.org/licenses/by/2.0/legalcode'>CC BY 2.0</a>",
+      "image_id": "10720"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Simon_Pierre_Barette_Attribution-ShareAlike_3.0_Unported_CC_BY-SA_3.0_Pontederia_cordata.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=QeLyPTCPrxMtKqbLz8PSQ1Hf3ZE%3D&Expires=1788863418",
+      "caption": "Pontederia cordata",
+      "credit": "Simon Pierre Barette",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/3.0/deed.en'>CC BY-SA 3.0</a>",
+      "image_id": "10721"
+    }
+  ],
+  "taxon": "Pontederia cordata",
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "33c6e6e764498d45daaeff2b7227dc4bb54e9243f8cdd8052e8a91493e9c8278"
+  }
+}

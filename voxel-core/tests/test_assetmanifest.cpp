@@ -22,6 +22,26 @@ using namespace vxc;
 using vxmtest::VxmSpecies;
 using vxmtest::buildVxm;
 
+VXC_TEST(ecological_density_policy_is_biome_scoped_and_preserves_habitat){
+    VxmSpecies source;source.weights[TAIGA]=1000;source.weights[TEMPERATE_FOREST]=1000;
+    source.waterMaxMm=20000;source.slopeMaxMmPerM=300;
+    AssetManifest manifest;CHECK(manifest.parse(buildVxm({source}))==AssetManifestError::kOk);
+    std::vector<AssetSpecies> legacy,ecological;
+    assetSpeciesTableFromManifest(manifest,legacy);
+    assetSpeciesTableFromManifest(manifest,ecological,{{0,256,12000,uint16_t(1u<<TEMPERATE_FOREST)}});
+    CHECK_EQ(legacy.size(),1u);CHECK_EQ(ecological.size(),1u);
+    CHECK_EQ(legacy[0].weightPerMille[TAIGA],ecological[0].weightPerMille[TAIGA]);
+    CHECK(ecological[0].weightPerMille[TEMPERATE_FOREST]<legacy[0].weightPerMille[TEMPERATE_FOREST]);
+    CHECK_EQ(legacy[0].waterMaxMm,ecological[0].waterMaxMm);
+    CHECK_EQ(legacy[0].slopeMaxMmPerM,ecological[0].slopeMaxMmPerM);
+    source.abundanceQ10=6;source.spacingMm=700000;
+    CHECK(manifest.parse(buildVxm({source}))==AssetManifestError::kOk);
+    assetSpeciesTableFromManifest(manifest,legacy);CHECK(legacy.empty());
+    assetSpeciesTableFromManifest(manifest,ecological,{{0,819,48000,uint16_t(1u<<TEMPERATE_FOREST)}});
+    CHECK_EQ(ecological.size(),1u);CHECK(ecological[0].weightPerMille[TEMPERATE_FOREST]>0);
+    CHECK_EQ(ecological[0].weightPerMille[TAIGA],0);
+}
+
 namespace {
 
 std::vector<uint8_t> readFixture(const char* name) {

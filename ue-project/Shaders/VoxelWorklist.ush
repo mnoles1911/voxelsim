@@ -132,7 +132,7 @@ struct GpuAssetStampInstance
 	uint SizeY;
 	uint SizeZ;
 	uint ColStartsBase;
-	uint Pad0;
+	uint RenderOwned; // explicit winner ownership, not a cell material bit
 };
 
 // --- the record fold, GPU half ----------------------------------------------

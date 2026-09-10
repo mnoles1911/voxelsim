@@ -1,0 +1,151 @@
+{
+  "status": "passed pilot review",
+  "source": "https://plants.ces.ncsu.edu/plants/lupinus-perennis/",
+  "viewed_photos": [
+    "Form in bloom - Steven Katovich, USDA Forest Service, Bugwood.org",
+    "Native habitat in Illinois - Natural Locasian",
+    "Flowers - cassi saari"
+  ],
+  "findings": "Steven Katovich USDA full plants,Natural Locasian Illinois field and cassi saari flowers: radial narrow leaflets on long petioles with purple pea-flowered racemes above. Generic flat leaf slab rejected. Current seeds1,4,7 and all36contact-sheet panels visually inspected. 28\u201365cm shoots carry palmately divided leaves on petioles and violet spring racemes. Compact radial leaflets merge into stars or plates at25mm, but attached petiole architecture and raceme position are preserved. Accepted as coarse stylized spring source; user endorsement remains separate.",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "batch_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+  ],
+  "generator_digest": "91a141f5eeb515113964f696b8175034a83840067a301118c8177e73542af7e4",
+  "sheet_hash": "81cf8207f842d53bd40c1e1a6fafd3eb0b3ff9f72959caa52ec31422fe7e7bf9",
+  "reviewed_at": 1788858046.155094,
+  "pilot_hashes": {
+    "1": "3757ceda07912c83a85aa134456d81f37e03ada315f75c3d3a1d4e3a488a0bff",
+    "4": "9cf982f9dd27e424d5e9ae20abb2f3d4406b600393cfcd30fa459e860a3f6ea2",
+    "7": "b9721a7bd56218cf5d9ef882f3bcc98083baf69671ac124ef390c498c8b15680"
+  },
+  "profile": "prairie-lupine",
+  "review_date": "2026-09-08",
+  "additional_sources": [],
+  "reference_catalog_photos": [
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Lupinus_perennis_for_qolSlx3a6tz8.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=vBs0myx5rRlwnzYmqh96I8xD1c4%3D&Expires=1788859998",
+      "caption": "Form in bloom",
+      "credit": "Steven Katovich, USDA Forest Service, Bugwood.org",
+      "license": "<a href='https://creativecommons.org/licenses/by/3.0/'>CC BY 3.0</a>",
+      "image_id": "37140"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Lupinus_perennis_nat_My4xx1pETU4Z.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=sw1XGl4SbcJt9agEOnkhY%2BjEvrI%3D&Expires=1788859998",
+      "caption": "Native habitat in Illinois",
+      "credit": "Natural Locasian",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc/4.0/legalcode'>CC BY-NC 4.0</a>",
+      "image_id": "37144"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Lupinus_perennis_in__8cbh2dNrZaMN.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=sA%2FhmXdaPN%2BoojfdqpY3blHbEAk%3D&Expires=1788859998",
+      "caption": "Flowers",
+      "credit": "cassi saari",
+      "license": "<a href='http://creativecommons.org/licenses/by-sa/4.0/legalcode'>CC BY-SA 4.0</a>",
+      "image_id": "37139"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Lupinus_perennis_gro_9MUNtLypntxL.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=KIlStaxbBfkdiF7XOXuSMeCH1SE%3D&Expires=1788859998",
+      "caption": "Growing along a road in PA",
+      "credit": "Nate Hartley",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc/4.0/legalcode'>CC BY-NC 4.0</a>",
+      "image_id": "37145"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Lupinus_perennis_flo_ZUV89i04WjXW.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=Ek%2BGA9fsHTpSgZsToA%2BhMmR3OpE%3D&Expires=1788859998",
+      "caption": "Flowers and stem",
+      "credit": "earnoodles",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc/4.0/legalcode'>CC BY-NC 4.0</a>",
+      "image_id": "37142"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Lupinus_perennis_Com_GJnz9p7mMW0g.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=SR%2FccoD4Syz%2B%2FmxZWTXGFATLTyo%3D&Expires=1788859998",
+      "caption": "Compound leaf",
+      "credit": "Pauline Singleton",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc/4.0/legalcode'>CC BY-NC 4.0</a>",
+      "image_id": "37141"
+    }
+  ],
+  "taxon": "Lupinus perennis",
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "81cf8207f842d53bd40c1e1a6fafd3eb0b3ff9f72959caa52ec31422fe7e7bf9"
+  }
+}

@@ -1,0 +1,151 @@
+{
+  "status": "passed pilot review",
+  "source": "https://plants.ces.ncsu.edu/plants/erythronium-americanum/",
+  "viewed_photos": [
+    "Fritzflohrreynolds form",
+    "Andrew C form",
+    "Nicholas A Tonelli forest habit"
+  ],
+  "findings": "Two basal leaves and single nodding yellow flower with reflexed tepals; generic raceme rejected. Dedicated erythronium staged. Leaf mottling remains an appearance limitation. Current seeds 1, 4 and 7 and every panel in the 36-seed contact sheet were visually inspected. Paired basal blades and single curved scapes replace generic racemes. At 15\u201325 cm the nodding reflexed tepals reduce to yellow tip cells; leaf mottling remains absent. Physical size is retained. Accepted as a coarse stylized spring source at 25 mm; user endorsement remains separate.",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "batch_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+  ],
+  "generator_digest": "22905e6b3d93a50dfd2192a73a84b29a03c9e0cc2a0e3f8e6e68bafe582b7aa3",
+  "sheet_hash": "4cfa00bf05e73e987c4108f2086b1440174c8ba7856966e1c1660ef30c8b5c1a",
+  "reviewed_at": 1788854429.2022748,
+  "pilot_hashes": {
+    "1": "e036cb1d90722fdfad6a77cff360761bd856108149e3a4bcf2fee562f7b3c2fe",
+    "4": "9c77b4d57e395a54b13dbf05e9fbb29a8d720717939f00e4f3e747df3f74ce93",
+    "7": "8607385e112957d76dcd42a48a7a458560f7b3d81b1f2060e01e27cef22b0b1f"
+  },
+  "profile": "trout-lily",
+  "review_date": "2026-09-08",
+  "additional_sources": [],
+  "reference_catalog_photos": [
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Erythronium_american_BUwIAMx2VaoT.jpe?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=NV2anAsCckATYJxbFGD39u%2FEnP8%3D&Expires=1788856163",
+      "caption": "form",
+      "credit": "Fritzflohrreynolds",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/3.0/deed.en'>CC BY-SA 3.0</a>",
+      "image_id": "14486"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Erythronium_american_lEKCrQpLRa0N.jfif?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=Ph%2BGmuQg5WvFSZrmfO81or6BqSw%3D&Expires=1788856163",
+      "caption": "form",
+      "credit": "Andrew C",
+      "license": "<a href='http://creativecommons.org/licenses/by/2.0/legalcode'>CC BY 2.0</a>",
+      "image_id": "14478"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Erythronium_american_2YrFldxts4nt.jpe?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=FYcMoDZ2T1sLvJNlQasFEJjsmp8%3D&Expires=1788856163",
+      "caption": "flower and form in forest",
+      "credit": "Nicholas A. Tonelli",
+      "license": "<a href='http://creativecommons.org/licenses/by/2.0/legalcode'>CC BY 2.0</a>",
+      "image_id": "14483"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Erythronium_american_GwBemxRx33OX.jfif?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=vDHi889%2BD7%2BBFNUoYH4MIKBI9pM%3D&Expires=1788856163",
+      "caption": "form and flower bud",
+      "credit": "Ryan Hodnett",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/2.0/'>CC-BY-SA 2.0</a>",
+      "image_id": "14488"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/erythronium_american_Q0oLbzvtVl9i.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=O60CxbQ%2B3BWBz5W1kZqZaSIqMBg%3D&Expires=1788856163",
+      "caption": "Form",
+      "credit": "David G. Smith delawarewildflowers.org",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc/4.0/legalcode'>CC BY-NC 4.0</a>",
+      "image_id": "37979"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Erythronium_american_EHeXXdywUkKz.jpe?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=AjXm3qy9XHw%2BncWX7wDBtcS275c%3D&Expires=1788856163",
+      "caption": "flower with bumblebee",
+      "credit": "Joshua Mayer",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/2.0/'>CC-BY-SA 2.0</a>",
+      "image_id": "14480"
+    }
+  ],
+  "taxon": "Erythronium americanum",
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "4cfa00bf05e73e987c4108f2086b1440174c8ba7856966e1c1660ef30c8b5c1a"
+  }
+}

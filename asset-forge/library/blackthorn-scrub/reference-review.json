@@ -1,0 +1,340 @@
+{
+  "status": "passed pilot review",
+  "source": "https://gobotany.nativeplanttrust.org/species/prunus/spinosa/",
+  "viewed_photos": [
+    "Plant form leafy and flowering - Robert Vid_ki",
+    "Fruits - Robert Vid_ki; leaf/twig arrangement only, fruit excluded"
+  ],
+  "findings": "Compared dense leafy scrub, the early spring white flowering thicket and twig/leaf detail to the revised current size pilots 1/4/7 plus all 36 sheet entries. Increased attached terminal fork density from two to four and leaf positions from five to eight while reducing fine twig radius to 4 mm. This gives a denser, irregular thorn-scrub structure without leaf spheres; 25 mm rasterization still exaggerates the thinnest twig widths. Selected late spring leaf flush after the blossom stage, so flowers and autumn sloes are absent. Heights approximately 1.68-3.75 m. Short thorn microdetail cannot be reliably distinguished at this pitch. Accepted as a leafy spring blackthorn thicket source.",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "batch_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+  ],
+  "generator_digest": "1dac64c3826a961a3935ab8dfa3d8d2d782b0685604400df1dca99191ef66373",
+  "sheet_hash": "35b88a65b55f22f68206ac60e3de728974b191c2c23e457c04385c1127a28fce",
+  "reviewed_at": 1788846560.8754823,
+  "pilot_hashes": {
+    "1": "43542e509b7d3c3a4ab4ed9f6b7611b45b45d2eb99c95205bd32e9e647683b5a",
+    "4": "734e447e5b0b1540ba0847012c355719f5c0c012fee7c2b1f6839cb14296916d",
+    "7": "b40c8b30b1be4ada5a6eb1f54104966082140a525c52bf14f1cdc7bfb3542c62"
+  },
+  "profile": "blackthorn-scrub",
+  "review_date": "2026-09-08",
+  "additional_sources": [],
+  "reference_catalog_photos": [
+    {
+      "url": "https://newfs.s3.amazonaws.com/taxon-images-1000s1000/Rosaceae/prunus-spinosa-ha-rvid-b.jpg",
+      "caption": "Plant form: Prunus spinosa.",
+      "credit": "By Robert Vid_ki. \u00b7 Copyright \u00a9 2026 CC BY-NC 3.0.",
+      "license": "See source credit; remotely hosted",
+      "image_id": "https://newfs.s3.amazonaws.com/taxon-images-1000s1000/Rosaceae/prunus-spinosa-ha-rvid-b.jpg"
+    },
+    {
+      "url": "https://newfs.s3.amazonaws.com/taxon-images-1000s1000/Rosaceae/prunus-spinosa-ha-rvid-a.jpg",
+      "caption": "Plant form: Prunus spinosa.",
+      "credit": "By Robert Vid_ki. \u00b7 Copyright \u00a9 2026 CC BY-NC 3.0.",
+      "license": "See source credit; remotely hosted",
+      "image_id": "https://newfs.s3.amazonaws.com/taxon-images-1000s1000/Rosaceae/prunus-spinosa-ha-rvid-a.jpg"
+    },
+    {
+      "url": "https://newfs.s3.amazonaws.com/taxon-images-1000s1000/Rosaceae/prunus-spinosa-fr-rvid-b.jpg",
+      "caption": "Fruits: Prunus spinosa.",
+      "credit": "By Robert Vid_ki. \u00b7 Copyright \u00a9 2026 CC BY-NC 3.0.",
+      "license": "See source credit; remotely hosted",
+      "image_id": "https://newfs.s3.amazonaws.com/taxon-images-1000s1000/Rosaceae/prunus-spinosa-fr-rvid-b.jpg"
+    },
+    {
+      "url": "https://newfs.s3.amazonaws.com/taxon-images-1000s1000/Rosaceae/prunus-spinosa-fl-rvid.jpg",
+      "caption": "Flowers: Prunus spinosa.",
+      "credit": "By Robert Vid_ki. \u00b7 Copyright \u00a9 2026 CC BY-NC 3.0.",
+      "license": "See source credit; remotely hosted",
+      "image_id": "https://newfs.s3.amazonaws.com/taxon-images-1000s1000/Rosaceae/prunus-spinosa-fl-rvid.jpg"
+    },
+    {
+      "url": "https://newfs.s3.amazonaws.com/taxon-images-1000s1000/Rosaceae/prunus-spinosa-fr-rvid-a.jpg",
+      "caption": "Fruits: Prunus spinosa.",
+      "credit": "By Robert Vid_ki. \u00b7 Copyright \u00a9 2026 CC BY-NC 3.0.",
+      "license": "See source credit; remotely hosted",
+      "image_id": "https://newfs.s3.amazonaws.com/taxon-images-1000s1000/Rosaceae/prunus-spinosa-fr-rvid-a.jpg"
+    },
+    {
+      "url": "https://newfs.s3.amazonaws.com/taxon-images-1000s1000/Rosaceae/prunus-spinosa-ba-atrnkoczy.jpg",
+      "caption": "Bark: Prunus spinosa.",
+      "credit": "By Amadej Trnkoczy. \u00b7 Copyright \u00a9 2026 Amadej Trnkoczy.",
+      "license": "See source credit; remotely hosted",
+      "image_id": "https://newfs.s3.amazonaws.com/taxon-images-1000s1000/Rosaceae/prunus-spinosa-ba-atrnkoczy.jpg"
+    }
+  ],
+  "taxon": "Prunus spinosa",
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "35b88a65b55f22f68206ac60e3de728974b191c2c23e457c04385c1127a28fce"
+  },
+  "identity_revalidations": [
+    {
+      "previous_digest": "0a54b058b206f15d6adb682852c2e936349c7890574f8e888d2cd6c1a846a926",
+      "new_digest": "1dac64c3826a961a3935ab8dfa3d8d2d782b0685604400df1dca99191ef66373",
+      "timestamp": 1788847579.7655094,
+      "method": "Every saved VXA rebuilt to identical SHA-256; original files and all user decisions preserved",
+      "variants": [
+        {
+          "id": "blackthorn-scrub-0001",
+          "seed": 1,
+          "hash": "43542e509b7d3c3a4ab4ed9f6b7611b45b45d2eb99c95205bd32e9e647683b5a"
+        },
+        {
+          "id": "blackthorn-scrub-0002",
+          "seed": 2,
+          "hash": "5aa0a3982d04c7d934635ad28b528ee18a4fd2716dd6423973e45e0cb47626a3"
+        },
+        {
+          "id": "blackthorn-scrub-0003",
+          "seed": 3,
+          "hash": "d9f6e5f1a50aa5649e927dc3adf2d62172b3798349875cedac47842c24b25241"
+        },
+        {
+          "id": "blackthorn-scrub-0004",
+          "seed": 4,
+          "hash": "734e447e5b0b1540ba0847012c355719f5c0c012fee7c2b1f6839cb14296916d"
+        },
+        {
+          "id": "blackthorn-scrub-0005",
+          "seed": 5,
+          "hash": "b1ae42e2b54082ac3f6f8eceff821ca2f7261a8d006a21584bdee31649ab93a0"
+        },
+        {
+          "id": "blackthorn-scrub-0006",
+          "seed": 6,
+          "hash": "ab1a8cb86dfdfa2e894a8cc13bb3171f9f70543c4ab668f567d140cdcbf0dd86"
+        },
+        {
+          "id": "blackthorn-scrub-0007",
+          "seed": 7,
+          "hash": "b40c8b30b1be4ada5a6eb1f54104966082140a525c52bf14f1cdc7bfb3542c62"
+        },
+        {
+          "id": "blackthorn-scrub-0008",
+          "seed": 8,
+          "hash": "a40571311a5129e9a51ac63041da83001500e0d2a9ee2ae21d44c744c68ae22d"
+        },
+        {
+          "id": "blackthorn-scrub-0009",
+          "seed": 9,
+          "hash": "a7893a419daca5bf96c0362953994329ede5d7f976ce6e63ab30b2baf44e8e92"
+        },
+        {
+          "id": "blackthorn-scrub-0010",
+          "seed": 10,
+          "hash": "12cf2376b39201c22172096d97fb1a05d08605f40fa07798a20ffd98c508766e"
+        },
+        {
+          "id": "blackthorn-scrub-0011",
+          "seed": 11,
+          "hash": "bda76fd123f5de751be30b4bfffef47f64a2ca78e8d776d3e1c5f51a34eb7343"
+        },
+        {
+          "id": "blackthorn-scrub-0012",
+          "seed": 12,
+          "hash": "c403a2220dadbcf3ac36d1caa169367b8a1b9f6d553b04a917264449e74bb153"
+        },
+        {
+          "id": "blackthorn-scrub-0013",
+          "seed": 13,
+          "hash": "2424e8b4ee0cc1da157634067890ea8d24bf0084dc17de0209f1fc30bc60e7dd"
+        },
+        {
+          "id": "blackthorn-scrub-0014",
+          "seed": 14,
+          "hash": "f00ac8ac7e317f70c090102cdb338c7fbeac5746b2edb732506154b6a3955793"
+        },
+        {
+          "id": "blackthorn-scrub-0015",
+          "seed": 15,
+          "hash": "d1cf19fcd8b788264e8f4f0718c50479999eb229dc3e7dce89f247334c50d185"
+        },
+        {
+          "id": "blackthorn-scrub-0016",
+          "seed": 16,
+          "hash": "4065d57ce9961dcee5d24727cab36c7875e4ee2daa8afec38d5d76ad8ce2dc14"
+        },
+        {
+          "id": "blackthorn-scrub-0017",
+          "seed": 17,
+          "hash": "df3e82a265b24370d560b907d2c27f02ea02b019bef582280cbb4d57f2edd20f"
+        },
+        {
+          "id": "blackthorn-scrub-0018",
+          "seed": 18,
+          "hash": "3990552107b751fa0036dc04a00e02df20955543d14c49c9bf43ae8ef938f8d2"
+        },
+        {
+          "id": "blackthorn-scrub-0019",
+          "seed": 19,
+          "hash": "60871152126b76d819710ce0052c6a638069b9dfac0759d462f745b9794bf8cd"
+        },
+        {
+          "id": "blackthorn-scrub-0020",
+          "seed": 20,
+          "hash": "941807d914fab0f98196c29d0b947f55c3db9e84728e9488bc95a74d41483868"
+        },
+        {
+          "id": "blackthorn-scrub-0021",
+          "seed": 21,
+          "hash": "764bc50294f23f2b78609603fe41aa4cb4ee71f0ce988b8c82eed74c7dca8592"
+        },
+        {
+          "id": "blackthorn-scrub-0022",
+          "seed": 22,
+          "hash": "000252e2737988b9fba541c4dfe2cd30e2dc293eb7f6351c392436bb4ca755f3"
+        },
+        {
+          "id": "blackthorn-scrub-0023",
+          "seed": 23,
+          "hash": "22b7245f8911dff1956180303ba33edd6b7f85652e1e822821b2650e779fc291"
+        },
+        {
+          "id": "blackthorn-scrub-0024",
+          "seed": 24,
+          "hash": "b3a4b9fc71509e9cab00d0a517ec8ed7e89892705a64deea95427736fad07cd2"
+        },
+        {
+          "id": "blackthorn-scrub-0025",
+          "seed": 25,
+          "hash": "8db95a9a547ca2e7e5f2845ca0601b05200c0943dcd6d3821759463c06c71b54"
+        },
+        {
+          "id": "blackthorn-scrub-0026",
+          "seed": 26,
+          "hash": "061218f849d526e5a15df357092107b4cae10d279d7ae0a697d5f39dbc0ae449"
+        },
+        {
+          "id": "blackthorn-scrub-0027",
+          "seed": 27,
+          "hash": "e531b86f7b7b179f2e2d87c54def00b03efba3cb71a9b7bf4d95a533142c51c1"
+        },
+        {
+          "id": "blackthorn-scrub-0028",
+          "seed": 28,
+          "hash": "3c3b3c8a69a6ef7867ef2c9f7c4b16d6391b419db39f984d89737c139962266d"
+        },
+        {
+          "id": "blackthorn-scrub-0029",
+          "seed": 29,
+          "hash": "7672758d021e740017b85ac4c6021780c69db5409e637457bd9d60c9450f8103"
+        },
+        {
+          "id": "blackthorn-scrub-0030",
+          "seed": 30,
+          "hash": "42bb002102ba5e3293c6cd00dfac6289b7d3874a2289dd6947b4ed31dba4fe4e"
+        },
+        {
+          "id": "blackthorn-scrub-0031",
+          "seed": 31,
+          "hash": "6a9938c706a1138442f6158de8f442ad079316dad2b3ebd3d234ab7394df7ed7"
+        },
+        {
+          "id": "blackthorn-scrub-0032",
+          "seed": 32,
+          "hash": "94b3889611ad07a5809a2939b1ab51c39e465000950e126f13f60c756fdaba49"
+        },
+        {
+          "id": "blackthorn-scrub-0033",
+          "seed": 33,
+          "hash": "8ca31f3eb196d7b3a2b0f1d2b49ca7cdbcb189dad789b46b3e7c167badd0d208"
+        },
+        {
+          "id": "blackthorn-scrub-0034",
+          "seed": 34,
+          "hash": "b013ba66efbd535c665f5974df192a37c355590297ff388f12d93197205d6a44"
+        },
+        {
+          "id": "blackthorn-scrub-0035",
+          "seed": 35,
+          "hash": "0879717cf0d70cb996592b68471cc0931bfec21516fb0307a4c93f132212543d"
+        },
+        {
+          "id": "blackthorn-scrub-0036",
+          "seed": 36,
+          "hash": "cdf1ab6d69a7c86ea14bd4d058a7766b4132598e94a01eb83a04f5a2ba039f4c"
+        }
+      ]
+    }
+  ]
+}

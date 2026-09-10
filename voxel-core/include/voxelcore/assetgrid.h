@@ -292,6 +292,8 @@ private:
     // one cache line per column instead of straddling.
     int32_t sizeX_ = 0, sizeY_ = 0, sizeZ_ = 0;
     int32_t originX_ = 0, originY_ = 0, originZ_ = 0;
+    // Derived during material decode; no mutable voxel API exists.
+    uint64_t solidCount_ = 0;
     uint32_t voxelSizeUm_ = 0;   // 0 until a successful parse; see voxelSizeMm()
     std::vector<uint8_t> partMat_;
     std::vector<uint32_t> partLen_;

@@ -26,6 +26,17 @@ if ($null -eq $python) {
     if ($installedPython) { $python = @{ Source = $installedPython.FullName } }
 }
 if ($null -eq $python) {
+    # Use the installed desktop runtime when no standalone Python exists.
+    $desktopPython = Join-Path $env:USERPROFILE '.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe'
+    if (Test-Path -LiteralPath $desktopPython) {
+        $python = @{ Source = $desktopPython }
+        $localPackages = Join-Path (Split-Path $forgeDir -Parent) '.scratch\oak-python'
+        if (Test-Path -LiteralPath $localPackages) {
+            $env:PYTHONPATH = $localPackages + $(if ($env:PYTHONPATH) { ';' + $env:PYTHONPATH } else { '' })
+        }
+    }
+}
+if ($null -eq $python) {
     Write-Host ""
     Write-Host "Asset Forge cannot start: Python was not found on this machine's PATH." -ForegroundColor Red
     Write-Host "Fix: install Python 3.12+ from https://www.python.org/downloads/ and re-run."

@@ -35,6 +35,10 @@ public:
     }
     bool InitializeAsset(const FString& Name, int32 FinestMm, bool Collision);
     bool InitializeAssetFromVxa(FVoxelEnvironmentAssetDescriptor Descriptor,const TArray<uint8>& Vxa,bool Collision,bool FitTerrain=false);
+    // Verifies a yaw-baked source subset only; canonical composition and
+    // ownership/publication remain the caller's responsibility.
+    bool InitializeComposedAssetFromVxa(FVoxelEnvironmentAssetDescriptor Descriptor,const TArray<uint8>& SourceVxa,const TArray<uint8>& ClippedVxa,uint8 CanonicalYaw,bool Collision);
+    bool InitializePublishedTree(const FString& Species,int32 Seed,bool FitTerrain=true);
     const FVoxelEnvironmentAssetDescriptor& GetAssetDescriptor() const {return SourceDescriptor;}
     bool IsFellable() const {return SourceDescriptor.Fellable;}
     bool SolidAt(const FVector& WorldUU) const;
@@ -52,6 +56,7 @@ public:
     UPROPERTY(Transient) TArray<TObjectPtr<UMaterialInstanceDynamic>> Materials;
 private:
     FVoxelEnvironmentAssetDescriptor SourceDescriptor;
+    bool InitializeVerifiedAssetPayload(FVoxelEnvironmentAssetDescriptor Descriptor,const TArray<uint8>& Vxa,bool Collision,bool FitTerrain);
     bool RefreshGeometrySnapshot();
     FVoxelImmutableGeometry GeometrySnapshot;
     TSharedPtr<FEnvironmentStagedRestore,ESPMode::ThreadSafe> StagedRestore;

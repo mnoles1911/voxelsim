@@ -1,0 +1,307 @@
+{
+  "revision": "spring-v2",
+  "status": "staged species palette expansion; game validation pending",
+  "season": "spring",
+  "color_space": "sRGB",
+  "variation": {
+    "voxel_gain": 0.085,
+    "face_gain": 0.045,
+    "warmth": 0.025
+  },
+  "profiles": {
+    "temperate-oak": {
+      "bark": "70634F",
+      "foliage": "526F35",
+      "fresh_growth": "81954C",
+      "bark_pattern": "ridged"
+    },
+    "american-beech": {
+      "bark": "94968B",
+      "foliage": "638345",
+      "fresh_growth": "96AC67",
+      "bark_pattern": "smooth"
+    },
+    "european-beech": {
+      "bark": "8E9187",
+      "foliage": "587A3E",
+      "fresh_growth": "93AB60",
+      "bark_pattern": "smooth"
+    },
+    "sugar-maple": {
+      "bark": "797465",
+      "foliage": "587B39",
+      "fresh_growth": "90A650",
+      "bark_pattern": "plates"
+    },
+    "bigleaf-maple": {
+      "bark": "77705D",
+      "foliage": "658342",
+      "fresh_growth": "99AD60",
+      "bark_pattern": "plates"
+    },
+    "sycamore-maple": {
+      "bark": "8C8775",
+      "foliage": "5C8042",
+      "fresh_growth": "91A95D",
+      "bark_pattern": "plates"
+    },
+    "field-maple": {
+      "bark": "807963",
+      "foliage": "627F3D",
+      "fresh_growth": "93AA58",
+      "bark_pattern": "ridged"
+    },
+    "japanese-maple": {
+      "bark": "898775",
+      "foliage": "748846",
+      "fresh_growth": "A8B56C",
+      "bark_pattern": "smooth"
+    },
+    "hornbeam": {
+      "bark": "8C8F80",
+      "foliage": "5B7B3E",
+      "fresh_growth": "94AC60",
+      "bark_pattern": "ridged"
+    },
+    "small-leaved-lime": {
+      "bark": "817D69",
+      "foliage": "64863E",
+      "fresh_growth": "A0B76B",
+      "bark_pattern": "ridged"
+    },
+    "common-ash": {
+      "bark": "8B8A78",
+      "foliage": "708A49",
+      "fresh_growth": "A7B970",
+      "bark_pattern": "ridged"
+    },
+    "field-elm": {
+      "bark": "726B58",
+      "foliage": "526F39",
+      "fresh_growth": "8BA35B",
+      "bark_pattern": "ridged"
+    },
+    "wych-elm": {
+      "bark": "7B7361",
+      "foliage": "587541",
+      "fresh_growth": "92AA62",
+      "bark_pattern": "ridged"
+    },
+    "birch": {
+      "bark": "D0CDBB",
+      "foliage": "74934B",
+      "fresh_growth": "A5B865",
+      "bark_pattern": "birch"
+    },
+    "common-alder": {
+      "bark": "736D60",
+      "foliage": "496D3B",
+      "fresh_growth": "839F59",
+      "bark_pattern": "plates"
+    },
+    "eastern-cottonwood": {
+      "bark": "8A8571",
+      "foliage": "6C8D49",
+      "fresh_growth": "A4B868",
+      "bark_pattern": "ridged"
+    },
+    "quaking-aspen": {
+      "bark": "C1C4A8",
+      "foliage": "7C994F",
+      "fresh_growth": "B0BF72",
+      "bark_pattern": "smooth"
+    },
+    "white-poplar": {
+      "bark": "C6C6B2",
+      "foliage": "768F61",
+      "fresh_growth": "A8B886",
+      "bark_pattern": "smooth"
+    },
+    "weeping-willow": {
+      "bark": "797762",
+      "foliage": "809351",
+      "fresh_growth": "A8B573",
+      "bark_pattern": "ridged"
+    },
+    "black-cherry": {
+      "bark": "635B51",
+      "foliage": "52763E",
+      "fresh_growth": "8BA55C",
+      "bark_pattern": "plates"
+    },
+    "cherry-blossom": {
+      "bark": "69574F",
+      "foliage": "668342",
+      "fresh_growth": "94A55C",
+      "bark_pattern": "cherry"
+    },
+    "flowering-dogwood": {
+      "bark": "7A7162",
+      "foliage": "728B4C",
+      "fresh_growth": "A5B771",
+      "bark_pattern": "plates"
+    },
+    "hawthorn-scrub": {
+      "bark": "7D7768",
+      "foliage": "5B7C3F",
+      "fresh_growth": "98AE64",
+      "bark_pattern": "ridged"
+    },
+    "crab-apple": {
+      "bark": "807260",
+      "foliage": "668044",
+      "fresh_growth": "A0B268",
+      "bark_pattern": "plates"
+    },
+    "wild-pear": {
+      "bark": "797363",
+      "foliage": "58753E",
+      "fresh_growth": "8EA45D",
+      "bark_pattern": "plates"
+    },
+    "rowan": {
+      "bark": "999B8A",
+      "foliage": "718B4F",
+      "fresh_growth": "A6B875",
+      "bark_pattern": "smooth"
+    },
+    "shagbark-hickory": {
+      "bark": "8C8474",
+      "foliage": "72884A",
+      "fresh_growth": "A7B96E",
+      "bark_pattern": "fibrous"
+    },
+    "sweet-chestnut": {
+      "bark": "817961",
+      "foliage": "5D7E3B",
+      "fresh_growth": "97AE5C",
+      "bark_pattern": "ridged"
+    },
+    "tulip-tree": {
+      "bark": "8B8C78",
+      "foliage": "7A974E",
+      "fresh_growth": "AFC375",
+      "bark_pattern": "ridged"
+    },
+    "honey-locust": {
+      "bark": "7F7867",
+      "foliage": "79994E",
+      "fresh_growth": "B0C479",
+      "bark_pattern": "ridged"
+    },
+    "bur-oak": {
+      "bark": "807764",
+      "foliage": "617B3E",
+      "fresh_growth": "94A75A",
+      "bark_pattern": "ridged"
+    },
+    "cork-oak": {
+      "bark": "8A7B67",
+      "foliage": "536F4C",
+      "fresh_growth": "8E9D67",
+      "bark_pattern": "ridged"
+    },
+    "holm-oak": {
+      "bark": "77766A",
+      "foliage": "466449",
+      "fresh_growth": "81915E",
+      "bark_pattern": "plates"
+    },
+    "river-broadleaf": {
+      "bark": "7C7465",
+      "foliage": "537741",
+      "fresh_growth": "90A962",
+      "bark_pattern": "plates"
+    },
+    "temperate-sapling": {
+      "bark": "8A8871",
+      "foliage": "73934B",
+      "fresh_growth": "ACC172",
+      "bark_pattern": "smooth"
+    },
+    "douglas-fir": {
+      "bark": "786B58",
+      "foliage": "456E50",
+      "fresh_growth": "8DA365",
+      "bark_pattern": "ridged"
+    },
+    "eastern-hemlock": {
+      "bark": "776758",
+      "foliage": "3D664A",
+      "fresh_growth": "839E63",
+      "bark_pattern": "ridged"
+    },
+    "western-hemlock": {
+      "bark": "7C6E60",
+      "foliage": "466E53",
+      "fresh_growth": "8BA76B",
+      "bark_pattern": "ridged"
+    },
+    "western-red-cedar": {
+      "bark": "805C48",
+      "foliage": "416447",
+      "fresh_growth": "728450",
+      "bark_pattern": "fibrous"
+    },
+    "norway-spruce": {
+      "bark": "806E5E",
+      "foliage": "3E6648",
+      "fresh_growth": "86A460",
+      "bark_pattern": "plates"
+    },
+    "sitka-spruce": {
+      "bark": "877968",
+      "foliage": "567F6B",
+      "fresh_growth": "95B084",
+      "bark_pattern": "plates"
+    },
+    "scots-pine": {
+      "bark": "755740",
+      "foliage": "486D51",
+      "fresh_growth": "7F965F",
+      "bark_pattern": "pine"
+    },
+    "maritime-pine": {
+      "bark": "7B5B46",
+      "foliage": "46694D",
+      "fresh_growth": "87995D",
+      "bark_pattern": "ridged"
+    },
+    "tundra-pine": {
+      "bark": "7B624D",
+      "foliage": "506F52",
+      "fresh_growth": "8A9C65",
+      "bark_pattern": "pine"
+    },
+    "monterey-cypress": {
+      "bark": "887967",
+      "foliage": "4D7456",
+      "fresh_growth": "89A26C",
+      "bark_pattern": "fibrous"
+    },
+    "columnar-cypress": {
+      "bark": "887B68",
+      "foliage": "3E6349",
+      "fresh_growth": "7A925C",
+      "bark_pattern": "fibrous"
+    },
+    "european-yew": {
+      "bark": "89664E",
+      "foliage": "365F40",
+      "fresh_growth": "80A15B",
+      "bark_pattern": "fibrous"
+    },
+    "hero-sequoia": {
+      "bark": "977157",
+      "foliage": "487258",
+      "fresh_growth": "8AA56F",
+      "bark_pattern": "fibrous"
+    },
+    "tree-fern": {
+      "bark": "675643",
+      "foliage": "638C49",
+      "fresh_growth": "A0BA71",
+      "bark_pattern": "fibrous"
+    }
+  }
+}

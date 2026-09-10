@@ -1,0 +1,121 @@
+{
+  "status": "passed pilot review",
+  "source": "https://botany.cz/cs/Salvinia-natans/",
+  "viewed_photos": [
+    "https://botany.cz/foto/salvina1.jpg",
+    "https://botany.cz/foto/salvina2.jpg"
+  ],
+  "photo_reviewer": "Astra root actual photo review; understory agent geometry comparison",
+  "findings": "Actual8-14mm Salvinia leaves are subvoxel; reviewed colony silhouettes at25mm, not oversized leaf models. Seeds1/4/7 and36sheet show shallow connected irregular chains, with variable gaps and footprint. Small dense patches merge; individual hairs and paired leaves cannot be resolved at this pitch.",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "batch_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+  ],
+  "generator_digest": "f941527b410525d2304a660c0752205416e72f4f6aa1070ee1528df34d2ce68f",
+  "sheet_hash": "7d49a13c724379311c04270b5aa23a9ccc7b802f8154fce25a7d248a596e7a4c",
+  "reviewed_at": 1788859299.8327837,
+  "pilot_hashes": {
+    "1": "97336002647a75af72f3478d67716378e0aca11eb6dcff927e7778c56aae69ee",
+    "4": "eeb4e276042ea91fe73eb69ce2c6ddb7e40883fb09a48d2473f074f0384c508a",
+    "7": "e1f25dcf58495aefd4cfaddff08512043bcfbea21f5a3b5a96fe811b1b0c839f"
+  },
+  "profile": "water-earwort",
+  "review_date": "2026-09-08",
+  "additional_sources": [
+    "https://www.efloras.org/florataxon.aspx?flora_id=2&taxon_id=200005216"
+  ],
+  "reference_catalog_photos": [
+    {
+      "url": "https://botany.cz/foto/salvina1.jpg",
+      "caption": "Floating Salvinia chains and colony habit",
+      "credit": "BOTANY.cz / Pavol Elias jun. source page"
+    },
+    {
+      "url": "https://botany.cz/foto/salvina2.jpg",
+      "caption": "Paired oval floating fronds and finely textured surface",
+      "credit": "BOTANY.cz / Pavol Elias jun. source page"
+    }
+  ],
+  "taxon": "Salvinia natans",
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "7d49a13c724379311c04270b5aa23a9ccc7b802f8154fce25a7d248a596e7a4c"
+  }
+}

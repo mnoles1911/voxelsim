@@ -1,4 +1,5 @@
 #include "VoxelGI.h"
+#include "VoxelFrameProfiling.h"
 
 #include "VoxelChunkComponent.h"
 #include "VoxelCoords.h"
@@ -3713,6 +3714,7 @@ namespace
 
 void UVoxelGISubsystem::Tick(float DeltaSeconds)
 {
+	CSV_SCOPED_TIMING_STAT(VoxelStream, GITickMs);
 	Super::Tick(DeltaSeconds);
 
 	// --- ARM VERIFICATION, before every other guard -------------------------

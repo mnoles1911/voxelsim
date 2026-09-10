@@ -1,0 +1,151 @@
+{
+  "status": "passed pilot review",
+  "source": "https://plants.ces.ncsu.edu/plants/bellis-perennis/",
+  "viewed_photos": [
+    "Flowers in mass planting - Bernt Fransson",
+    "form - SABENCIA Guillermo C\u00e9sar Ruiz",
+    "Form - Alex Ranaldi"
+  ],
+  "findings": "Bernt Fransson,SABENCIA Guillermo Cesar Ruiz and Alex Ranaldi actual photos: low spoon-leaf rosettes and bare scapes, white ray florets/yellow centers. Pink garden forms excluded. Current seeds1,4,7 and all36contact-sheet panels visually inspected. Low10\u201320cm spoon-leaf rosettes with bare scapes, white rays and yellow centers. Heads can touch in compact seeds but dimensions remain botanical scale. Accepted as coarse stylized spring source; user endorsement remains separate.",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "batch_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+  ],
+  "generator_digest": "a9b7164153474a5f6179d00164984abead4ece5132a9d2a6bc348b3cb73bdbe7",
+  "sheet_hash": "4adc761a93790c310af1735fdaefc8b4b69c8b00c45b82037cb32966b23e851f",
+  "reviewed_at": 1788858046.0025227,
+  "pilot_hashes": {
+    "1": "58e82ddf150a3599dbbea9496e7e45046889fdd639b442f1d8cbdddb137544b6",
+    "4": "5a464e4ec086f759ec23b95c0fe61c440261662d615507f627fea925822c89c6",
+    "7": "502cb216265793e674b90a2a4b79cb1b819c8f0fbbb5ed129aa71236cd6518c0"
+  },
+  "profile": "meadow-daisy",
+  "review_date": "2026-09-08",
+  "additional_sources": [],
+  "reference_catalog_photos": [
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Bellis_perennis_form_YIU6TIOwwsu1.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=sJCULnkdzzlt9CLpb1M%2Fl8GYkFA%3D&Expires=1788859629",
+      "caption": "Flowers in mass planting",
+      "credit": "Bernt Fransson",
+      "license": "<a href='http://creativecommons.org/licenses/by-sa/4.0/legalcode'>CC BY-SA 4.0</a>",
+      "image_id": "13525"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Bellis_perennis_form_mE5YHin3PKIm.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=RZq7%2BWJ2V4dmfuYslDN%2B85xzkX8%3D&Expires=1788859629",
+      "caption": "form",
+      "credit": "SABENCIA Guillermo C\u00e9sar Ruiz",
+      "license": "<a href='http://creativecommons.org/licenses/by-sa/4.0/legalcode'>CC BY-SA 4.0</a>",
+      "image_id": "13526"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Bellis_perennis_form_46wjKuglVKo0.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=2cnMt7D86FBWuOdSy3EJy7wSLHI%3D&Expires=1788859629",
+      "caption": "Form",
+      "credit": "Alex Ranaldi",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/2.0/'>CC-BY-SA 2.0</a>",
+      "image_id": "15436"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Bellis_perennis_flow_FEOqqHhnE8N5.jfif?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=g73a3xsApzfwqxSsalm5OSEH0M0%3D&Expires=1788859629",
+      "caption": "flowers and leaves in mass planting",
+      "credit": "Gunnar Creutz",
+      "license": "<a href='http://creativecommons.org/licenses/by-sa/4.0/legalcode'>CC BY-SA 4.0</a>",
+      "image_id": "15438"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Bellis_perennis_pink_WgipRxNShWX2.apng?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=lu6DmdJBf36pIASLOfOTkYSKRT4%3D&Expires=1788859629",
+      "caption": "Leaves and pink and red flowers",
+      "credit": "Morgaine",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/2.0/'>CC-BY-SA 2.0</a>",
+      "image_id": "15435"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Bellis_perennis--Jason_Baker--CC_BY_2.0.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=0vvHDNi%2Fj7%2FSaoiL%2BmB4OrzKbl0%3D&Expires=1788859629",
+      "caption": "Red and white flowers",
+      "credit": "Jason Baker",
+      "license": "<a href='http://creativecommons.org/licenses/by/2.0/legalcode'>CC BY 2.0</a>",
+      "image_id": "7685"
+    }
+  ],
+  "taxon": "Bellis perennis",
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "4adc761a93790c310af1735fdaefc8b4b69c8b00c45b82037cb32966b23e851f"
+  }
+}

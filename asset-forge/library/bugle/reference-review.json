@@ -1,0 +1,151 @@
+{
+  "status": "passed pilot review",
+  "source": "https://plants.ces.ncsu.edu/plants/ajuga-reptans/",
+  "viewed_photos": [
+    "Cathy DeWitt Codial Canary April; cultivar color excluded",
+    "Jim Lawrence Ajuga flowering spikes",
+    "Chris Alberti basal rosette"
+  ],
+  "findings": "Low runner-linked green rosettes with short opposite-bracted flower whorls, not one oversized terminal blue flower. Dedicated ajuga staged; cultivar yellow foliage excluded. Current seeds 1, 4 and 7 and every panel in the 36-seed contact sheet were visually inspected. Green runner rosettes support short opposite-bracted violet flowering stems. The 15\u201330 cm forms vary spread and height. Adjacent tiny whorls merge into violet columns at 25 mm; individual corolla detail is not resolved. Yellow-leaved cultivar color was explicitly excluded. Accepted as a coarse stylized spring source at 25 mm; user endorsement remains separate.",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "batch_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+  ],
+  "generator_digest": "b41ce44075d4b8568fd55be7a1f58fa436ed0a172ff9ca1b1b9d0e52d9a54f79",
+  "sheet_hash": "1adcc7100ead71dcf5ca5bb127af823b6d0faa326affd75b1f7d55610cde4367",
+  "reviewed_at": 1788854429.572986,
+  "pilot_hashes": {
+    "1": "ff7d195cc8c1d76aa18c8745705c54047602b4185fc29cf9df86980fde77b7f5",
+    "4": "62a137982019c9034cacdbff867ea47bc7523e2f27fb8f1407ad4226daa3747b",
+    "7": "96037b5b1a6868a6201493f6bf0b6df72b38acfa28ad41b53f37891548ce13a8"
+  },
+  "profile": "bugle",
+  "review_date": "2026-09-08",
+  "additional_sources": [],
+  "reference_catalog_photos": [
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Ajuga-cordial-canary_3tUWI0HLBdAj.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=dEKWR018jvTUfccQMAgsc%2F9cQPE%3D&Expires=1788856163",
+      "caption": "Ajuga Codial Canary dense form April Wake",
+      "credit": "Cathy DeWitt",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc/4.0/legalcode'>CC BY-NC 4.0</a>",
+      "image_id": "41463"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Ajuga_reptans_wide_J_8Zcs3rirHuMH.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=RKyyQUhG2jdjBbgiYWhfPg5xOXk%3D&Expires=1788856163",
+      "caption": "Ajuga reptans",
+      "credit": "Jim Lawrence",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc-nd/4.0/legalcode'>CC BY-NC-ND 4.0</a>",
+      "image_id": "12343"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Ajuga_-_Lawn_Alternative_-_Chris_Alberti_10814320703_m.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=7Bt0ifFVQwysRj8LjO1SORk6eyg%3D&Expires=1788856163",
+      "caption": "Ajuga reptans",
+      "credit": "Chris Alberti",
+      "license": "<a href='http://creativecommons.org/licenses/by/4.0/legalcode'>CC BY 4.0</a>",
+      "image_id": "5236"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Ajuga_reptans_Ken_Slade_1.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=noat4O4tClPcCnyiBv5yX1nCQXI%3D&Expires=1788856163",
+      "caption": "Snowberry clear-wing moth visiting an Ajuga reptans flower.",
+      "credit": "Ken Slade",
+      "license": "<a href='http://creativecommons.org/licenses/by-nd/2.0/'>CC BY-ND 2.0</a>",
+      "image_id": "5238"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Ajuga_reptans_flowersPaul_Appletoncc_bync_20_12749069934_m.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=u7k2OjanYhsN6S0fA0LjwQMSxSs%3D&Expires=1788856163",
+      "caption": "Ajuga reptans",
+      "credit": "Paul Appelton",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc-sa/2.0/legalcode'>CC BY-NC-SA 2.0</a>",
+      "image_id": "5241"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Ajuga_reptans_flfm1__LBFGIcKXIEw4.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=wC9rdBXOAHtyxoYxLvun%2FaPtEqA%3D&Expires=1788856163",
+      "caption": "Ajuga reptans",
+      "credit": "Jim Robbins",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc-nd/4.0/legalcode'>CC BY-NC-ND 4.0</a>",
+      "image_id": "20639"
+    }
+  ],
+  "taxon": "Ajuga reptans",
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "1adcc7100ead71dcf5ca5bb127af823b6d0faa326affd75b1f7d55610cde4367"
+  }
+}

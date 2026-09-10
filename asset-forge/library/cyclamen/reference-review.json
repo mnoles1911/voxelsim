@@ -1,0 +1,151 @@
+{
+  "status": "passed pilot review",
+  "source": "https://plants.ces.ncsu.edu/plants/cyclamen-hederifolium/",
+  "viewed_photos": [
+    "Form - hamon jp",
+    "Form - March - Wake Co., NC - Cathy DeWitt",
+    "Form - Nov. 3 - Wake Co., NC - Cathy DeWitt"
+  ],
+  "findings": "hamon jp flowering form,Cathy DeWitt March foliage and November flowers viewed. Spring choice follows March leaf-only specimen, ivy-shaped petioled leaves; no tall bare flower stems. Leaf silver pattern unresolved. Current seeds1,4,7 and all36contact-sheet panels visually inspected. Spring7\u201315cm petioled ivy-like foliage replaces bare upright flower placeholders. March foliage photograph is the seasonal authority; silver pattern unresolved. Accepted as coarse stylized spring source; user endorsement remains separate.",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "batch_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+  ],
+  "generator_digest": "9f8bf5ed5a9659bb0343c8942aef09129af5c36d8b4a13b3c38f7dcda1f251ee",
+  "sheet_hash": "35be3f1f3ead05e078fbc65808a894078017a60b89876bff9131d8212a1d8b5f",
+  "reviewed_at": 1788858046.1160717,
+  "pilot_hashes": {
+    "1": "f12809ffe476eb8b6e2b23c9d69e6702168d6ce100558023c9ab6c9fcc1dfc3b",
+    "4": "6aeb56de39eaf656acb42f3dba416ae447bb773b274116431549855f9a13a381",
+    "7": "46d96f6bbb5cbe86cafcc91e1890c1e27ef91a8f21629445ac030d2854b99467"
+  },
+  "profile": "cyclamen",
+  "review_date": "2026-09-08",
+  "additional_sources": [],
+  "reference_catalog_photos": [
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Cyclamen_Hederifoliu_O7ylvZj8LAyt.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=2x0aH1oXRuhe9%2F8w0TUETvBELxQ%3D&Expires=1788859668",
+      "caption": "Form",
+      "credit": "hamon jp",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/3.0/deed.en'>CC BY-SA 3.0</a>",
+      "image_id": "19589"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Cyclamen-hederifoliu_W5Wsb5OBJoqu.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=wklaFnlGHBnwueT40GWL5iNUi6U%3D&Expires=1788859668",
+      "caption": "Form - March - Wake Co., NC",
+      "credit": "Cathy DeWitt",
+      "license": "<a href='http://creativecommons.org/licenses/by/4.0/legalcode'>CC BY 4.0</a>",
+      "image_id": "34868"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Copy_v1QUAPCJvnHr.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=AI2fOCGQO2YYYBsbCC7DHI7cfQc%3D&Expires=1788859668",
+      "caption": "Form - Nov. 3 - Wake Co., NC",
+      "credit": "Cathy DeWitt",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc-nd/4.0/legalcode'>CC BY-NC-ND 4.0</a>",
+      "image_id": "35639"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Cyclamen_hederifoliu_ElfCbbv8H165.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=P2sq2izXDu08qa2gDQxm7pe131o%3D&Expires=1788859668",
+      "caption": "Flowers",
+      "credit": "Dominicus Johannes Bergsma",
+      "license": "<a href='http://creativecommons.org/licenses/by-sa/4.0/legalcode'>CC BY-SA 4.0</a>",
+      "image_id": "19588"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Cyclamen_hederifoliu_DXKEszbhPKZg.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=5V4p6sc%2FiKkwkPiS%2FoHXLnfJpEg%3D&Expires=1788859668",
+      "caption": "Leaves",
+      "credit": "peganum",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/2.0/'>CC-BY-SA 2.0</a>",
+      "image_id": "19590"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Cyclamen_hederifoliu_yf5sdqHigddF.jpe?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=PobiSWmrqWpscf%2FivSSbrSROEg4%3D&Expires=1788859668",
+      "caption": "Back of Flower (Warren County, NC)",
+      "credit": "Cathy Dewitt",
+      "license": "<a href='http://creativecommons.org/licenses/by/4.0/legalcode'>CC BY 4.0</a>",
+      "image_id": "26587"
+    }
+  ],
+  "taxon": "Cyclamen hederifolium",
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "35be3f1f3ead05e078fbc65808a894078017a60b89876bff9131d8212a1d8b5f"
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "revision": "temperate-ecology-authoring-v1",
+  "species": "common-ash",
+  "kind": "tree",
+  "habitat_role": "canopy",
+  "community_weights_per_mille": {
+    "oak-beech": 1000,
+    "maple-beech": 0,
+    "coastal-conifer": 0,
+    "pine-birch": 0,
+    "riparian": 1000,
+    "warm-dry": 0,
+    "east-asian": 0,
+    "wet-mild": 0
+  },
+  "trunk_exclusion_mm": 876,
+  "crown_opacity_per_mille": 574,
+  "reference_review": "reference-review.json",
+  "status": "authored_initial_placement_targets_pending_world_visual_review",
+  "notes": [
+    "Preferences do not bypass existing habitat gates.",
+    "Community memberships are game assemblages; regional botanical refinements remain tunable.",
+    "Variant bounds and publication authority come from the inventory, not this trait record."
+  ]
+}

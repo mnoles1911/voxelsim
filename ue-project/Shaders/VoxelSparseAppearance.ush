@@ -1,0 +1,79 @@
+// Sparse appearance lookup only; no occupancy, shading or ownership mutation.
+// Page layout: voxelcore/assetappearancepack.h. Source: VoxelSparseAppearance.h.
+bool VoxelAppearanceLookupPage(StructuredBuffer<uint> P,uint Base,uint Length,uint3 Cell,
+    out uint Resource,out int3 SourceCell,out uint Yaw,out int3 WorldOffset)
+{
+    Resource=0u;SourceCell=0;Yaw=0u;WorldOffset=0;uint Total,Stride;P.GetDimensions(Total,Stride);
+    if(Base>Total||Length>Total-Base||Length<80u||any(Cell>=32u))return false; // lint-shader-ub: allow UNSIGNED_UNDERFLOW - Base greater than Total independently refuses; subtraction cannot authorize an invalid range
+    uint Version=P[Base],Level=P[Base+5u];
+    if((Version!=1u&&Version!=2u&&Version!=3u)||P[Base+1u]!=Length)return false;
+    if(Version!=3u&&P[Base+15u]!=0u)return false;
+    if(Version==1u?Level!=0u:(Level==0u||Level>7u))return false;
+    uint Scale=1u<<(Level&7u),Half=Level==0u?0u:Scale/2u; // lint-shader-ub: allow VARIABLE_SHIFT - Level is masked to zero through seven
+    uint Instances=P[Base+6u],Cells=P[Base+7u],Bricks=P[Base+12u];
+    if(Instances==0u||Instances>4096u||Cells==0u||Cells>32768u||Bricks>64u||Bricks==0u)return false;
+    uint Mask=80u,Inst=Mask+17u*Bricks,Handles=Inst+8u*Instances;
+    uint Offsets=Handles+(Cells+1u)/2u;
+    if(P[Base+8u]!=16u||P[Base+9u]!=Mask||P[Base+10u]!=Inst||P[Base+11u]!=Handles)return false;
+    if(Version==3u?(P[Base+15u]!=Offsets||Offsets+Cells!=Length||Length>98304u):(Offsets!=Length||Length>65536u))return false;
+    if((P[Base+13u]|P[Base+14u])==0u)return false;
+    uint Brick=((Cell.x>>3u)+4u*(Cell.y>>3u))*4u+(Cell.z>>3u),Block=P[Base+16u+Brick];
+    if(Block==0u||Block>Bricks)return false;
+    uint M=Base+Mask+(Block-1u)*17u,Bit=(Cell.x&7u)+8u*(Cell.y&7u)+64u*(Cell.z&7u),Word=Bit>>5u,Shift=Bit&31u; // lint-shader-ub: allow UNSIGNED_UNDERFLOW - Block is checked in the inclusive range one through Bricks
+    if((P[M+1u+Word]&(1u<<Shift))==0u)return false; // lint-shader-ub: allow VARIABLE_SHIFT - Shift is explicitly masked with31 and lies in zero through thirty one
+    uint Rank=0u;for(uint I=0u;I<Word;++I)Rank+=countbits(P[M+1u+I]);
+    // lint-shader-ub: allow UNSIGNED_UNDERFLOW - One shifted by zero through thirty one is nonzero, so subtracting one cannot underflow
+    Rank+=countbits(P[M+1u+Word]&((1u<<Shift)-1u)); // lint-shader-ub: allow VARIABLE_SHIFT - Shift is explicitly masked with31 and lies in zero through thirty one
+    uint First=P[M];if(First>=Cells||Rank>=Cells-First)return false;uint At=First+Rank; // lint-shader-ub: allow UNSIGNED_UNDERFLOW - First at or above Cells independently refuses before any indexed record access
+    uint Handle=(P[Base+Handles+(At>>1u)]>>((At&1u)*16u))&65535u; // lint-shader-ub: allow VARIABLE_SHIFT - The low bit times sixteen gives only shift zero or sixteen
+    if(Handle==0u||Handle>Instances)return false;
+    uint D=Base+Inst+(Handle-1u)*8u;Resource=P[D];Yaw=P[D+4u]; // lint-shader-ub: allow UNSIGNED_UNDERFLOW - Handle is checked in the inclusive range one through Instances
+    if(Resource==0u||Yaw>3u||(P[D+5u]|P[D+6u]|P[D+7u])!=0u)return false;
+    if(Version==3u){
+        uint O=P[Base+Offsets+At];if((O>>24u)!=0u)return false;
+        int3 B=int3(O&255u,(O>>8u)&255u,(O>>16u)&255u);
+        WorldOffset=int3(B.x>=128?B.x-256:B.x,B.y>=128?B.y-256:B.y,B.z>=128?B.z-256:B.z);
+        if(any(WorldOffset < -int(Half))||any(WorldOffset >= int(Scale)-int(Half)))return false; // lint-shader-ub: allow UNSIGNED_UNDERFLOW - explicit signed casts; Scale is at least Half
+    }
+    int64_t X=int64_t(Cell.x)*Scale+Half+WorldOffset.x-int64_t(asint(P[D+1u])),Y=int64_t(Cell.y)*Scale+Half+WorldOffset.y-int64_t(asint(P[D+2u])),Z=int64_t(Cell.z)*Scale+Half+WorldOffset.z-int64_t(asint(P[D+3u]));
+    int64_t SX=X,SY=Y;
+    if(Yaw==1u){SX=Y;SY=-X;}else if(Yaw==2u){SX=-X;SY=-Y;}else if(Yaw==3u){SX=-Y;SY=X;}
+    if(SX < -2147483647 || SX>2147483647 || SY < -2147483647 || SY>2147483647 || Z < -2147483647 || Z>2147483647)return false;
+    SourceCell=int3(int(SX),int(SY),int(Z));return true;
+}
+// Legacy callers need only the selected source identity.
+bool VoxelAppearanceLookupPage(StructuredBuffer<uint> P,uint Base,uint Length,uint3 Cell,
+    out uint Resource,out int3 SourceCell,out uint Yaw)
+{
+    int3 WorldOffset;return VoxelAppearanceLookupPage(P,Base,Length,Cell,Resource,SourceCell,Yaw,WorldOffset);
+}
+bool VoxelAppearanceLookupSource(StructuredBuffer<uint> S,uint Base,uint Length,int3 SourceCell,uint Material,
+    out uint Packed,out uint3 ZeroCell,out uint Needle)
+{
+    Packed=0u;ZeroCell=0u;Needle=0u;uint Total,Stride;S.GetDimensions(Total,Stride);
+    if(Base>Total||Length>Total-Base||Length<20u)return false; // lint-shader-ub: allow UNSIGNED_UNDERFLOW - Base greater than Total independently refuses; subtraction cannot authorize an invalid range
+    if((S[Base]!=1u&&S[Base]!=2u)||S[Base+1u]!=Length||(S[Base]==1u?S[Base+15u]!=0u:S[Base+15u]>1u)||S[Base+14u]>1u)return false;
+    uint N=S[Base+2u],B=S[Base+3u];if(N==0u||B==0u||B>(Length-20u)/20u)return false; // lint-shader-ub: allow UNSIGNED_UNDERFLOW - Length is already checked at least twenty words
+    uint Records=20u+20u*B;if(N!=Length-Records||S[Base+4u]!=20u||S[Base+5u]!=20u+4u*B||S[Base+6u]!=Records)return false; // lint-shader-ub: allow UNSIGNED_UNDERFLOW - Bricks bound proves twenty plus twenty times Bricks is at most Length
+    uint Pitch=S[Base+13u];
+    if(S[Base]==1u?(Pitch!=25u&&Pitch!=50u&&Pitch!=100u):(Pitch==0u||Pitch>1000000u))return false;
+    uint3 Size=uint3(S[Base+7u],S[Base+8u],S[Base+9u]);if(any(Size==0u)||any(Size>65535u))return false;
+    int3 Origin=int3(asint(S[Base+10u]),asint(S[Base+11u]),asint(S[Base+12u]));
+    int64_t X=int64_t(SourceCell.x)-Origin.x,Y=int64_t(SourceCell.y)-Origin.y,Z=int64_t(SourceCell.z)-Origin.z;
+    if(X<0||Y<0||Z<0||X>=Size.x||Y>=Size.y||Z>=Size.z)return false;
+    ZeroCell=uint3(uint(X),uint(Y),uint(Z));uint3 Key=ZeroCell>>3u;
+    uint Lo=0u,Hi=B;
+    while(Lo<Hi){uint Mid=Lo+(Hi-Lo)/2u,D=Base+20u+4u*Mid;uint3 K=uint3(S[D],S[D+1u],S[D+2u]); // lint-shader-ub: allow UNSIGNED_UNDERFLOW - The binary search loop condition guarantees Lo is less than Hi
+        bool Less=K.x<Key.x||(K.x==Key.x&&(K.y<Key.y||(K.y==Key.y&&K.z<Key.z)));
+        if(Less)Lo=Mid+1u;else Hi=Mid;
+    }
+    if(Lo>=B)return false;uint D=Base+20u+4u*Lo;
+    if(any(uint3(S[D],S[D+1u],S[D+2u])!=Key))return false;
+    uint Bit=(ZeroCell.x&7u)+8u*(ZeroCell.y&7u)+64u*(ZeroCell.z&7u),Word=Bit>>5u,Shift=Bit&31u,M=Base+20u+4u*B+16u*Lo;
+    if((S[M+Word]&(1u<<Shift))==0u)return false; // lint-shader-ub: allow VARIABLE_SHIFT - Shift is explicitly masked with31 and lies in zero through thirty one
+    // lint-shader-ub: allow UNSIGNED_UNDERFLOW - One shifted by zero through thirty one is nonzero, so subtracting one cannot underflow
+    uint Rank=0u;for(uint I=0u;I<Word;++I)Rank+=countbits(S[M+I]);Rank+=countbits(S[M+Word]&((1u<<Shift)-1u)); // lint-shader-ub: allow VARIABLE_SHIFT - Shift is explicitly masked with31 and lies in zero through thirty one
+    uint First=S[D+3u];if(First>=N||Rank>=N-First)return false; // lint-shader-ub: allow UNSIGNED_UNDERFLOW - First at or above N independently refuses before any indexed record access
+    Packed=S[Base+Records+First+Rank];if((Packed&255u)!=Material)return false;
+    Needle=S[Base+14u];return true;
+}

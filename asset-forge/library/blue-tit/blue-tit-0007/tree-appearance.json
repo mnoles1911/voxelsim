@@ -1,0 +1,16 @@
+{
+  "revision": "temperate-spring-variation-v1",
+  "geometry_sha256": "ec05482b664cebf1b8c491e4c3675e200ec1207514f2c7b5e5bfed72c1787181",
+  "preview_sha256": "fc0c6fdcec0a068c855ee61ebbd40389f8f3c45e89091f59ea96b9afbccb04c5",
+  "policy_sha256": "92a27b4ebfc22cc2b282d4f58e097aadee370a641e732198d561b36f11992a4a",
+  "needle": false,
+  "foliage_mask": false,
+  "voxel_mm": 12.5,
+  "palette": "canonical material RGB preserved",
+  "color_variation": {
+    "voxel_gain": 0.085,
+    "face_gain": 0.045,
+    "warmth": 0.025
+  },
+  "season": "spring"
+}

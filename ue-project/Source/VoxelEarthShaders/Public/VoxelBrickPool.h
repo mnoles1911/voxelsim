@@ -84,6 +84,8 @@
 // bitten by -- a check reporting success while the thing under test was never
 // checked.
 #include "CoreMinimal.h"
+#include "VoxelTerrainAppearanceUpload.h"
+class FVoxelTerrainAppearanceGpuState;
 #include "RHIResources.h"     // FBufferRHIRef, held by value in FVoxelBrickPoolBuffers
 #include "RenderGraphFwd.h"   // FRDGBufferRef / FRDGBufferSRVRef, for the marcher seam
 #include "Templates/Function.h"   // TFunction, for FVoxelBrickIndexSink
@@ -294,6 +296,10 @@ using FVoxelBrickCpuPackRef = TSharedPtr<FVoxelBrickCpuPack, ESPMode::ThreadSafe
 // header names no type from it. Including it would push the shader parameter
 // machinery into every consumer of the pool, most of which never bind anything.
 #define VOXEL_BRICK_POOL_PARAMETERS() \
+	SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, VoxelAppearancePages) \
+	SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, VoxelAppearanceSources) \
+	SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint2>, VoxelAppearanceRanges) \
+	SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint4>, VoxelAppearanceSlots) \
 	SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint2>, VoxelBrickDesc) \
 	SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>,  VoxelBrickOcc) \
 	SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>,  VoxelBrickMat) \
@@ -405,6 +411,7 @@ struct FVoxelBrickPoolAllocLayout
 // that owns the buffers it writes.
 struct VOXELEARTHSHADERS_API FVoxelBrickPoolBuffers
 {
+	TSharedPtr<FVoxelTerrainAppearanceGpuState,ESPMode::ThreadSafe> Appearance;
 	FVoxelBrickPoolBuffers();
 	~FVoxelBrickPoolBuffers();
 
@@ -624,7 +631,8 @@ public:
 	// command per chunk at streaming rates is the cost this whole wave exists to
 	// remove.
 	int32 AddChunkFromGpu(const FVoxelGpuBrickPayloadRef& Payload, const FVoxelBrickChunkKey& Key,
-	                      const FVoxelBrickChunkShading& Shading);
+	                      const FVoxelBrickChunkShading& Shading,
+                          TSharedPtr<const FVoxelTerrainAppearanceUpload,ESPMode::ThreadSafe> Appearance=nullptr);
 
 	// The same, for a chunk vxc::packChunkBricksCanonical packed on a worker or
 	// on the game thread. GAME THREAD ONLY, identical contract to the above:
@@ -639,7 +647,8 @@ public:
 	// 32 B record are folded in CPU-side there, arithmetic-for-arithmetic with
 	// BrickDescPoolWriteMain and BrickChunkRecordMain.
 	int32 AddChunkFromCpu(const FVoxelBrickCpuPackRef& Pack, const FVoxelBrickChunkKey& Key,
-	                      const FVoxelBrickChunkShading& Shading);
+	                      const FVoxelBrickChunkShading& Shading,
+                          TSharedPtr<const FVoxelTerrainAppearanceUpload,ESPMode::ThreadSafe> Appearance=nullptr);
 
 	// ---- PHASE 6: the level ground cover is keyed at -------------------------
 	//
@@ -705,6 +714,7 @@ public:
 		}
 	};
 	FRDGRefs Register(FRDGBuilder& GraphBuilder);
+    bool CreateAppearanceSRVs(FRDGBuilder&,FRDGBufferSRVRef&,FRDGBufferSRVRef&,FRDGBufferSRVRef&,FRDGBufferSRVRef&);
 
 	// Fills a VOXEL_BRICK_POOL_PARAMETERS() block. RENDER THREAD ONLY.
 	//
@@ -728,6 +738,7 @@ public:
 		{
 			return false;
 		}
+    if(!CreateAppearanceSRVs(GraphBuilder,Parameters.VoxelAppearancePages,Parameters.VoxelAppearanceSources,Parameters.VoxelAppearanceRanges,Parameters.VoxelAppearanceSlots))return false;
 		Parameters.VoxelBrickDesc = DescSRV;
 		Parameters.VoxelBrickOcc = OccSRV;
 		Parameters.VoxelBrickMat = MatSRV;
@@ -993,7 +1004,8 @@ public:
 	// verify can check the landed record against what the CPU BELIEVED, rather
 	// than re-deriving it (derived, not verified, is the failure family).
 	bool AllocateGpuChunkShell(const FVoxelBrickChunkKey& Key, const FIntVector& OriginVoxel,
-	                           FResidentChunk& OutChunk);
+	                           FResidentChunk& OutChunk,
+                               TSharedPtr<const FVoxelTerrainAppearanceUpload,ESPMode::ThreadSafe> Appearance=nullptr);
 
 	// Undo of the above for a job that failed after its shell was taken
 	// (rejected, timed out, cancelled, or its graph refused the brick region).
@@ -1233,6 +1245,7 @@ public:
 	// expensive mistake available on this path (format section 6b).
 	struct FResidentChunk
 	{
+        TSharedPtr<const FVoxelTerrainAppearanceUpload,ESPMode::ThreadSafe> Appearance;
 		FVoxelBrickChunkKey Key;
 		uint32 ChunkSlot = 0;
 		uint32 BrickBase = 0;   // descriptor slots
@@ -1299,6 +1312,7 @@ private:
 
 	struct FPendingWrite
 	{
+        TSharedPtr<const FVoxelTerrainAppearanceUpload,ESPMode::ThreadSafe> Appearance;
 		// EXACTLY ONE of these is set. Payload means the bytes are already in
 		// GPU memory and Flush copies them with the four brick passes; CpuPack
 		// means they are in system memory and Flush uploads them directly.
@@ -1492,6 +1506,7 @@ private:
 	// classic FPendingWrite path stays for the UNARMED pool only.
 	struct FPendingGpuCpuWrite
 	{
+        TSharedPtr<const FVoxelTerrainAppearanceUpload,ESPMode::ThreadSafe> Appearance;
 		FVoxelBrickCpuPackRef Pack;
 		FVoxelBrickChunkKey Key;
 		uint32 ChunkSlot = 0;

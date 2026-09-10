@@ -1,0 +1,151 @@
+{
+  "status": "passed pilot review",
+  "source": "https://plants.ces.ncsu.edu/plants/convallaria-majalis/",
+  "viewed_photos": [
+    "Mass planting - Evelyn Simak",
+    "Mid-April form - Cathy DeWitt",
+    "White bells - H Zell"
+  ],
+  "findings": "Paired upright broad leaves and separate arched pendent racemes replace the generic rosette. Correct 15-30 cm habit. Bells merge into white cells at 25 mm; rims are unresolved. Actually compared reference photographs, current seeds 1, 4, 7 and all 36 seeded variants. Accepted as coarse colony-scale spring geometry, not close-up botanical microdetail. Variant endorsement remains a user decision.",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "batch_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+  ],
+  "generator_digest": "ce50d741cf24c553235ec383f1223c50a3ab03dcc0182121e090c02ca1a99308",
+  "sheet_hash": "2f1aea8cf8fba3119f78455c7dec2c80fdeb6c3dbea82b579f4f8751ff89b14a",
+  "reviewed_at": 1788850127.090097,
+  "pilot_hashes": {
+    "1": "b72c1faaa3d02460e17b1bc434546d902210989401a3c8ec9fbf6ccd76bacc3c",
+    "4": "fb0748a9d34ec57f2e9ef84e457ff9585036b67632286fc126be818b0c899b84",
+    "7": "50a8a5e73ec96d5c505dbb02504d009d86333a63fc961ca3ef527431f69b4952"
+  },
+  "profile": "lily-of-the-valley",
+  "review_date": "2026-09-08",
+  "additional_sources": [],
+  "reference_catalog_photos": [
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Convallaria_majalis__50LxtOdeEgKL.jfif?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=PAvC%2FnUdhkWwvW6EoghmKo05lWE%3D&Expires=1788850880",
+      "caption": "Mass planting along a foundation.",
+      "credit": "Evelyn Simak",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/2.0/'>CC-BY-SA 2.0</a>",
+      "image_id": "12652"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Convallaria-majalis-_49E2jzfRcguq.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=LipNvtoIwKBRCdf2%2BvdT1LJEgbw%3D&Expires=1788850880",
+      "caption": "Form - Mid-April - Wake Co., NC",
+      "credit": "Cathy DeWitt",
+      "license": "<a href='http://creativecommons.org/licenses/by/4.0/legalcode'>CC BY 4.0</a>",
+      "image_id": "34645"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Convallaria_majalis__rssHShKjFDTo.jfif?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=78cvwqykWyhcBZRKQCeSN3q9cJg%3D&Expires=1788850880",
+      "caption": "White bell-shaped flowers",
+      "credit": "H Zell",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/3.0/deed.en'>CC BY-SA 3.0</a>",
+      "image_id": "12659"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Convallaria_majalis__DEsSF03a2ec4.jfif?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=VQetO8OieLj0oHVdI00qyy2r72U%3D&Expires=1788850880",
+      "caption": "leaves and flowers",
+      "credit": "Ryan Hodnett",
+      "license": "<a href='http://creativecommons.org/licenses/by-sa/4.0/legalcode'>CC BY-SA 4.0</a>",
+      "image_id": "12656"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/convallaria_majalis__5TxZHpQ2dRSd.jpe?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=vBan%2BHFOuz0n%2FOxwLL%2FOzWpR3QE%3D&Expires=1788850880",
+      "caption": "Flowers and leaves in spring in Moore County",
+      "credit": "Susan Strine",
+      "license": "<a href='http://creativecommons.org/licenses/by/2.0/legalcode'>CC BY 2.0</a>",
+      "image_id": "22423"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Convallaria_majalis__NgwcvFRALwDk.jfif?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=3CYLX7USZpgYVE2QsSx8N6V4VSs%3D&Expires=1788850880",
+      "caption": "Leaves",
+      "credit": "Andreas Rockstein",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/2.0/'>CC-BY-SA 2.0</a>",
+      "image_id": "12653"
+    }
+  ],
+  "taxon": "Convallaria majalis",
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "2f1aea8cf8fba3119f78455c7dec2c80fdeb6c3dbea82b579f4f8751ff89b14a"
+  }
+}

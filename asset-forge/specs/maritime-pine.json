@@ -1,4 +1,39 @@
 {
+  "artifact": {
+    "asym_vox": 0.8,
+    "beam_m": 0.85,
+    "bilge": 2.6,
+    "billow_m": 0.16,
+    "crossbar_at": 0.42,
+    "deck_frac": 0.07,
+    "depth_m": 0.35,
+    "droop_m": 0.3,
+    "entry": 0.62,
+    "form": "hull",
+    "frame_at": 0.34,
+    "frame_base_m": 0.95,
+    "frame_drop_m": 1.15,
+    "frame_r_m": 0.03,
+    "fullness": 2.4,
+    "gunwale_m": 0.06,
+    "gunwale_vox": 1,
+    "keel_m": 0.45,
+    "keel_r_m": 0.04,
+    "length_m": 4.0,
+    "panel_vox": 2,
+    "rocker": 0.14,
+    "seat": true,
+    "seat_len_m": 0.8,
+    "sheer": 0.35,
+    "shell_vox": 2,
+    "spar_r_m": 0.045,
+    "strake_share": 0.25,
+    "sweep": 0.85,
+    "taper": 0.3,
+    "thwart_t_m": 0.05,
+    "thwart_w_m": 0.1,
+    "thwarts": 2
+  },
   "biomes": {
     "bare_rock": 0.0,
     "beach": 1.0,
@@ -81,6 +116,13 @@
     "shell_lower": 0.35,
     "shell_upper": 0.55,
     "squash": 1.0
+  },
+  "curation": {
+    "notes": "Reference-informed generator; variants require endorsement in Forge.",
+    "seeds": [
+      1
+    ],
+    "status": "draft"
   },
   "detail": {
     "depth_max_m": 6.0,
@@ -243,7 +285,9 @@
     "fish_flank": "skin_silver",
     "fish_patch": "skin_pale",
     "fish_pattern": "skin_dark",
+    "frame": "beak_horn",
     "head": "leaf_blossom",
+    "hull": "heartwood",
     "leaf": "leaf_needle",
     "quad_back": "skin_brown",
     "quad_belly": "skin_pale",
@@ -254,7 +298,9 @@
     "quad_mark": "skin_dark",
     "quad_tail": "skin_brown",
     "rock": "rock",
-    "stem": "grass"
+    "stem": "grass",
+    "strake": "deadwood",
+    "trim": "bark"
   },
   "name": "maritime-pine",
   "notes": "THE THIRD PINE, AND IT HAS TO DIFFER FROM BOTH THE OTHERS AT DISTANCE. `stone-pine` is a flat plate on a bare stem (`height_frac` 0.20, umbrella); `scots-pine` is a high open irregular flat top; this one keeps the bare stem -- `clear_frac` 0.72 -- but carries a ROUNDED tiered crown in the top quarter, on seven wide-spaced whorls. A pine coast with three pines on it reads as a place; with one it reads as a texture.\n\nTHE ORANGE IN THE FISSURES IS NOT AVAILABLE IN EITHER DIRECTION. `scots-pine` chose `bark_pale` and got the brightness right and the hue wrong; this one takes the dark `bark`, which is right for the deeply fissured lower stem and wrong further up. That is not a fix, but it does mean the two pines differ in trunk value as well as in crown, and the underlying ask -- bark colour that varies with height -- is the same one three specs in this pass make.",
@@ -264,8 +310,15 @@
     "elev_max_m": 400.0,
     "elev_min_m": 0.0,
     "slope_max_pct": 70.0,
+    "slope_min_pct": 0.0,
     "spacing_m": 6.0,
     "water_max_m": 0.0
+  },
+  "plant_recipe": {
+    "form": "mixed",
+    "generator": "temperate-shoots-v2",
+    "profile": "maritime-pine",
+    "size": "mixed"
   },
   "quad": {
     "belly": 0.52,
@@ -406,6 +459,7 @@
     "lobe_depth": 0.18,
     "lobes": 0,
     "radius_base_m": 0.305,
+    "taper": 0.5,
     "wander": 0.2
   },
   "tuft": {

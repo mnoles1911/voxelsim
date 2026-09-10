@@ -1,0 +1,295 @@
+{
+  "status": "passed pilot review",
+  "source": "https://herbaria.plants.ox.ac.uk/bol/plants400/Profiles/GH/Hyacinthoides",
+  "viewed_photos": [
+    "Oxford Plants 400 BluebellWood_01 woodland habit",
+    "RHS JI_0421_RHSRosemoor_282 spring racemes and strap leaves"
+  ],
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "batch_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+  ],
+  "findings": "Inspected the Oxford woodland photograph and RHS close-up of English bluebells, then all three current pilots and 36 variants. Replaced oversize radial flower stars with small attached pendulous tubular corollas along the outer side of the bent raceme. Basal strap leaves and uncluttered upright flower stalks retain the characteristic habit. All 36 silhouettes span 0.17-0.35 m. At 25 mm the real 15-25 mm corollas necessarily merge into a few purple cells, especially in compact small variants; curled tepal lips cannot resolve. Accepted as a stylized spring English bluebell source with this explicit resolution limit. User seed endorsement remains separate.",
+  "generator_digest": "1efd3468d4039d3a3ad25c19e6deddfb32c3b6b5755560649b5f327eb596a4a0",
+  "sheet_hash": "627fbe62960268407deb2c4c0a2de70e9a623e5ebcdab38f5406a1503a99fe6d",
+  "reviewed_at": 1788840941.4121053,
+  "pilot_hashes": {
+    "1": "84e370b5011fe791609985f4eb349e8c4aad896af42ff47e95ece3975161056d",
+    "4": "359d18bbf341e8e9094960dc723ce5ca94654a2058ed398a62ef91cd410d2b15",
+    "7": "d67ab103da40c09c752740c354c9385763271b33316191e21e4e1e1b36cd804f"
+  },
+  "profile": "common-bluebell",
+  "review_date": "2026-09-08",
+  "taxon": "Hyacinthoides non-scripta",
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "627fbe62960268407deb2c4c0a2de70e9a623e5ebcdab38f5406a1503a99fe6d"
+  },
+  "identity_revalidations": [
+    {
+      "previous_digest": "b6ab3a4a3ac785f0ad1e3b90255e39f0f6429da42fdb2f155ee8e1805aa64da1",
+      "new_digest": "1efd3468d4039d3a3ad25c19e6deddfb32c3b6b5755560649b5f327eb596a4a0",
+      "timestamp": 1788843659.8766708,
+      "method": "Every saved VXA rebuilt to identical SHA-256; original files and all user decisions preserved",
+      "variants": [
+        {
+          "id": "common-bluebell-0001",
+          "seed": 1,
+          "hash": "84e370b5011fe791609985f4eb349e8c4aad896af42ff47e95ece3975161056d"
+        },
+        {
+          "id": "common-bluebell-0002",
+          "seed": 2,
+          "hash": "c6cfe62af65565e939ee6802a62620426a901b768ce76540d3de66908bcaad08"
+        },
+        {
+          "id": "common-bluebell-0003",
+          "seed": 3,
+          "hash": "a592670c605c23ba9500240c85b1ab7f36f2648ce03991a773fb8bc81e60e118"
+        },
+        {
+          "id": "common-bluebell-0004",
+          "seed": 4,
+          "hash": "359d18bbf341e8e9094960dc723ce5ca94654a2058ed398a62ef91cd410d2b15"
+        },
+        {
+          "id": "common-bluebell-0005",
+          "seed": 5,
+          "hash": "87dde6f4211499076e47317017e3ca9afdce070aba12d1b99f1852bb4889a725"
+        },
+        {
+          "id": "common-bluebell-0006",
+          "seed": 6,
+          "hash": "a5f9d6fb5aa88e2974b27ff11765e0af3ce0c45e935240cabf4a8d5ae2cb429b"
+        },
+        {
+          "id": "common-bluebell-0007",
+          "seed": 7,
+          "hash": "d67ab103da40c09c752740c354c9385763271b33316191e21e4e1e1b36cd804f"
+        },
+        {
+          "id": "common-bluebell-0008",
+          "seed": 8,
+          "hash": "0f9cfbac85630635c952461ff6bb0172357b99186b41e5f518b8b06cfe852f67"
+        },
+        {
+          "id": "common-bluebell-0009",
+          "seed": 9,
+          "hash": "feef6b82ce35293ba9ca13d8dbd05eefbb2e136fcbbcca1149ca0d280af4d613"
+        },
+        {
+          "id": "common-bluebell-0010",
+          "seed": 10,
+          "hash": "135c1ced29c94346e4dcd0e83e24840d5c90a45a9732bedd131dfa8f4d5969cd"
+        },
+        {
+          "id": "common-bluebell-0011",
+          "seed": 11,
+          "hash": "1c37c971c4b52aea19fa4cc4d15fb0434a2c508148bf502835bf7856a9a26ee1"
+        },
+        {
+          "id": "common-bluebell-0012",
+          "seed": 12,
+          "hash": "795ce7b95226d86724b34651a2cc2c1f4a66a46e9dd429afbf14d65b9180cd6e"
+        },
+        {
+          "id": "common-bluebell-0013",
+          "seed": 13,
+          "hash": "fe76b979dfd3a3c9a6db6e133b6ce42779adb0591081d48c870aeab7e80e89be"
+        },
+        {
+          "id": "common-bluebell-0014",
+          "seed": 14,
+          "hash": "ba164437a02ea902117e7592b8551815cf81849df6871501ee48e5582e701d4c"
+        },
+        {
+          "id": "common-bluebell-0015",
+          "seed": 15,
+          "hash": "7f4d9652e857073b4b28c6cfc9275d187dac1de9207d78d0569a7d905ae5a4f2"
+        },
+        {
+          "id": "common-bluebell-0016",
+          "seed": 16,
+          "hash": "937cae018fcdc611da69d14a1f7afd6ba70229f7fc90d9c6ece07eab56bdd079"
+        },
+        {
+          "id": "common-bluebell-0017",
+          "seed": 17,
+          "hash": "7d119cd15f01d8d530f5a73df9cb04b8cc0b1373cd79716d8f0d0815e1d49151"
+        },
+        {
+          "id": "common-bluebell-0018",
+          "seed": 18,
+          "hash": "229619919afd5232464e55c6eb20fc95117533c62d4f90516dec777cbf45d603"
+        },
+        {
+          "id": "common-bluebell-0019",
+          "seed": 19,
+          "hash": "98eba7be90dc818676b0cbe36ccd5ad56e60a32c3baeeaa744329901dafff7cf"
+        },
+        {
+          "id": "common-bluebell-0020",
+          "seed": 20,
+          "hash": "34f7e6aa16c8447b7728df66fe529bf284a47fa59e97a75b368b160466c5d015"
+        },
+        {
+          "id": "common-bluebell-0021",
+          "seed": 21,
+          "hash": "e39f851892f815f38aae2f78364b7696b83b1fbb085c37370a66b4c95017eb6f"
+        },
+        {
+          "id": "common-bluebell-0022",
+          "seed": 22,
+          "hash": "aa491268ab128b5fac9830210d411a52b35b52e63a942817b552eed8fb2a6f91"
+        },
+        {
+          "id": "common-bluebell-0023",
+          "seed": 23,
+          "hash": "fd0d78491504b73d0f4a37ab5e49001746f02f115867b9789fd67374760a5069"
+        },
+        {
+          "id": "common-bluebell-0024",
+          "seed": 24,
+          "hash": "dbc697bcec7ef2283f54c23e1702bf257dabaddad48e443d762d79a67f4dfb09"
+        },
+        {
+          "id": "common-bluebell-0025",
+          "seed": 25,
+          "hash": "596bb198e9520c32e049fe376029f05d1b952ce4988bed11c145f6943b6f737a"
+        },
+        {
+          "id": "common-bluebell-0026",
+          "seed": 26,
+          "hash": "496fb4136c8c718ce26cf4ab43a61fc2e927fd41ab565c5c3879fb4459299795"
+        },
+        {
+          "id": "common-bluebell-0027",
+          "seed": 27,
+          "hash": "f6b70b3cb2482ad6c6297485ac690e4ab95db86feb309b604c4744ceae4f7787"
+        },
+        {
+          "id": "common-bluebell-0028",
+          "seed": 28,
+          "hash": "d16363f337ad641897e4afe2e0bd199332b48195e1fe20a57797115fca755a37"
+        },
+        {
+          "id": "common-bluebell-0029",
+          "seed": 29,
+          "hash": "776c28e409cd5356af0923ce27bb0972e126d34735d71d41e40a4f08f4d7e673"
+        },
+        {
+          "id": "common-bluebell-0030",
+          "seed": 30,
+          "hash": "d028c153fe696a47f1263169f050fe12a2e3dc200c583fcf13b7df784f734c17"
+        },
+        {
+          "id": "common-bluebell-0031",
+          "seed": 31,
+          "hash": "0c4f5172ac1f5209c92b6d5485b659199ce9402579c362068e811cf9ed6c7543"
+        },
+        {
+          "id": "common-bluebell-0032",
+          "seed": 32,
+          "hash": "f3ec012849008ac75ad17c1106f2a496709716e0da7baa6177b05d6d0be93603"
+        },
+        {
+          "id": "common-bluebell-0033",
+          "seed": 33,
+          "hash": "45051872b15affc17a43eeac061d8d2d1a8a6b4ef2c2d7226d7488fd24b8a287"
+        },
+        {
+          "id": "common-bluebell-0034",
+          "seed": 34,
+          "hash": "313a247a4fbe6f2725fbade9830ad93f8b3626bac8388fc5ab196917ebc8247b"
+        },
+        {
+          "id": "common-bluebell-0035",
+          "seed": 35,
+          "hash": "4b6d563d4ea117915fd817aa0d84366ca762a39bc55ac269bf3e0eb7bbc02856"
+        },
+        {
+          "id": "common-bluebell-0036",
+          "seed": 36,
+          "hash": "c158dc4c8e7ddd254f0d7edbff588d75b72d926365e716e2e24326b9888b3309"
+        }
+      ]
+    }
+  ]
+}

@@ -12,6 +12,9 @@ public class VoxelEarth : ModuleRules
 		// UE 5.7 defaults to C++20 (BuildSettingsVersion.Latest), but set it
 		// explicitly since this module links a C++20 static library.
 		CppStandard = CppStandardVersion.Cpp20;
+		// Source-bound appearance packets use portable SHA-256; the generic
+		// FPlatformMisc helper is not implemented on the Windows editor target.
+		AddEngineThirdPartyPrivateStaticDependencies(Target, "OpenSSL");
 
 		PublicDependencyModuleNames.AddRange(new string[]
 		{

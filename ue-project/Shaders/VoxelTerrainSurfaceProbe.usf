@@ -1,0 +1,29 @@
+#include "/Engine/Public/Platform.ush"
+#include "/VoxelEarth/VoxelTerrainAppearance.ush"
+StructuredBuffer<uint> PageWords;
+StructuredBuffer<uint> SourceWords;
+StructuredBuffer<uint2> SourceRanges;
+StructuredBuffer<uint4> Queries;
+RWStructuredBuffer<uint4> Results;
+uint QueryCount;
+[numthreads(64,1,1)]
+void TerrainSurfaceProbeMain(uint3 Tid:SV_DispatchThreadID){
+    if(Tid.x>=QueryCount)return;
+    uint Base=Tid.x*5u;uint4 D=Queries[Base],C=Queries[Base+1u],F=Queries[Base+2u],M=Queries[Base+3u],P=Queries[Base+4u];
+    uint4 A=uint4(0u,0xffffffffu,0u,0u),B=uint4(0u,0u,asuint(1.0f),asuint(1.0f)),O=0u,W=0u;
+    uint Axis=C.w,Positive=F.w;int3 Start=asint(C.xyz);float3 Fraction=asfloat(F.xyz);float Footprint=asfloat(M.w),Pitch=asfloat(P.x);
+    if(Axis<3u&&Positive<2u&&M.z>0u&&M.z<=8u&&all(P.yzw==0u)&&all(isfinite(Fraction))&&all(Fraction>=0)&&all(Fraction<=1)&&isfinite(Footprint)&&Footprint>=0&&isfinite(Pitch)&&Pitch>0&&all(Start>int3(-2147483639,-2147483639,-2147483639))&&all(Start<int3(2147483639,2147483639,2147483639))){
+        bool First=true;
+        for(uint Step=0u;Step<M.z;++Step){
+            uint Material=((Step<4u?M.x:M.y)>>((Step&3u)*8u))&255u; // lint-shader-ub: allow VARIABLE_SHIFT - shift bounded to0,8,16,24
+            if(Material==0u)continue;
+            int3 Cell=Start;Cell[Axis]+=(Positive!=0u?-1:1)*int(Step);
+            float3 RGB;float Coverage;float2 UV;
+            bool Approved=VoxelTerrainSurfaceAppearance(PageWords,SourceWords,SourceRanges,D,Cell,Fraction,Axis,Positive,Material,Pitch,Footprint,RGB,Coverage,UV);
+            if(First){B.y=Approved?1u:0u;B.z=asuint(Coverage);First=false;}
+            if(Approved&&Coverage<.5f){A.w++;continue;}
+            A.x=1u;A.y=Step;A.z=Material;B.x=Approved?1u:0u;B.w=asuint(Coverage);O=uint4(asuint(RGB),asuint(UV.x));W=uint4(asuint(UV.y),asuint(Cell));break;
+        }
+    }
+    Results[Tid.x*4u]=A;Results[Tid.x*4u+1u]=B;Results[Tid.x*4u+2u]=O;Results[Tid.x*4u+3u]=W;
+}

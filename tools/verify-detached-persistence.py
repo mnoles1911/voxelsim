@@ -18,13 +18,16 @@ class Reader:
 def plant_record(record):
     r=Reader(record); name,=r.unpack('i')
     if name == -1:
-        version,=r.unpack('I'); assert version == 1
+        version,=r.unpack('I'); assert version in (1,2)
         def text_field(limit):
             text=r.bytes(limit).decode('ascii'); assert all(32<=ord(c)<=126 for c in text); return text
         spec=text_field(128); kind=text_field(64); category=text_field(64); source_hash=text_field(32)
         spec_hash=text_field(128); catalog_hash=text_field(128); provider_hash=text_field(128)
         seed,flags=r.unpack('IB')
         assert spec and kind and category == 'environment' and len(source_hash)==32 and all(c in '0123456789abcdefABCDEF' for c in source_hash) and flags in (0,1)
+        if version == 2:
+            clipped_hash=text_field(32); source_yaw,=r.unpack('B')
+            assert len(clipped_hash)==32 and all(c in '0123456789abcdefABCDEF' for c in clipped_hash) and source_yaw<4
         name=spec
     else:
         assert name in range(4)

@@ -1,0 +1,88 @@
+{
+  "species": "western-hemlock",
+  "status": "passed pilot review",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "findings": [
+    "Narrow spire and gently bent leader follow the habitat photograph; hanging twig reference informs the fine attached sprays. Needles are represented at shoot scale."
+  ],
+  "reviewed_images": [
+    {
+      "image_id": "35279",
+      "source": "https://plants.ces.ncsu.edu/plants/tsuga-heterophylla/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    },
+    {
+      "image_id": "35280",
+      "source": "https://plants.ces.ncsu.edu/plants/tsuga-heterophylla/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    }
+  ],
+  "taxon": "tsuga-heterophylla",
+  "sources": [
+    "https://plants.ces.ncsu.edu/plants/tsuga-heterophylla/"
+  ],
+  "habitat": "coastal",
+  "art_baseline": {
+    "season": "spring",
+    "foliage": "Species-appropriate spring foliage and fresh growth; flowering only where appropriate to the species.",
+    "reference_policy": "Use spring photographs for finished color and foliage. Other seasons may inform branch structure only.",
+    "out_of_scope": [
+      "seasonal transitions",
+      "seasonal recoloring"
+    ]
+  },
+  "generator_digest": "6d0b2c04db2c83b942e5b228219a87f514e03cf06752831f8ac02256fa4cfa85",
+  "review_date": "2026-09-07",
+  "review_scope": "Stylized spring vertical slice; source acceptance is separate from world variant endorsement.",
+  "pilot_artifacts": {
+    "1": "72b7a650ae25ce40ae52166c35ae49e0d07ec4d1181c4f70f12243f97bc211fe",
+    "4": "b86af1affd878707d96eeb978f1e2f6ad9285a33984664804e5d538b8b97fa0c",
+    "7": "6a19a524aa184f9c9edd549b5d4f060846e5bd6418185c7bb69664df0661f190"
+  },
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "bcffaf35113e02f0308ce3d57a0bcedf86ac97a4aa97583ab71b574862916eb4"
+  }
+}

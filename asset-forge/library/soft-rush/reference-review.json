@@ -1,0 +1,151 @@
+{
+  "status": "passed pilot review",
+  "source": "https://plants.ces.ncsu.edu/plants/juncus-effusus/",
+  "viewed_photos": [
+    "Juncus effusus - Thayne Tuason",
+    "Brownish-green flowers fading to rusty brown - Cathy DeWitt",
+    "Juncus effusus - Ole Husby"
+  ],
+  "findings": "Thayne Tuason, Cathy DeWitt and Ole Husby actual photos: dense cylindrical green unbranched stem tuft. Mature rusty flower clusters excluded; no broad leaves. Current three-size pilots (seeds 1,4,7) and every panel of36-seed contact sheet visually reviewed. Dense tuft of upright cylindrical leafless stems with varied lean/height; 42\u201388 cm. Lower stems merge into a coarse stool at 25 mm, upper silhouette remains stem-based. Accepted as stylized spring source; variant endorsement remains a user decision.",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "batch_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+  ],
+  "generator_digest": "0acb83dd51f381105c9b78fb5d8deb49a2b79fe3e5f54c7512e57610e21955c1",
+  "sheet_hash": "52576675e426d85be5d19c6a92af4772a3c28ea93710f8d97c87270a063d7d72",
+  "reviewed_at": 1788855354.3356235,
+  "pilot_hashes": {
+    "1": "4091edbe90650e49da2ab3ea7c9f5c8d75f23cb64cca6c2c44b955d25a194eff",
+    "4": "597879bb43689b14c93e3c5df4f71d6b3b8519559ec664f946a7ac1f2a8ba4e7",
+    "7": "b65c4987d91963f829938e707cee03c8b52ea91b586877f59064f47a6cc4fe71"
+  },
+  "profile": "soft-rush",
+  "review_date": "2026-09-08",
+  "additional_sources": [],
+  "reference_catalog_photos": [
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Juncus-effusus--Thayne-Tuason--CC-BY-NC.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=otRvLvVtuk0DPU4rfhAue%2Fe9KUY%3D&Expires=1788858152",
+      "caption": "Juncus effusus",
+      "credit": "Thayne Tuason",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc/2.0/'>CC BY-NC 2.0</a>",
+      "image_id": "6503"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Juncus_effusus_soft__U3ORlcULzzMM.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=rVD7vKLPkHU5yMZXHLe3WbhoxRk%3D&Expires=1788858152",
+      "caption": "Brownish-green flowers fading to rusty brown",
+      "credit": "Cathy DeWitt",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc-nd/4.0/legalcode'>CC BY-NC-ND 4.0</a>",
+      "image_id": "42604"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Juncus-effusus--Ole-Husby--CC-BY-SA.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=5jkNGnidqX%2FSQhpc4s2uTto7SAU%3D&Expires=1788858152",
+      "caption": "Juncus effusus",
+      "credit": "Ole Husby",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/2.0/'>CC-BY-SA 2.0</a>",
+      "image_id": "6504"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Juncus-effusus--Celeste-Ramsay--CC-BY-NC-ND.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=CXNgZZMZ28Dz6gF1kuKa3%2FYIeLg%3D&Expires=1788858152",
+      "caption": "Juncus effusus",
+      "credit": "Celeste Ramsay",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc-nd/2.0/legalcode'>CC BY-NC-ND 2.0</a>",
+      "image_id": "6505"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Juncus-effusus--Forest-and-Kim-Starr--CC-BY.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=65C2WUYig39aCCsa2EA6nAxln1c%3D&Expires=1788858152",
+      "caption": "Juncus effusus",
+      "credit": "Forest and Kim Starr",
+      "license": "<a href='http://creativecommons.org/licenses/by/2.0/legalcode'>CC BY 2.0</a>",
+      "image_id": "6506"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Juncus-spring-forest_SeGEraHgMeDr.jpe?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=iz4oG4NiVKhPDLZAPzTq3KFmXf4%3D&Expires=1788858152",
+      "caption": "forest in spring, Union County, NC",
+      "credit": "Kristyna Culp",
+      "license": "<a href='http://creativecommons.org/licenses/by/4.0/legalcode'>CC BY 4.0</a>",
+      "image_id": "22413"
+    }
+  ],
+  "taxon": "Juncus effusus",
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "52576675e426d85be5d19c6a92af4772a3c28ea93710f8d97c87270a063d7d72"
+  }
+}

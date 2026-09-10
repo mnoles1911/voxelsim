@@ -149,7 +149,7 @@
   },
   "creature": {
    "blurb": "Living things that are spawned rather than composed. They carry their own pitch under their own transform (ADR-0010), they are published in the manifest with biome weights so a spawner can find them, and they are authored and deliberately not rendered until animation exists.",
-   "count": 382,
+   "count": 390,
    "in_manifest": true,
    "kinds": [
     "fish",
@@ -997,6 +997,22 @@
      ],
      "kind": "quadruped",
      "name": "bengal-tiger",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "draft",
+     "grids": [
+      {
+       "bytes": 315158,
+       "extent_vox": null,
+       "seed": 1,
+       "voxels": 210538,
+       "vxa": "library/bengal_tiger_anatomy_pilot/bengal_tiger_anatomy_pilot-0001/tree.vxa"
+      }
+     ],
+     "kind": "quadruped",
+     "name": "bengal_tiger_anatomy_pilot",
      "via": "kind",
      "voxel_mm": 12.5
     },
@@ -2277,6 +2293,22 @@
      ],
      "kind": "bird",
      "name": "common-tern",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "draft",
+     "grids": [
+      {
+       "bytes": 7163,
+       "extent_vox": null,
+       "seed": 1,
+       "voxels": 6062,
+       "vxa": "library/common_raven_anatomy_pilot/common_raven_anatomy_pilot-0001/tree.vxa"
+      }
+     ],
+     "kind": "bird",
+     "name": "common_raven_anatomy_pilot",
      "via": "kind",
      "voxel_mm": 12.5
     },
@@ -3721,6 +3753,22 @@
      "voxel_mm": 12.5
     },
     {
+     "curation": "draft",
+     "grids": [
+      {
+       "bytes": 44723,
+       "extent_vox": null,
+       "seed": 1,
+       "voxels": 24305,
+       "vxa": "library/golden_eagle_anatomy_pilot/golden_eagle_anatomy_pilot-0001/tree.vxa"
+      }
+     ],
+     "kind": "bird",
+     "name": "golden_eagle_anatomy_pilot",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
      "curation": "approved",
      "grids": [
       {
@@ -3921,6 +3969,22 @@
      "voxel_mm": 25.0
     },
     {
+     "curation": "draft",
+     "grids": [
+      {
+       "bytes": 227123,
+       "extent_vox": null,
+       "seed": 1,
+       "voxels": 399955,
+       "vxa": "library/great_white_shark_anatomy_pilot/great_white_shark_anatomy_pilot-0001/tree.vxa"
+      }
+     ],
+     "kind": "fish",
+     "name": "great_white_shark_anatomy_pilot",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
      "curation": "approved",
      "grids": [
       {
@@ -4057,6 +4121,22 @@
      ],
      "kind": "quadruped",
      "name": "grey-wolf",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "draft",
+     "grids": [
+      {
+       "bytes": 68718,
+       "extent_vox": null,
+       "seed": 1,
+       "voxels": 69525,
+       "vxa": "library/grey_wolf_anatomy_pilot/grey_wolf_anatomy_pilot-0001/tree.vxa"
+      }
+     ],
+     "kind": "quadruped",
+     "name": "grey_wolf_anatomy_pilot",
      "via": "kind",
      "voxel_mm": 12.5
     },
@@ -5361,6 +5441,22 @@
      "voxel_mm": 25.0
     },
     {
+     "curation": "draft",
+     "grids": [
+      {
+       "bytes": 627488,
+       "extent_vox": null,
+       "seed": 1,
+       "voxels": 2379896,
+       "vxa": "library/orca_anatomy_pilot/orca_anatomy_pilot-0001/tree.vxa"
+      }
+     ],
+     "kind": "cetacean",
+     "name": "orca_anatomy_pilot",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
      "curation": "approved",
      "grids": [
       {
@@ -5721,6 +5817,22 @@
      "voxel_mm": 12.5
     },
     {
+     "curation": "draft",
+     "grids": [
+      {
+       "bytes": 6148,
+       "extent_vox": null,
+       "seed": 1,
+       "voxels": 2334,
+       "vxa": "library/rainbow_trout_anatomy_pilot/rainbow_trout_anatomy_pilot-0001/tree.vxa"
+      }
+     ],
+     "kind": "fish",
+     "name": "rainbow_trout_anatomy_pilot",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
      "curation": "approved",
      "grids": [
       {
@@ -5917,6 +6029,22 @@
      ],
      "kind": "quadruped",
      "name": "red-squirrel",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "draft",
+     "grids": [
+      {
+       "bytes": 92963,
+       "extent_vox": null,
+       "seed": 1,
+       "voxels": 205448,
+       "vxa": "library/red_deer_stag_anatomy_pilot/red_deer_stag_anatomy_pilot-0001/tree.vxa"
+      }
+     ],
+     "kind": "quadruped",
+     "name": "red_deer_stag_anatomy_pilot",
      "via": "kind",
      "voxel_mm": 12.5
     },
@@ -7804,7 +7932,7 @@
   },
   "environment": {
    "blurb": "Static world content. The engine composes it into terrain chunks on both the CPU and GPU paths and the deterministic per-chunk scatter decides where it goes. Trees and rocks join the world voxel grid at 10 cm and are destructible as terrain is; the rest carry their own finer grid and are drawn as instances in the detail ring.",
-   "count": 446,
+   "count": 448,
    "in_manifest": true,
    "kinds": [
     "tree",
@@ -7994,6 +8122,30 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 100598,
+       "extent_vox": [
+        60,
+        61,
+        146
+       ],
+       "seed": 101,
+       "voxels": 42851,
+       "vxa": "library/birch/birch-0101/tree.vxa"
+      },
+      {
+       "bytes": 142803,
+       "extent_vox": [
+        68,
+        63,
+        186
+       ],
+       "seed": 102,
+       "voxels": 68880,
+       "vxa": "library/birch/birch-0102/tree.vxa"
+      }
+     ],
      "kind": "tree",
      "name": "birch",
      "via": "kind",
@@ -8131,6 +8283,28 @@
        "seed": 1,
        "voxels": 9453,
        "vxa": "library/bramble-thicket/bramble-thicket-0001/tree.vxa"
+      },
+      {
+       "bytes": 4118,
+       "extent_vox": [
+        17,
+        17,
+        18
+       ],
+       "seed": 101,
+       "voxels": 840,
+       "vxa": "library/bramble-thicket/bramble-thicket-0101/tree.vxa"
+      },
+      {
+       "bytes": 4908,
+       "extent_vox": [
+        19,
+        21,
+        13
+       ],
+       "seed": 102,
+       "voxels": 920,
+       "vxa": "library/bramble-thicket/bramble-thicket-0102/tree.vxa"
       }
      ],
      "kind": "bush",
@@ -9019,6 +9193,28 @@
        "seed": 1,
        "voxels": 3931,
        "vxa": "library/granite-boulder/granite-boulder-0001/tree.vxa"
+      },
+      {
+       "bytes": 3273,
+       "extent_vox": [
+        23,
+        20,
+        13
+       ],
+       "seed": 101,
+       "voxels": 2290,
+       "vxa": "library/granite-boulder/granite-boulder-0101/tree.vxa"
+      },
+      {
+       "bytes": 3923,
+       "extent_vox": [
+        23,
+        23,
+        15
+       ],
+       "seed": 102,
+       "voxels": 4636,
+       "vxa": "library/granite-boulder/granite-boulder-0102/tree.vxa"
       }
      ],
      "kind": "rock",
@@ -9549,6 +9745,28 @@
        "seed": 1,
        "voxels": 106,
        "vxa": "library/meadow-daisy/meadow-daisy-0001/tree.vxa"
+      },
+      {
+       "bytes": 578,
+       "extent_vox": [
+        9,
+        11,
+        11
+       ],
+       "seed": 101,
+       "voxels": 121,
+       "vxa": "library/meadow-daisy/meadow-daisy-0101/tree.vxa"
+      },
+      {
+       "bytes": 618,
+       "extent_vox": [
+        11,
+        10,
+        10
+       ],
+       "seed": 102,
+       "voxels": 121,
+       "vxa": "library/meadow-daisy/meadow-daisy-0102/tree.vxa"
       }
      ],
      "kind": "flower",
@@ -9569,6 +9787,28 @@
        "seed": 1,
        "voxels": 124,
        "vxa": "library/meadow-grass/meadow-grass-0001/tree.vxa"
+      },
+      {
+       "bytes": 783,
+       "extent_vox": [
+        13,
+        14,
+        9
+       ],
+       "seed": 101,
+       "voxels": 155,
+       "vxa": "library/meadow-grass/meadow-grass-0101/tree.vxa"
+      },
+      {
+       "bytes": 753,
+       "extent_vox": [
+        10,
+        13,
+        11
+       ],
+       "seed": 102,
+       "voxels": 155,
+       "vxa": "library/meadow-grass/meadow-grass-0102/tree.vxa"
       }
      ],
      "kind": "grass",
@@ -10543,6 +10783,427 @@
      "voxel_mm": 100.0
     },
     {
+     "curation": "draft",
+     "grids": [
+      {
+       "bytes": 40073,
+       "extent_vox": [
+        61,
+        55,
+        44
+       ],
+       "seed": 1,
+       "voxels": 9947,
+       "vxa": "library/temperate-oak-family/temperate-oak-family-0001/tree.vxa"
+      },
+      {
+       "bytes": 8758,
+       "extent_vox": [
+        25,
+        26,
+        42
+       ],
+       "seed": 2,
+       "voxels": 4340,
+       "vxa": "library/temperate-oak-family/temperate-oak-family-0002/tree.vxa"
+      },
+      {
+       "bytes": 20578,
+       "extent_vox": [
+        44,
+        45,
+        44
+       ],
+       "seed": 3,
+       "voxels": 7000,
+       "vxa": "library/temperate-oak-family/temperate-oak-family-0003/tree.vxa"
+      },
+      {
+       "bytes": 411703,
+       "extent_vox": [
+        125,
+        126,
+        100
+       ],
+       "seed": 4,
+       "voxels": 96962,
+       "vxa": "library/temperate-oak-family/temperate-oak-family-0004/tree.vxa"
+      },
+      {
+       "bytes": 68268,
+       "extent_vox": [
+        49,
+        52,
+        84
+       ],
+       "seed": 5,
+       "voxels": 33876,
+       "vxa": "library/temperate-oak-family/temperate-oak-family-0005/tree.vxa"
+      },
+      {
+       "bytes": 141318,
+       "extent_vox": [
+        73,
+        73,
+        83
+       ],
+       "seed": 6,
+       "voxels": 51517,
+       "vxa": "library/temperate-oak-family/temperate-oak-family-0006/tree.vxa"
+      },
+      {
+       "bytes": 1189698,
+       "extent_vox": [
+        173,
+        172,
+        136
+       ],
+       "seed": 7,
+       "voxels": 248190,
+       "vxa": "library/temperate-oak-family/temperate-oak-family-0007/tree.vxa"
+      },
+      {
+       "bytes": 158718,
+       "extent_vox": [
+        72,
+        66,
+        123
+       ],
+       "seed": 8,
+       "voxels": 84558,
+       "vxa": "library/temperate-oak-family/temperate-oak-family-0008/tree.vxa"
+      },
+      {
+       "bytes": 499778,
+       "extent_vox": [
+        112,
+        115,
+        120
+       ],
+       "seed": 9,
+       "voxels": 158597,
+       "vxa": "library/temperate-oak-family/temperate-oak-family-0009/tree.vxa"
+      },
+      {
+       "bytes": 47608,
+       "extent_vox": [
+        65,
+        67,
+        45
+       ],
+       "seed": 10,
+       "voxels": 11159,
+       "vxa": "library/temperate-oak-family/temperate-oak-family-0010/tree.vxa"
+      },
+      {
+       "bytes": 8103,
+       "extent_vox": [
+        24,
+        25,
+        40
+       ],
+       "seed": 11,
+       "voxels": 3888,
+       "vxa": "library/temperate-oak-family/temperate-oak-family-0011/tree.vxa"
+      },
+      {
+       "bytes": 19473,
+       "extent_vox": [
+        38,
+        37,
+        44
+       ],
+       "seed": 12,
+       "voxels": 6509,
+       "vxa": "library/temperate-oak-family/temperate-oak-family-0012/tree.vxa"
+      },
+      {
+       "bytes": 426198,
+       "extent_vox": [
+        128,
+        127,
+        102
+       ],
+       "seed": 13,
+       "voxels": 97917,
+       "vxa": "library/temperate-oak-family/temperate-oak-family-0013/tree.vxa"
+      },
+      {
+       "bytes": 99548,
+       "extent_vox": [
+        61,
+        62,
+        92
+       ],
+       "seed": 14,
+       "voxels": 43190,
+       "vxa": "library/temperate-oak-family/temperate-oak-family-0014/tree.vxa"
+      },
+      {
+       "bytes": 105868,
+       "extent_vox": [
+        67,
+        65,
+        80
+       ],
+       "seed": 15,
+       "voxels": 42884,
+       "vxa": "library/temperate-oak-family/temperate-oak-family-0015/tree.vxa"
+      },
+      {
+       "bytes": 1239303,
+       "extent_vox": [
+        189,
+        182,
+        138
+       ],
+       "seed": 16,
+       "voxels": 263168,
+       "vxa": "library/temperate-oak-family/temperate-oak-family-0016/tree.vxa"
+      },
+      {
+       "bytes": 262638,
+       "extent_vox": [
+        77,
+        79,
+        137
+       ],
+       "seed": 17,
+       "voxels": 115213,
+       "vxa": "library/temperate-oak-family/temperate-oak-family-0017/tree.vxa"
+      },
+      {
+       "bytes": 481063,
+       "extent_vox": [
+        110,
+        110,
+        121
+       ],
+       "seed": 18,
+       "voxels": 153559,
+       "vxa": "library/temperate-oak-family/temperate-oak-family-0018/tree.vxa"
+      },
+      {
+       "bytes": 21723,
+       "extent_vox": [
+        45,
+        41,
+        39
+       ],
+       "seed": 19,
+       "voxels": 6940,
+       "vxa": "library/temperate-oak-family/temperate-oak-family-0019/tree.vxa"
+      },
+      {
+       "bytes": 9113,
+       "extent_vox": [
+        28,
+        24,
+        47
+       ],
+       "seed": 20,
+       "voxels": 4580,
+       "vxa": "library/temperate-oak-family/temperate-oak-family-0020/tree.vxa"
+      },
+      {
+       "bytes": 20973,
+       "extent_vox": [
+        38,
+        39,
+        46
+       ],
+       "seed": 21,
+       "voxels": 7179,
+       "vxa": "library/temperate-oak-family/temperate-oak-family-0021/tree.vxa"
+      },
+      {
+       "bytes": 448423,
+       "extent_vox": [
+        135,
+        140,
+        100
+       ],
+       "seed": 22,
+       "voxels": 100951,
+       "vxa": "library/temperate-oak-family/temperate-oak-family-0022/tree.vxa"
+      },
+      {
+       "bytes": 70028,
+       "extent_vox": [
+        55,
+        55,
+        81
+       ],
+       "seed": 23,
+       "voxels": 32914,
+       "vxa": "library/temperate-oak-family/temperate-oak-family-0023/tree.vxa"
+      },
+      {
+       "bytes": 311983,
+       "extent_vox": [
+        109,
+        98,
+        106
+       ],
+       "seed": 24,
+       "voxels": 83088,
+       "vxa": "library/temperate-oak-family/temperate-oak-family-0024/tree.vxa"
+      },
+      {
+       "bytes": 1238268,
+       "extent_vox": [
+        177,
+        179,
+        144
+       ],
+       "seed": 25,
+       "voxels": 264707,
+       "vxa": "library/temperate-oak-family/temperate-oak-family-0025/tree.vxa"
+      },
+      {
+       "bytes": 242068,
+       "extent_vox": [
+        88,
+        76,
+        131
+       ],
+       "seed": 26,
+       "voxels": 107848,
+       "vxa": "library/temperate-oak-family/temperate-oak-family-0026/tree.vxa"
+      },
+      {
+       "bytes": 629223,
+       "extent_vox": [
+        125,
+        129,
+        124
+       ],
+       "seed": 27,
+       "voxels": 175883,
+       "vxa": "library/temperate-oak-family/temperate-oak-family-0027/tree.vxa"
+      },
+      {
+       "bytes": 22938,
+       "extent_vox": [
+        42,
+        45,
+        39
+       ],
+       "seed": 28,
+       "voxels": 7178,
+       "vxa": "library/temperate-oak-family/temperate-oak-family-0028/tree.vxa"
+      },
+      {
+       "bytes": 8138,
+       "extent_vox": [
+        25,
+        25,
+        43
+       ],
+       "seed": 29,
+       "voxels": 4208,
+       "vxa": "library/temperate-oak-family/temperate-oak-family-0029/tree.vxa"
+      },
+      {
+       "bytes": 16618,
+       "extent_vox": [
+        38,
+        36,
+        41
+       ],
+       "seed": 30,
+       "voxels": 5987,
+       "vxa": "library/temperate-oak-family/temperate-oak-family-0030/tree.vxa"
+      },
+      {
+       "bytes": 271538,
+       "extent_vox": [
+        106,
+        102,
+        85
+       ],
+       "seed": 31,
+       "voxels": 73663,
+       "vxa": "library/temperate-oak-family/temperate-oak-family-0031/tree.vxa"
+      },
+      {
+       "bytes": 120723,
+       "extent_vox": [
+        68,
+        69,
+        103
+       ],
+       "seed": 32,
+       "voxels": 48906,
+       "vxa": "library/temperate-oak-family/temperate-oak-family-0032/tree.vxa"
+      },
+      {
+       "bytes": 190638,
+       "extent_vox": [
+        85,
+        81,
+        104
+       ],
+       "seed": 33,
+       "voxels": 63823,
+       "vxa": "library/temperate-oak-family/temperate-oak-family-0033/tree.vxa"
+      },
+      {
+       "bytes": 995618,
+       "extent_vox": [
+        166,
+        164,
+        123
+       ],
+       "seed": 34,
+       "voxels": 226911,
+       "vxa": "library/temperate-oak-family/temperate-oak-family-0034/tree.vxa"
+      },
+      {
+       "bytes": 221123,
+       "extent_vox": [
+        85,
+        80,
+        119
+       ],
+       "seed": 35,
+       "voxels": 102744,
+       "vxa": "library/temperate-oak-family/temperate-oak-family-0035/tree.vxa"
+      },
+      {
+       "bytes": 578008,
+       "extent_vox": [
+        123,
+        120,
+        130
+       ],
+       "seed": 36,
+       "voxels": 171659,
+       "vxa": "library/temperate-oak-family/temperate-oak-family-0036/tree.vxa"
+      }
+     ],
+     "kind": "tree",
+     "name": "temperate-oak-family",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "draft",
+     "grids": [
+      {
+       "bytes": 512033,
+       "extent_vox": null,
+       "seed": 1,
+       "voxels": 148505,
+       "vxa": "library/temperate-oak-pilot/temperate-oak-pilot-0001/tree.vxa"
+      }
+     ],
+     "kind": "tree",
+     "name": "temperate-oak-pilot",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
      "curation": "approved",
      "kind": "tree",
      "name": "temperate-sapling",
@@ -10799,6 +11460,28 @@
        "seed": 1,
        "voxels": 1261,
        "vxa": "library/water-reed/water-reed-0001/tree.vxa"
+      },
+      {
+       "bytes": 2513,
+       "extent_vox": [
+        22,
+        26,
+        61
+       ],
+       "seed": 101,
+       "voxels": 1294,
+       "vxa": "library/water-reed/water-reed-0101/tree.vxa"
+      },
+      {
+       "bytes": 2333,
+       "extent_vox": [
+        21,
+        20,
+        39
+       ],
+       "seed": 102,
+       "voxels": 1024,
+       "vxa": "library/water-reed/water-reed-0102/tree.vxa"
       }
      ],
      "kind": "reed",

@@ -1,4 +1,5 @@
 #include "VoxelClipmapActor.h"
+#include "VoxelFrameProfiling.h"
 
 #include "Camera/PlayerCameraManager.h"
 #include "Components/PointLightComponent.h"
@@ -724,21 +725,9 @@ bool AVoxelClipmapActor::IsCameraUnderRock(const FVector& CameraLocUU) const
 		return false;
 	}
 
-	const int64 Vx = (int64)FMath::FloorToDouble(CameraLocUU.X / VoxelCoords::VoxelSizeUU);
-	const int64 Vy = (int64)FMath::FloorToDouble(CameraLocUU.Y / VoxelCoords::VoxelSizeUU);
-
-	int32 Solids = 0;
-	for (double Up = kVeilProbeStepUU; Up <= kVeilProbeMaxUU; Up += kVeilProbeStepUU)
-	{
-		const int64 Vz = (int64)FMath::FloorToDouble((CameraLocUU.Z + Up) / VoxelCoords::VoxelSizeUU);
-		if (Subsystem->IsSolidAtVoxel(Vx, Vy, Vz))
-		{
-			if (++Solids >= kVeilProbeSolidsToLatch)
-			{
-				return true; // early-out: this is the common case underground
-			}
-		}
-	}
+	const int32 Solids = Subsystem->CountUndergroundRoofSamples(
+		CameraLocUU, kVeilProbeStepUU, kVeilProbeMaxUU, kVeilProbeSolidsToLatch);
+	if (Solids >= kVeilProbeSolidsToLatch) return true;
 	// Latch OFF only on ZERO solids overhead; 1 solid sample holds the
 	// previous state (see kVeilProbeSolidsToLatch's comment -- the caller
 	// implements that hold).
@@ -1587,6 +1576,7 @@ void AVoxelClipmapActor::UpdateDebugTint()
 
 void AVoxelClipmapActor::Tick(float DeltaTime)
 {
+	CSV_SCOPED_TIMING_STAT(VoxelStream, ClipmapTickMs);
 	Super::Tick(DeltaTime);
 
 	UpdateDebugTint();

@@ -1,0 +1,88 @@
+{
+  "species": "flowering-dogwood",
+  "status": "passed pilot review",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "findings": [
+    "Irregular horizontal crown layers and open gaps now follow the photographed structure. Baseline is leaf-on spring rather than the peak white-bract flowering state shown in the reference."
+  ],
+  "reviewed_images": [
+    {
+      "image_id": "18690",
+      "source": "https://plants.ces.ncsu.edu/plants/cornus-florida/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    },
+    {
+      "image_id": "10079",
+      "source": "https://plants.ces.ncsu.edu/plants/cornus-florida/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    }
+  ],
+  "taxon": "cornus-florida",
+  "sources": [
+    "https://plants.ces.ncsu.edu/plants/cornus-florida/"
+  ],
+  "habitat": "understory",
+  "art_baseline": {
+    "season": "spring",
+    "foliage": "Species-appropriate spring foliage and fresh growth; flowering only where appropriate to the species.",
+    "reference_policy": "Use spring photographs for finished color and foliage. Other seasons may inform branch structure only.",
+    "out_of_scope": [
+      "seasonal transitions",
+      "seasonal recoloring"
+    ]
+  },
+  "generator_digest": "6d0b2c04db2c83b942e5b228219a87f514e03cf06752831f8ac02256fa4cfa85",
+  "review_date": "2026-09-07",
+  "review_scope": "Stylized spring vertical slice; source acceptance is separate from world variant endorsement.",
+  "pilot_artifacts": {
+    "1": "03c2a5799f63c8618eebc09201f19abdcf4d45fb9e19de6ae53f3407e14764e1",
+    "4": "a83605157628457e749e85d14984c2c0f52feec198edaa036ae0f48d00f3f102",
+    "7": "2ca2152020b6ece827e90daea0541453d25ac3b5691474b067424644e32e38cc"
+  },
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "a85a86d053e66acd4b8db54d96acf8c97de45a47d0f4e39ebb3504c7a9eb390e"
+  }
+}

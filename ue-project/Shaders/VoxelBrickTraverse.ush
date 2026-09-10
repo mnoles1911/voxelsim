@@ -1748,6 +1748,11 @@ uint VoxelMarchFaceClass(FVoxelMarchHit H)
 // structured buffer binds without complaint and then reads plausible nonsense;
 // the pool's own writer reads descriptors as uint2 and the pairing of
 // OccWord/MatWord is what makes a descriptor one thing.
+#include "VoxelTerrainAppearance.ush"
+StructuredBuffer<uint> VoxelAppearancePages;
+StructuredBuffer<uint> VoxelAppearanceSources;
+StructuredBuffer<uint2> VoxelAppearanceRanges;
+StructuredBuffer<uint4> VoxelAppearanceSlots;
 StructuredBuffer<uint2> VoxelBrickDesc;
 StructuredBuffer<uint>  VoxelBrickOcc;
 StructuredBuffer<uint>  VoxelBrickMat;
@@ -3184,6 +3189,29 @@ uint VoxelMarchBrickProbeVoxel(int3 WorldVoxel)
 // THE WALK. A structural mirror of VoxelFluidWalkVoxelLine -- see the long note
 // at the top of this section for why a mirror exists at all and what gates it.
 // Every line that is not the solidity call is that function's line.
+// Presentation coverage never changes occupancy. A rejected face continues
+// the existing integer DDA, including its step budget and brick transitions.
+bool VoxelMarchHasApprovedFoliage(FVoxelMarchChunkCache Chunk,uint Material) {
+    // This predicate controls cutout traversal only, never source color lookup.
+    // At level >=3 the approved coarse footprint is at least .7/.19 >1.8,
+    // so the mask is exactly opaque for broadleaf AND needles at every UV.
+    // Missing/invalid appearance also falls back to opaque. Preserve the near
+    // cutout path; avoid sparse lookup and restore uniform-brick entry hits far away.
+    if(GVoxelMarchRecordLevel>=3u||!Chunk.bValid||!(Material==19u||Material==20u||Material==21u||Material==22u||Material==24u||Material==25u))return false;
+    uint Count,Stride;VoxelAppearanceSlots.GetDimensions(Count,Stride);
+    const uint Slot=Chunk.BrickBase/64u;
+    if(Slot>=Count)return false;
+    return VoxelAppearanceSlots[Slot].y!=0u;
+}
+bool VoxelMarchApprovedFaceCovered(FVoxelMarchChunkCache Chunk,int3 Cell,uint Material,float3 Origin,float3 Dir,float T,int Axis,int Sign) {
+    if(Axis<0||!VoxelMarchHasApprovedFoliage(Chunk,Material))return true;
+    const float3 Fraction=saturate((Origin+Dir*T)/VOXEL_FLUID_VOXEL_UU-float3(Cell-VoxelMarchOriginVoxel()));
+    float3 RGB;float Coverage;float2 UV;
+    if(!VoxelTerrainSurfaceAppearance(VoxelAppearancePages,VoxelAppearanceSources,VoxelAppearanceRanges,
+        VoxelAppearanceSlots[Chunk.BrickBase/64u],Cell,Fraction,uint(Axis),uint(Sign<0),Material,100.0f*float(1u<<(GVoxelMarchRecordLevel&7u)),0.0f,RGB,Coverage,UV))return true;
+    return Coverage>=0.5f;
+}
+
 FVoxelMarchHit VoxelMarchTraverseBrick(float3 OriginLocalUU, float3 DirWorld,
                                        float TMinUU, float TMaxUU, float ConeSlopeUU)
 {
@@ -3338,6 +3366,7 @@ FVoxelMarchHit VoxelMarchTraverseBrick(float3 OriginLocalUU, float3 DirWorld,
 		if (VoxelMarchBrickSolidAt(vNow, Chunk, Brick, Mat))
 #endif
 		{
+			if(!VoxelMarchApprovedFaceCovered(Chunk,vNow,Mat,OriginLocalUU,DirWorld,TMinUU+(TMaxUU-TMinUU)*tLast,axis,step[axis]))continue;
 			H.bHit = true;
 			H.Voxel = vNow;
 			H.FaceAxis = axis;
@@ -3678,13 +3707,15 @@ bool VoxelMarchWalkCellsInBrick(float3 OriginLocalUU, float3 Dir, float TStart, 
 			return false;
 		}
 		const uint CellIndex = VoxelMarchCellIndex(V0);
-		const uint OccWord = VoxelBrickOcc[Brick.OccBase + (CellIndex >> 5u)];
+		uint OccWord=0xffffffffu;
+        if(Brick.Kind!=1u)OccWord=VoxelBrickOcc[Brick.OccBase + (CellIndex >> 5u)];
 		// lint-shader-ub: allow VARIABLE_SHIFT - CellIndex & 31 is 0..31 by construction
 		if ((OccWord & (1u << (CellIndex & 31u))) != 0u)
 		{
 			OutTHit = TStart;
 			OutVoxel = V0;
-			OutMaterial = VoxelMarchMixedMaterial(Brick, CellIndex);
+			OutMaterial=Brick.UniformMat;
+            if(Brick.Kind!=1u)OutMaterial=VoxelMarchMixedMaterial(Brick,CellIndex);
 			// ---- THE FACE, WHICH THIS PATH USED TO LEAVE AT -1 -------------
 			//
 			// A DEFECT, found by reading and living exactly where the dump says
@@ -3726,7 +3757,7 @@ bool VoxelMarchWalkCellsInBrick(float3 OriginLocalUU, float3 Dir, float TStart, 
 				OutFaceAxis = Axis;
 				OutFaceSign = (DirOnAxis > 0.0f) ? 1 : -1;
 			}
-			return true;
+			if(VoxelMarchApprovedFaceCovered(Chunk,OutVoxel,OutMaterial,OriginLocalUU,Dir,OutTHit,OutFaceAxis,OutFaceSign))return true;
 		}
 	}
 
@@ -3848,7 +3879,8 @@ bool VoxelMarchWalkCellsInBrick(float3 OriginLocalUU, float3 Dir, float TStart, 
 			return false;
 		}
 		const uint CellIndex = VoxelMarchCellIndex(VNow);
-		const uint OccWord = VoxelBrickOcc[Brick.OccBase + (CellIndex >> 5u)];
+		uint OccWord=0xffffffffu;
+        if(Brick.Kind!=1u)OccWord=VoxelBrickOcc[Brick.OccBase + (CellIndex >> 5u)];
 		// lint-shader-ub: allow VARIABLE_SHIFT - CellIndex & 31 is 0..31 by construction
 		if ((OccWord & (1u << (CellIndex & 31u))) != 0u)
 		{
@@ -3856,8 +3888,9 @@ bool VoxelMarchWalkCellsInBrick(float3 OriginLocalUU, float3 Dir, float TStart, 
 			OutVoxel = VNow;
 			OutFaceAxis = axis;
 			OutFaceSign = step[axis];
-			OutMaterial = VoxelMarchMixedMaterial(Brick, CellIndex);
-			return true;
+			OutMaterial=Brick.UniformMat;
+            if(Brick.Kind!=1u)OutMaterial=VoxelMarchMixedMaterial(Brick,CellIndex);
+			if(VoxelMarchApprovedFaceCovered(Chunk,OutVoxel,OutMaterial,OriginLocalUU,Dir,OutTHit,OutFaceAxis,OutFaceSign))return true;
 		}
 	}
 	return false;
@@ -4470,7 +4503,7 @@ FVoxelMarchHit VoxelMarchTraverseBrickHierWatch(float3 OriginLocalUU, float3 Dir
 				t = tBrickNext;      // uniform AIR: 512 voxels, no occupancy fetch
 				continue;
 			}
-			if (Brick.Kind == 1u)
+			if (Brick.Kind == 1u && !VoxelMarchHasApprovedFoliage(Chunk,Brick.UniformMat))
 			{
 				// Uniform SOLID. The hit is the brick's ENTRY, and the face is
 				// the one the ray crossed to get in.

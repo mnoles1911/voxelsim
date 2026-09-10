@@ -13,11 +13,15 @@ in vec3 aNormal;
 in vec3 aOffset;
 in vec3 aColor;
 uniform mat4 uMVP;
+uniform bool uPawn;
+uniform vec3 uPartSize;
+uniform vec3 uPartOffset;
+uniform vec3 uPartColor;
 out vec3 vColor;
 out vec3 vNormal;
 void main() {
-  gl_Position = uMVP * vec4(aPos + aOffset, 1.0);
-  vColor = aColor;
+  gl_Position = uMVP * vec4(uPawn ? aPos * uPartSize + uPartOffset : aPos + aOffset, 1.0);
+  vColor = uPawn ? uPartColor : aColor;
   vNormal = aNormal;
 }`;
 
@@ -35,6 +39,17 @@ void main() {
 }`;
 
 type Vec3 = [number, number, number];
+
+// Metres, feet at zero. Matches VoxelProxyBody.cpp's standing six-box pawn
+// and VoxelMovementTuning.h's 1.8 m height / 0.6 m total width.
+export const PLAYER_PARTS: { min: Vec3; size: Vec3; color: Vec3 }[] = [
+  { min: [-0.20, -0.20, 0.80], size: [0.40, 0.40, 0.70], color: [0.20, 0.35, 0.55] },
+  { min: [-0.16, -0.15, 1.52], size: [0.32, 0.30, 0.28], color: [0.85, 0.70, 0.55] },
+  { min: [-0.14, -0.30, 0.75], size: [0.28, 0.14, 0.70], color: [0.55, 0.30, 0.15] },
+  { min: [-0.14, 0.16, 0.75], size: [0.28, 0.14, 0.70], color: [0.55, 0.30, 0.15] },
+  { min: [-0.14, -0.21, 0], size: [0.28, 0.20, 0.80], color: [0.55, 0.30, 0.15] },
+  { min: [-0.14, 0.01, 0], size: [0.28, 0.20, 0.80], color: [0.55, 0.30, 0.15] },
+];
 
 function cubeGeometry() {
   const faces: [Vec3, Vec3[]][] = [
@@ -151,7 +166,8 @@ function instanceAttrib(
 }
 
 export interface VoxelViewer {
-  setInstances(offsets: Float32Array, colors: Uint8Array, dims: Vec3): void;
+  setInstances(offsets: Float32Array, colors: Uint8Array, dims: Vec3, voxelCm?: number): void;
+  setPawnVisible(visible: boolean): void;
   reset(): void;
   /** Multiply the orbit distance: factor < 1 zooms in, > 1 out. */
   zoom(factor: number): void;
@@ -179,6 +195,13 @@ export function createViewer(canvas: HTMLCanvasElement): VoxelViewer | null {
 
   const uMVP = gl.getUniformLocation(prog, "uMVP");
   const uLight = gl.getUniformLocation(prog, "uLight");
+  const uPawn = gl.getUniformLocation(prog, "uPawn");
+  const uPartSize = gl.getUniformLocation(prog, "uPartSize");
+  const uPartOffset = gl.getUniformLocation(prog, "uPartOffset");
+  const uPartColor = gl.getUniformLocation(prog, "uPartColor");
+  let pawnVisible = true;
+  let pawnOrigin: Vec3 = [0, 0, 0];
+  let unitsPerMeter = 0;
 
   const state = {
     count: 0,
@@ -190,7 +213,7 @@ export function createViewer(canvas: HTMLCanvasElement): VoxelViewer | null {
     dirty: true,
   };
 
-  function setInstances(offsets: Float32Array, colors: Uint8Array, dims: Vec3) {
+  function setInstances(offsets: Float32Array, colors: Uint8Array, dims: Vec3, voxelCm?: number) {
     gl!.bindVertexArray(vao);
     instanceAttrib(gl!, prog, "aOffset", offsetBuf, offsets, 3, gl!.FLOAT, false);
     instanceAttrib(gl!, prog, "aColor", colorBuf, colors, 3, gl!.UNSIGNED_BYTE, true);
@@ -199,8 +222,21 @@ export function createViewer(canvas: HTMLCanvasElement): VoxelViewer | null {
     // between a species' seeds compares them from the exact same viewpoint.
     const ratio = state.count > 0 ? state.radius / state.home : 1;
     state.count = offsets.length / 3;
+    unitsPerMeter = voxelCm && Number.isFinite(voxelCm) && voxelCm > 0 ? 100 / voxelCm : 0;
+    let floor = Infinity;
+    let right = -Infinity;
+    for (let i = 0; i < offsets.length; i += 3) {
+      right = Math.max(right, offsets[i] + 1);
+      floor = Math.min(floor, offsets[i + 2]);
+    }
+    pawnOrigin = [right + 0.8 * unitsPerMeter, dims[1] / 2, floor];
     state.center = [dims[0] / 2, dims[1] / 2, dims[2] / 2];
-    state.home = Math.max(...dims) * 1.5;
+    // Reserve the reference's space even when hidden, so toggling never moves the camera.
+    const framed: Vec3 = unitsPerMeter && state.count
+      ? [Math.max(dims[0], pawnOrigin[0] + 0.3 * unitsPerMeter), dims[1], Math.max(dims[2], floor + 1.8 * unitsPerMeter)]
+      : dims;
+    state.center = [framed[0] / 2, framed[1] / 2, framed[2] / 2];
+    state.home = Math.max(...framed) * 1.5;
     state.radius = state.home * ratio;
     state.dirty = true;
   }
@@ -235,7 +271,17 @@ export function createViewer(canvas: HTMLCanvasElement): VoxelViewer | null {
     gl!.uniformMatrix4fv(uMVP, false, multiply(proj, view));
     gl!.uniform3fv(uLight, norm([0.45, 0.35, 0.82]));
     gl!.bindVertexArray(vao);
+    gl!.uniform1i(uPawn, 0);
     gl!.drawArraysInstanced(gl!.TRIANGLES, 0, 36, state.count);
+    if (pawnVisible && unitsPerMeter) {
+      gl!.uniform1i(uPawn, 1);
+      for (const part of PLAYER_PARTS) {
+        gl!.uniform3fv(uPartSize, part.size.map(n => n * unitsPerMeter));
+        gl!.uniform3fv(uPartOffset, part.min.map((n, i) => pawnOrigin[i] + n * unitsPerMeter));
+        gl!.uniform3fv(uPartColor, part.color);
+        gl!.drawArraysInstanced(gl!.TRIANGLES, 0, 36, 1);
+      }
+    }
   }
 
   /* Input: drag to orbit, wheel or pinch to zoom. Every pointer is tracked so
@@ -317,6 +363,10 @@ export function createViewer(canvas: HTMLCanvasElement): VoxelViewer | null {
 
   return {
     setInstances,
+    setPawnVisible(visible: boolean) {
+      pawnVisible = visible;
+      state.dirty = true;
+    },
     reset() {
       state.azimuth = -0.9;
       state.elevation = 0.45;

@@ -1,0 +1,157 @@
+{
+  "status": "passed pilot review",
+  "source": "https://plants.ces.ncsu.edu/plants/iris-pseudacorus/",
+  "viewed_photos": [
+    "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Iris_pseudacorus_for_c34ogrp1bMHo.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=tM6PPKvuB1LqjO3%2BpUy%2B58zyjRs%3D&Expires=1788863419"
+  ],
+  "photo_reviewer": "Astra understory agent actual browser photo inspection",
+  "photo_observations": {
+    "observations": "Actual Jorg Hempel stand photograph viewed: flat sword-like basal fans, yellow drooping outer falls on separate stems. NCStateApril-June flowers75-100mm. Choose0.9m fresh fans and sparse attached80mm yellow iris blossoms; no seed capsules.",
+    "viewed_photos": [
+      "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Iris_pseudacorus_for_c34ogrp1bMHo.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=tM6PPKvuB1LqjO3%2BpUy%2B58zyjRs%3D&Expires=1788863419"
+    ],
+    "source": "https://plants.ces.ncsu.edu/plants/iris-pseudacorus/"
+  },
+  "findings": "Inspected all36current variants and seeds1/4/7 at small/medium/large scales. Sparse attached yellow blossoms with three bent outer falls and shorter inner standards above fresh sword fans47-97cm. April-June bloom supported.75-100mm flowers are3-4cells, fine iris folds simplified; no capsules.",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "batch_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+  ],
+  "generator_digest": "de298abd6eb0a3566eaf9ae1d164976922307ba94e359241271c210e8fe94645",
+  "sheet_hash": "9d6f4e38e98fdc4b6773870a9b1d5a0f2803c1611a7665cecbacbb594ddefe29",
+  "reviewed_at": 1788861145.653582,
+  "pilot_hashes": {
+    "1": "4617af733cdd882a439d64b7698dbe3ceea898221569fee54fc60c9955a73f76",
+    "4": "7b4367476928e19d1c26eddcad9acf85ef6a40629adfcde7650d3845e023d124",
+    "7": "62c0e68fd9e5f8ccc125b0f26ef760fb69699454021c347a226b0fea83fd3f36"
+  },
+  "profile": "yellow-flag-iris",
+  "review_date": "2026-09-08",
+  "additional_sources": [],
+  "reference_catalog_photos": [
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Iris_pseudacorus_for_c34ogrp1bMHo.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=tM6PPKvuB1LqjO3%2BpUy%2B58zyjRs%3D&Expires=1788863419",
+      "caption": "Form",
+      "credit": "Jorg Hempel",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/3.0/deed.en'>CC BY-SA 3.0</a>",
+      "image_id": "19657"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Iris_pseudacorus_flo_EhwMfwKo6XE2.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=xZuP1XdD%2BiC2L1xMOY6lh9J5BvQ%3D&Expires=1788863419",
+      "caption": "Close up of flower",
+      "credit": "H. Zell",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/3.0/deed.en'>CC BY-SA 3.0</a>",
+      "image_id": "19658"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/iris-1422563_1280_WLW8gdxbQb6o.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=gHCiOL3v4py538RtUoz3fpArTwU%3D&Expires=1788863419",
+      "caption": "Leaf and flower closeup",
+      "credit": "DEZALB",
+      "license": "<a href='https://creativecommons.org/publicdomain/zero/1.0/'>CC0 1.0</a>",
+      "image_id": "19659"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Iris_pseudacorus-Yel_T2Z2tLPt6f8d.jfif?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=Tj8a6mse7QzqQ34406U2PG6bQEQ%3D&Expires=1788863419",
+      "caption": "flower, Warren County, NC",
+      "credit": "Cathy Dewitt",
+      "license": "<a href='http://creativecommons.org/licenses/by/4.0/legalcode'>CC BY 4.0</a>",
+      "image_id": "23055"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Iris-x-pseudata-Kimb_dpDS4c75ERPD.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=ItB7IJDPRsU39nikQmCltWDzc%2Bw%3D&Expires=1788863419",
+      "caption": "Iris - x - Pseudata - Kinboshi - Sunken Garden , Wake County",
+      "credit": "Cathy Dewitt",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc/4.0/legalcode'>CC BY-NC 4.0</a>",
+      "image_id": "33374"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Iris-x-pseudata-Kimb_HSeLXAyPif5E.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=bPlHNrlmwmzsmAj2GEiHE6sUeks%3D&Expires=1788863419",
+      "caption": "Iris - x - Pseudata - Kimboshi - Sunken Garden, Wake County",
+      "credit": "Cathy Dewitt",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc/4.0/legalcode'>CC BY-NC 4.0</a>",
+      "image_id": "33375"
+    }
+  ],
+  "taxon": "Iris pseudacorus",
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "9d6f4e38e98fdc4b6773870a9b1d5a0f2803c1611a7665cecbacbb594ddefe29"
+  }
+}

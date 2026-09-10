@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "revision": "temperate-ecology-authoring-v1",
+  "species": "wood-sedge",
+  "kind": "grass",
+  "cover_role": "shade",
+  "community_weights_per_mille": {
+    "oak-beech": 500,
+    "maple-beech": 500,
+    "coastal-conifer": 500,
+    "pine-birch": 500,
+    "riparian": 500,
+    "warm-dry": 500,
+    "east-asian": 500,
+    "wet-mild": 500
+  },
+  "trunk_exclusion_mm": 100,
+  "crown_opacity_per_mille": 0,
+  "reference_review": "reference-review.json",
+  "placement_references": [],
+  "status": "authored_initial_placement_targets_pending_world_visual_review",
+  "notes": [
+    "Instanced non-colliding understory; no voxel-level destruction.",
+    "Water/depth gates are mandatory; wetland role alone does not establish suitability.",
+    "Weights are authored game targets. Broad default communities need regional refinement.",
+    "No seasonal simulation or recoloring."
+  ]
+}

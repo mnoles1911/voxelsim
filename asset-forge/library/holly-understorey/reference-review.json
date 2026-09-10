@@ -1,0 +1,312 @@
+{
+  "status": "passed pilot review",
+  "source": "https://plants.ces.ncsu.edu/plants/ilex-aquifolium/",
+  "viewed_photos": [
+    "Growth habit, foreground - Peter Birch",
+    "Foliage and fruit - Iain Turner; leaf shape only, winter berries excluded"
+  ],
+  "findings": "Compared the irregular multi-shoot woodland understorey habit and leathery elliptic leaf photograph to current size pilots 1/4/7 and every entry in the 36 sheet. Attached twig foliage and uneven upper leaders maintain openings through the shrub, replacing spherical leaf volumes. The selected asset is an understory shrub, not the mature single-trunk holly tree form. Spring evergreen foliage has no modeled red winter fruit. Individual spines and waxy reflections are below the geometry/current material representation; the 85 mm leaf envelope is retained. Heights approximately 1.7-3.75 m. Accepted the architecture as a stylized forest holly source; detailed species color treatment remains separate.",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "batch_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+  ],
+  "generator_digest": "e056afb92497a9b3929ad8dae0fc3015e351f3c64d4450e55b46312bcb97971b",
+  "sheet_hash": "c6d42dead86f91bbe4b43bb76ff08625557ab59335feaee06cd62b4c19a205b1",
+  "reviewed_at": 1788846687.9374626,
+  "pilot_hashes": {
+    "1": "761502cf5f6cc3fec4fefc24a10df77b12eace65c2a3548ac31e95f783495066",
+    "4": "b64b4bf573bd60b2c3b5ff41d1df7bcd6caa838b5d2dc8a1fcd67a20594e3719",
+    "7": "ec4cace7cc4843a5d51229c55ea96d164cafaf72e247710f99868e9f9c880c2d"
+  },
+  "profile": "holly-understorey",
+  "review_date": "2026-09-08",
+  "additional_sources": [],
+  "reference_catalog_photos": [
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Ilex-aquifolium--Peter-Birch--cc-by-nc-nd-2-0.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=W%2FDQHse8POfT5M%2FZXekcXt6ZPZ4%3D&Expires=1788849621",
+      "caption": "Growth habit, foreground",
+      "credit": "Photo by Peter Birch",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc-nd/2.0/legalcode'>CC BY-NC-ND 2.0</a>",
+      "image_id": "5277"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Ilex-aquifolium--Iain-Turner--cc-by-nc-sa-s-0.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=JZ8Xph0887qg5gfqYKzMeaWXMyU%3D&Expires=1788849622",
+      "caption": "Foliage and fruit",
+      "credit": "Photo by Iain Turner",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc-sa/2.0/legalcode'>CC BY-NC-SA 2.0</a>",
+      "image_id": "5276"
+    }
+  ],
+  "taxon": "Ilex aquifolium",
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "c6d42dead86f91bbe4b43bb76ff08625557ab59335feaee06cd62b4c19a205b1"
+  },
+  "identity_revalidations": [
+    {
+      "previous_digest": "241e180fe8b6c29231461c5e37c307217348f3f2cd51279196bf031fed17e914",
+      "new_digest": "e056afb92497a9b3929ad8dae0fc3015e351f3c64d4450e55b46312bcb97971b",
+      "timestamp": 1788847603.8007116,
+      "method": "Every saved VXA rebuilt to identical SHA-256; original files and all user decisions preserved",
+      "variants": [
+        {
+          "id": "holly-understorey-0001",
+          "seed": 1,
+          "hash": "761502cf5f6cc3fec4fefc24a10df77b12eace65c2a3548ac31e95f783495066"
+        },
+        {
+          "id": "holly-understorey-0002",
+          "seed": 2,
+          "hash": "95190ca74a8c53be029d60bca179ed204c6ed79e01e6d75d353c531425e20afd"
+        },
+        {
+          "id": "holly-understorey-0003",
+          "seed": 3,
+          "hash": "e39f61a743ebf8708c07fbfde9f83fbd73f35103488dbfcd1806286f88894406"
+        },
+        {
+          "id": "holly-understorey-0004",
+          "seed": 4,
+          "hash": "b64b4bf573bd60b2c3b5ff41d1df7bcd6caa838b5d2dc8a1fcd67a20594e3719"
+        },
+        {
+          "id": "holly-understorey-0005",
+          "seed": 5,
+          "hash": "3677a6814013c2a184d83586f1132ee787a12e541edc576e479a5281464b72fb"
+        },
+        {
+          "id": "holly-understorey-0006",
+          "seed": 6,
+          "hash": "5ff0ae7265ed01bcf6e61027d194f426d2a6a9cd442e8b6350566fe8a75cafca"
+        },
+        {
+          "id": "holly-understorey-0007",
+          "seed": 7,
+          "hash": "ec4cace7cc4843a5d51229c55ea96d164cafaf72e247710f99868e9f9c880c2d"
+        },
+        {
+          "id": "holly-understorey-0008",
+          "seed": 8,
+          "hash": "bd89405bceac1b0e89ca4a0f656c4a9b773eb813cf565e225a90cf7d4a79bf9e"
+        },
+        {
+          "id": "holly-understorey-0009",
+          "seed": 9,
+          "hash": "12bd275407dd39c61bf00937a2fb7d52ca324383f2767f426719c5e0dfa48922"
+        },
+        {
+          "id": "holly-understorey-0010",
+          "seed": 10,
+          "hash": "3f87728bc97587b63f7ade36319d9f5956b75d2f458165e56785655409a98665"
+        },
+        {
+          "id": "holly-understorey-0011",
+          "seed": 11,
+          "hash": "da34310399ed85362b407ea47231327eb560dafb4073614ec347be765433c4a5"
+        },
+        {
+          "id": "holly-understorey-0012",
+          "seed": 12,
+          "hash": "d536cfb61b88354c03f2e24a0347208bf89fe0b9023426c55af2d57fc908a6c6"
+        },
+        {
+          "id": "holly-understorey-0013",
+          "seed": 13,
+          "hash": "76e262d8153b43f3e0adf7c92a9ff91ab4bd565db9831045462699fa3fa9f876"
+        },
+        {
+          "id": "holly-understorey-0014",
+          "seed": 14,
+          "hash": "1abfeb13767848854834c4a158c1995955981e0b8c690923240c0ead3952a8cc"
+        },
+        {
+          "id": "holly-understorey-0015",
+          "seed": 15,
+          "hash": "ade9d39e3e6108bd4b7a2224240472c3784c184cad9246171104cc9016108e47"
+        },
+        {
+          "id": "holly-understorey-0016",
+          "seed": 16,
+          "hash": "f78be4c5c256641df4a00176b1a9bccf2fe8d48998813fee9a2d8eece92da2cb"
+        },
+        {
+          "id": "holly-understorey-0017",
+          "seed": 17,
+          "hash": "fe5bccf453b159c515931807a0f47b359dca7ea72999af62a2fef5428a5b7c70"
+        },
+        {
+          "id": "holly-understorey-0018",
+          "seed": 18,
+          "hash": "051df4d1765e7001de2b6dca5ffdc2863f68b04fdfe5862b5c86c83265dfa20c"
+        },
+        {
+          "id": "holly-understorey-0019",
+          "seed": 19,
+          "hash": "171c439f897eb22f17aed7b24bf169d258f6efb2ea3ded8005a1d08d6c8564d7"
+        },
+        {
+          "id": "holly-understorey-0020",
+          "seed": 20,
+          "hash": "62221451431cfd5792d7070b4c1412843465527db70d54df4b7ded2ec766f967"
+        },
+        {
+          "id": "holly-understorey-0021",
+          "seed": 21,
+          "hash": "2172e901afe4b3c8f9ce983bc229d3c10caf2feee5f0c31e0152e97f8afa2cdf"
+        },
+        {
+          "id": "holly-understorey-0022",
+          "seed": 22,
+          "hash": "fbbab98e29e4234f4301ca5b4ae4269f03b073ac0dab2c74cdacd8a5124bc125"
+        },
+        {
+          "id": "holly-understorey-0023",
+          "seed": 23,
+          "hash": "414fc4150c8382d947779d029b120c56984bd3b9b1987b1a5bc87afe0bfcc94e"
+        },
+        {
+          "id": "holly-understorey-0024",
+          "seed": 24,
+          "hash": "a099de0f07fabdf8c2083327948dd2b03cfe83664c4e51d4d2c0cd5ada325a82"
+        },
+        {
+          "id": "holly-understorey-0025",
+          "seed": 25,
+          "hash": "c12f01d5376bb7c7161f9b3f4b168d8bc7fc695e7b76526728e54f80ea6ca064"
+        },
+        {
+          "id": "holly-understorey-0026",
+          "seed": 26,
+          "hash": "1e3842448fec667d4c50d2f647f1d03021e4437ec088bec4728d8bf010174bf1"
+        },
+        {
+          "id": "holly-understorey-0027",
+          "seed": 27,
+          "hash": "f5e0ce1e5af1a79b43bdf0c4eeaa5803c3db211e5ca2f82134f217bc6d99e21b"
+        },
+        {
+          "id": "holly-understorey-0028",
+          "seed": 28,
+          "hash": "d43cc514f1dc340f918dd26d5243277491661ffb8e66a239d4a1e80ddcf39f10"
+        },
+        {
+          "id": "holly-understorey-0029",
+          "seed": 29,
+          "hash": "ca4156f8b276faff11da409eac5da383b9571ee64fc7eb8a7b1ec7d5ef7a8693"
+        },
+        {
+          "id": "holly-understorey-0030",
+          "seed": 30,
+          "hash": "f8ee8b046709b0b2887a38c5c1c0a211a71b9b19acc8ff6e66751d44bc3fda7c"
+        },
+        {
+          "id": "holly-understorey-0031",
+          "seed": 31,
+          "hash": "ff5049cab50592e92e4a4d5f549c1a1ea23df30d5460a95eb2672e7dedfb317f"
+        },
+        {
+          "id": "holly-understorey-0032",
+          "seed": 32,
+          "hash": "71cb769ffcd6d1098330393a8450c9b274772047ed2713e5fd6a29ba82285b83"
+        },
+        {
+          "id": "holly-understorey-0033",
+          "seed": 33,
+          "hash": "ff22d7ac54fdce364657cea14f09000c0139e19c2272e87915d763479051fa7f"
+        },
+        {
+          "id": "holly-understorey-0034",
+          "seed": 34,
+          "hash": "8e6cf2c075fa2efedec794f248206c2cfd1b124a13c3a5a1f853d36ad04fc673"
+        },
+        {
+          "id": "holly-understorey-0035",
+          "seed": 35,
+          "hash": "76fdde2c70e1613f65d26fd282a4ac4b839544d10960873b13280031a12bb168"
+        },
+        {
+          "id": "holly-understorey-0036",
+          "seed": 36,
+          "hash": "a11ea717a59014cb19a4f6b30bd100ac611124c31f3c19b7b695ba156d172747"
+        }
+      ]
+    }
+  ]
+}

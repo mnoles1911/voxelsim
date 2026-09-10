@@ -1,4 +1,39 @@
 {
+  "artifact": {
+    "asym_vox": 0.8,
+    "beam_m": 0.85,
+    "bilge": 2.6,
+    "billow_m": 0.16,
+    "crossbar_at": 0.42,
+    "deck_frac": 0.07,
+    "depth_m": 0.35,
+    "droop_m": 0.3,
+    "entry": 0.62,
+    "form": "hull",
+    "frame_at": 0.34,
+    "frame_base_m": 0.95,
+    "frame_drop_m": 1.15,
+    "frame_r_m": 0.03,
+    "fullness": 2.4,
+    "gunwale_m": 0.06,
+    "gunwale_vox": 1,
+    "keel_m": 0.45,
+    "keel_r_m": 0.04,
+    "length_m": 4.0,
+    "panel_vox": 2,
+    "rocker": 0.14,
+    "seat": true,
+    "seat_len_m": 0.8,
+    "sheer": 0.35,
+    "shell_vox": 2,
+    "spar_r_m": 0.045,
+    "strake_share": 0.25,
+    "sweep": 0.85,
+    "taper": 0.3,
+    "thwart_t_m": 0.05,
+    "thwart_w_m": 0.1,
+    "thwarts": 2
+  },
   "biomes": {
     "bare_rock": 0.0,
     "beach": 0.0,
@@ -82,6 +117,13 @@
     "shell_upper": 0.55,
     "squash": 1.0
   },
+  "curation": {
+    "notes": "Reference-reviewed spring source; endorse variants individually in Forge.",
+    "seeds": [
+      1
+    ],
+    "status": "draft"
+  },
   "detail": {
     "depth_max_m": 6.0,
     "depth_min_m": 0.3,
@@ -111,6 +153,7 @@
     "caudal_shape": "forked",
     "caudal_span": 1.15,
     "caudal_upper": 0.0,
+    "claspers": 0.0,
     "curve_amount": 0.0,
     "curve_at": 0.55,
     "depth_at": 0.36,
@@ -204,7 +247,7 @@
     "step_m": 0.35,
     "tip_radius_m": 0.045
   },
-  "height_m": 0.25,
+  "height_m": 0.28,
   "herd": {
     "cover": "any",
     "despawn_delay_s": 20.0,
@@ -242,7 +285,9 @@
     "fish_flank": "skin_silver",
     "fish_patch": "skin_pale",
     "fish_pattern": "skin_dark",
+    "frame": "beak_horn",
     "head": "plume_white",
+    "hull": "heartwood",
     "leaf": "leaf_broadleaf",
     "quad_back": "skin_brown",
     "quad_belly": "skin_pale",
@@ -253,18 +298,27 @@
     "quad_mark": "skin_dark",
     "quad_tail": "skin_brown",
     "rock": "rock",
-    "stem": "leaf_broadleaf"
+    "stem": "leaf_broadleaf",
+    "strake": "deadwood",
+    "trim": "bark"
   },
   "name": "lily-of-the-valley",
-  "notes": "TWO LEAVES AND ONE ARCH, and the generator has one arc for the whole clump. In life the leaves stand and only the flowering stem bends over behind them; here every stem shares `tuft.arc`, so the compromise is a middling arc on very few, very broad stems -- the leaves lean a little more than they should and the bell stem a little less. That is the one real loss in this spec and it is recorded rather than tuned around.\n\nWhat does carry: the count. Three or four stems is the whole plant, the widest stems on the page at 0.10 m, and one narrow one in three carrying a short one-sided run of white bells. It carpets under beech, so the spacing is 0.45 m -- below the old 0.5 floor and meant, because one plant is two leaves wide and a colony is continuous ground cover with no soil showing.",
+  "notes": "Spring understory source for Convallaria majalis; architecture: convallaria. Metric geometry at 25 mm cubic voxels. Species baseline and generator define the source; numbered seeds generate variants. User endorsement remains separate from source review.",
   "placement": {
     "abundance": 0.7,
     "cluster": 0.95,
     "elev_max_m": 900.0,
     "elev_min_m": 0.0,
     "slope_max_pct": 45.0,
+    "slope_min_pct": 0.0,
     "spacing_m": 0.45,
     "water_max_m": 0.0
+  },
+  "plant_recipe": {
+    "form": "mixed",
+    "generator": "temperate-understory-v1",
+    "profile": "lily-of-the-valley",
+    "size": "mixed"
   },
   "quad": {
     "belly": 0.52,
@@ -331,7 +385,7 @@
     "waist": 0.94,
     "width": 0.62
   },
-  "resolution_cm": "5",
+  "resolution_cm": "2.5",
   "rock": {
     "angular": 0.45,
     "arch": 0.0,
@@ -405,6 +459,7 @@
     "lobe_depth": 0.18,
     "lobes": 0,
     "radius_base_m": 0.3,
+    "taper": 0.5,
     "wander": 0.15
   },
   "tuft": {

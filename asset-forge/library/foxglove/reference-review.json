@@ -1,0 +1,151 @@
+{
+  "status": "passed pilot review",
+  "source": "https://plants.ces.ncsu.edu/plants/digitalis-purpurea/",
+  "viewed_photos": [
+    "Parent Gery flower close-up",
+    "Nevit Dilmen full flowering plants",
+    "Evelyn Simak flower detail"
+  ],
+  "findings": "Basal rosette, smaller cauline leaves, tall one-sided dense tubular raceme. Generic giant leaves and four tiny bells rejected. Dedicated digitalis staged. Current seeds 1, 4 and 7 and every panel in the 36-seed contact sheet were visually inspected. Basal rosettes have bounded leaf lengths, smaller cauline leaves and tall one-sided pink racemes. The 0.78\u20131.60 m forms retain varied height and lean. Individual tubular cavities and spotting remain unresolved; low connecting geometry requires soil embedding. Accepted as a coarse stylized spring source at 25 mm; user endorsement remains separate.",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "batch_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+  ],
+  "generator_digest": "59dcf6b313f5e27adbed7a4c9d045842fe943d22b0cb11b0e6b919a3f691edd8",
+  "sheet_hash": "06c305fb12ad41d042984efc2e3a8b8c591b07278310907e8a0826b6baa53267",
+  "reviewed_at": 1788854429.2572508,
+  "pilot_hashes": {
+    "1": "450a924be8f609a051261da222ead35dfc5292698d34205d5c43d0c722fb753e",
+    "4": "682f882e167a3886bd54aa8381871c6bf3de5032e8b6ac7ae6f11a0a8c41b26e",
+    "7": "2ddadfb8e4390cd6c75d6c157634fae45ad53f2aa65f0f9a922a790df122a8d9"
+  },
+  "profile": "foxglove",
+  "review_date": "2026-09-08",
+  "additional_sources": [],
+  "reference_catalog_photos": [
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Digitalis_purpurea_L_MYDZRfiM10nW.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=4lI7aymNF1Mtbdp%2B3hYXWRoVx3M%3D&Expires=1788856152",
+      "caption": "Digitalis purpurea",
+      "credit": "Parent Gery",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/3.0/deed.en'>CC BY-SA 3.0</a>",
+      "image_id": "33682"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Digitalis_purpurea__WEHK3fx5gh79.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=pFYnKP5B8828m0TC9EVkRPjBUjc%3D&Expires=1788856152",
+      "caption": "Digitalis purpurea",
+      "credit": "Nevit Dilmen",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/3.0/deed.en'>CC BY-SA 3.0</a>",
+      "image_id": "33407"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Digitalis_purpurea_E_yUVmBYVXsWuP.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=tWemyGT%2B56mhxEuwVh0%2Fh8tPw2s%3D&Expires=1788856152",
+      "caption": "Digitalis purpurea",
+      "credit": "Evelyn Simak",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/2.0/'>CC-BY-SA 2.0</a>",
+      "image_id": "33408"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Digitalis_purpurea_H_C6oyvxqSpCfp.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=hJ7fftTRHa9gpUcYft5PDwmDrlk%3D&Expires=1788856152",
+      "caption": "Digitalis purpurea",
+      "credit": "H. Zell",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/3.0/deed.en'>CC BY-SA 3.0</a>",
+      "image_id": "33410"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Digitalis_purpurea_J_LyTm4kQ6k60p.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=LOSsa%2FdqFAzJnQ%2BSj5%2FE%2BM47tz4%3D&Expires=1788856152",
+      "caption": "Digitalis purpurea",
+      "credit": "Jcart1534",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/3.0/deed.en'>CC BY-SA 3.0</a>",
+      "image_id": "33411"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Digitalis_Purpurea_M_1vd4GoJCtlqF.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=2HVE1vK%2F26LUpVXPUeK8O%2BgN%2Bys%3D&Expires=1788856152",
+      "caption": "Digitalis purpurea",
+      "credit": "Matthijs van den Berg",
+      "license": "<a href='http://creativecommons.org/licenses/by-sa/4.0/legalcode'>CC BY-SA 4.0</a>",
+      "image_id": "33412"
+    }
+  ],
+  "taxon": "Digitalis purpurea",
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "06c305fb12ad41d042984efc2e3a8b8c591b07278310907e8a0826b6baa53267"
+  }
+}

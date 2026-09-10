@@ -1,0 +1,89 @@
+{
+  "species": "wild-pear",
+  "status": "passed pilot review",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "findings": [
+    "Upright pear crown contrasts with broad crab apple; references include a narrow individual and a broad old tree, supporting the seeded shape range."
+  ],
+  "reviewed_images": [
+    {
+      "image_id": "vienna-pyrus-pyraster",
+      "source": "https://bdc.univie.ac.at/fileadmin/user_upload/i_bdc/dashboard/Pyruspyraster.html",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    },
+    {
+      "image_id": "pladias-pyraster11",
+      "source": "https://bdc.univie.ac.at/fileadmin/user_upload/i_bdc/dashboard/Pyruspyraster.html",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    }
+  ],
+  "taxon": "pyrus-pyraster",
+  "sources": [
+    "https://www.rhs.org.uk/plants/69543/pyrus-pyraster/details",
+    "https://bdc.univie.ac.at/fileadmin/user_upload/i_bdc/dashboard/Pyruspyraster.html"
+  ],
+  "habitat": "edge",
+  "art_baseline": {
+    "season": "spring",
+    "foliage": "Species-appropriate spring foliage and fresh growth; flowering only where appropriate to the species.",
+    "reference_policy": "Use spring photographs for finished color and foliage. Other seasons may inform branch structure only.",
+    "out_of_scope": [
+      "seasonal transitions",
+      "seasonal recoloring"
+    ]
+  },
+  "generator_digest": "6d0b2c04db2c83b942e5b228219a87f514e03cf06752831f8ac02256fa4cfa85",
+  "review_date": "2026-09-07",
+  "review_scope": "Stylized spring vertical slice; source acceptance is separate from world variant endorsement.",
+  "pilot_artifacts": {
+    "1": "33d2f908f131057b25b25a78849a0188dbfa3c24a3a69f443d7aac8891059f53",
+    "4": "d3d1dc691c96fd03de2073e7be90c69d15672b3095d556632c0b6a6bf39956c3",
+    "7": "fa835c188f47fa69361fa87f91462e01451e9280fdeb853fb6f13945de062d84"
+  },
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "8a976cc96790634e0cfd6729b468ed91a546a13a54d56e5a4eb61a1c6315d5e9"
+  }
+}

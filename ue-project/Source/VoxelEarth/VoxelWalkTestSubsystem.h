@@ -30,6 +30,7 @@
 
 class AVoxelEarthFlyPawn;
 class UVoxelCharacterMovementComponent;
+class FVoxelEcologicalRoute;
 
 VOXELEARTH_API DECLARE_LOG_CATEGORY_EXTERN(LogVoxelWalkTest, Log, All);
 
@@ -67,7 +68,10 @@ private:
 	AVoxelEarthFlyPawn* GetPawn() const;
 	UVoxelCharacterMovementComponent* GetMover() const;
 
+	TSharedPtr<FVoxelEcologicalRoute> EcologicalRoute;
 	bool bArmed = false;
+	bool bWaitForEcology = false;
+	double EcologyQuietSince = -1.0;
 	float StartDelaySeconds = 0.f;
 	double ElapsedSeconds = 0.0;
 

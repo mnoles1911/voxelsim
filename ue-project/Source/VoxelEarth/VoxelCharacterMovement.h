@@ -154,6 +154,7 @@ public:
 	void DebugDrawVolume(double EyeWorldZ) const;
 
 private:
+	void StepMovement(float DeltaTime);
 	// --- Voxel collision primitives (moved verbatim from the pawn) ---------
 
 	// Sweeps the collision box along a single world axis (0=X, 1=Y, 2=Z) by
@@ -218,6 +219,7 @@ private:
 	// jump so the coyote window cannot be spent twice in one airtime.
 	double TimeSinceGroundedSeconds = 0.0;
 	double JumpBufferRemainingSeconds = 0.0;
+	bool bJumpRequestFresh = false;
 	bool bJumpKeyHeld = false;
 
 	// Known-floor memory (see the known-floor rule in TickMovement). Set the

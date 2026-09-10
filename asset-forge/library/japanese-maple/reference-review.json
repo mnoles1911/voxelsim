@@ -1,0 +1,89 @@
+{
+  "species": "japanese-maple",
+  "status": "passed pilot review",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "findings": [
+    "Low spreading layered crown has irregular gaps instead of five flat shelves. Garden reference forms inform architecture; bronze foliage is not the green spring baseline."
+  ],
+  "reviewed_images": [
+    {
+      "image_id": "/site/assets/files/4074/acer-palmatum-7.jpg",
+      "source": "https://www.treesandshrubsonline.org/articles/acer/acer-palmatum/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    },
+    {
+      "image_id": "/site/assets/files/4074/acer-palmatum-11.jpg",
+      "source": "https://www.treesandshrubsonline.org/articles/acer/acer-palmatum/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    }
+  ],
+  "taxon": "acer-palmatum",
+  "sources": [
+    "https://plants.ces.ncsu.edu/plants/acer-palmatum/",
+    "https://www.treesandshrubsonline.org/articles/acer/acer-palmatum/"
+  ],
+  "habitat": "understory-regional",
+  "art_baseline": {
+    "season": "spring",
+    "foliage": "Species-appropriate spring foliage and fresh growth; flowering only where appropriate to the species.",
+    "reference_policy": "Use spring photographs for finished color and foliage. Other seasons may inform branch structure only.",
+    "out_of_scope": [
+      "seasonal transitions",
+      "seasonal recoloring"
+    ]
+  },
+  "generator_digest": "6d0b2c04db2c83b942e5b228219a87f514e03cf06752831f8ac02256fa4cfa85",
+  "review_date": "2026-09-07",
+  "review_scope": "Stylized spring vertical slice; source acceptance is separate from world variant endorsement.",
+  "pilot_artifacts": {
+    "1": "c8820e18455b0e0f6ce819fcf753bd1eee45d8fe9c0a3557e48a4a485526efee",
+    "4": "71dbfeb9a31245ee8c6dea569dec852564180b1870a323bb06e5ec55195acb39",
+    "7": "399e1f0973d23c7f3c1b590eea5a5969ead783c3a85f30d042eada8a56b732af"
+  },
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "449ed1f1e2df8967cd015450819f22a389e9fbb24fbd45872a4a1571af2707a1"
+  }
+}

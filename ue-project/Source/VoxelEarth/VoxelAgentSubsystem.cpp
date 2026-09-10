@@ -1,4 +1,5 @@
 #include "VoxelAgentSubsystem.h"
+#include "VoxelFrameProfiling.h"
 
 #include "Components/InstancedStaticMeshComponent.h"
 #include "Engine/StaticMesh.h"
@@ -1676,6 +1677,7 @@ void UVoxelAgentSubsystem::TickTier2(int32 AgentIndex, UVoxelWorldSubsystem& Ter
 
 void UVoxelAgentSubsystem::Tick(float DeltaTime)
 {
+	CSV_SCOPED_TIMING_STAT(VoxelStream, AgentTickMs);
 	Super::Tick(DeltaTime);
 
 	UWorld* World = GetWorld();

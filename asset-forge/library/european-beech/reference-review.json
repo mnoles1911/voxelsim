@@ -1,0 +1,94 @@
+{
+  "species": "european-beech",
+  "status": "passed pilot review",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "findings": [
+    "Dense oval mature crown and low branching now read as beech; spring woodland photograph informs habit, veteran trunk photograph informs bark and base proportions."
+  ],
+  "reviewed_images": [
+    {
+      "image_id": "/site/assets/files/5501/fagus-sylvatica-11.jpg",
+      "source": "https://www.treesandshrubsonline.org/articles/fagus/fagus-sylvatica/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    },
+    {
+      "image_id": "/site/assets/files/5501/fagus-sylvatica-14.jpg",
+      "source": "https://www.treesandshrubsonline.org/articles/fagus/fagus-sylvatica/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    }
+  ],
+  "taxon": "fagus-sylvatica",
+  "sources": [
+    "https://plants.ces.ncsu.edu/plants/fagus-sylvatica/",
+    "https://www.treesandshrubsonline.org/articles/fagus/fagus-sylvatica/"
+  ],
+  "habitat": "canopy",
+  "reviewed_generator": "temperate-shoots-v1",
+  "review_date": "2026-09-07",
+  "assessment": "Initial pilot rejected; v2 replacement requires a new comparison.",
+  "art_baseline": {
+    "season": "spring",
+    "foliage": "Species-appropriate spring foliage and fresh growth; flowering only where appropriate to the species.",
+    "reference_policy": "Use spring photographs for finished color and foliage. Other seasons may inform branch structure only.",
+    "out_of_scope": [
+      "seasonal transitions",
+      "seasonal recoloring"
+    ]
+  },
+  "previous_findings": [
+    "Tiered open branches fail to form the mature broad crown; ornamental weeping photo excluded from baseline."
+  ],
+  "generator_digest": "6d0b2c04db2c83b942e5b228219a87f514e03cf06752831f8ac02256fa4cfa85",
+  "review_scope": "Stylized spring vertical slice; source acceptance is separate from world variant endorsement.",
+  "pilot_artifacts": {
+    "1": "cdc4cf6de2809945b5cf1d1e9096a026113cc8f7e3cb1450effb7256e2a7da77",
+    "4": "a3198e866aa726c20f9ab8a5e08dc056d0eda65f61d92a2124a81bf672226ee2",
+    "7": "35514e0ddc272efadab765582af43a1314bcec0feffca4b92f95a469ff8933cc"
+  },
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "277aaf529ae6eed8e5c328c61d83a7507aa05625854ad2b6f4b2f1102dec6527"
+  }
+}

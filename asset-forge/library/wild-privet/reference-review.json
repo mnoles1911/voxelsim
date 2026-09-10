@@ -1,0 +1,151 @@
+{
+  "status": "passed pilot review",
+  "source": "https://plants.ces.ncsu.edu/plants/ligustrum-vulgare/",
+  "viewed_photos": [
+    "rollier June flower panicle",
+    "Creature_Librarian leaves",
+    "Rasbak whole shrub"
+  ],
+  "findings": "Narrow opposite leaves now follow finer and more numerous twigs, forming denser irregular bushes, 1.4-3.2 m. Reviewed June panicle but selected vegetative spring; no berries. Small leaf surfaces remain chunky at 25 mm. Actually compared reference photographs, current seeds 1,4,7 and all 36 variants. Accepted as stylized spring source; user endorsement remains separate.",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "batch_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+  ],
+  "generator_digest": "2cf1872b598297a33e8eaceab65328d9f181ad69c705e616376beaa6eb1098fb",
+  "sheet_hash": "e283b54d247c31e62300455376bc910ad3d1df33430fa4dce146cf6f709653e9",
+  "reviewed_at": 1788850912.5854578,
+  "pilot_hashes": {
+    "1": "b7e498cc0b85c03fe713567229948eb21d0555b3f75a36f057e96cb430621cb0",
+    "4": "a7866f2ca823416127c95af4ab2878daf0ff4afd19bed466f0e93963bedf3db4",
+    "7": "7f45bd7c50cf65a64f772e22de50327a3a7662dd56a89e3c6f8a4978a0881825"
+  },
+  "profile": "wild-privet",
+  "review_date": "2026-09-08",
+  "additional_sources": [],
+  "reference_catalog_photos": [
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Ligustrum_vulgare_fl_eIS9Yrg0dDnr.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=D6EkDT%2BVvnIE31HO2imaFFe%2FOk8%3D&Expires=1788853960",
+      "caption": "Ligustrum vulgare in June",
+      "credit": "\u00a9 rollier",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc/4.0/legalcode'>CC BY-NC 4.0</a>",
+      "image_id": "36191"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Ligustrum_vulgare_le_NUs3wO777nKF.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=HK419Pk6SM7UEK7v85WfF2SJWRo%3D&Expires=1788853960",
+      "caption": "Ligustrum vulgare leaves",
+      "credit": "Creature_Librarian",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc/4.0/legalcode'>CC BY-NC 4.0</a>",
+      "image_id": "36192"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Ligustrum_vulgare_fo_ICRZwl4VDvLB.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=sIAVbYr%2B0QNJXhfqL%2Bl2UMKhhYs%3D&Expires=1788853960",
+      "caption": "Ligustrum vulgare",
+      "credit": "Rasbak",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc/4.0/legalcode'>CC BY-NC 4.0</a>",
+      "image_id": "36193"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Ligustrum_vulgare_st_vicSc9pT7xr9.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=9HYub4Bw9tO7ZKTY60iFmG6%2BVzI%3D&Expires=1788853960",
+      "caption": "Ligustrum vulgare. Stem with opposite leaf arrangement",
+      "credit": "Thomas Wrbka",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc/4.0/legalcode'>CC BY-NC 4.0</a>",
+      "image_id": "36194"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Ligustrum_vulgare_fl_r2oVoGh8gwJ4.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=dRreSrg3U5ltoW%2FuoCIBxjKIhzE%3D&Expires=1788853960",
+      "caption": "Ligustrum vulgare. Flower buds",
+      "credit": "Andreas Rockstein",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/2.0/'>CC-BY-SA 2.0</a>",
+      "image_id": "36196"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Ligustrum_vulgare_fl_d6rn5bxnb6dG.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=0Za%2B7GpJdUNomSF5Mv5ivaZnkfY%3D&Expires=1788853960",
+      "caption": "Ligustrum vulgare. Flower detail",
+      "credit": "eyekosaede",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc/4.0/legalcode'>CC BY-NC 4.0</a>",
+      "image_id": "36197"
+    }
+  ],
+  "taxon": "Ligustrum vulgare",
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "e283b54d247c31e62300455376bc910ad3d1df33430fa4dce146cf6f709653e9"
+  }
+}

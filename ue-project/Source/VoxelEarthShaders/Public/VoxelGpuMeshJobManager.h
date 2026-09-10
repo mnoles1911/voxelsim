@@ -564,6 +564,11 @@ public:
 		double PollMs = 0.0;      // PollInFlight: harvesting readbacks
 		double BrickFlushMs = 0.0; // the pool Flush this tick owns
 		double EnqueueMs = 0.0;   // building and enqueueing the render command
+		double ShellMs = 0.0;
+		double WorkRecordsMs = 0.0;
+		double HandoffMs = 0.0; // the three sum to EnqueueMs
+		double RecordPayloadMs = 0.0; // nested within WorkRecordsMs
+		double RecordFlushMs = 0.0;
 	};
 	FTickStageMs GetAndResetTickStageMs()
 	{

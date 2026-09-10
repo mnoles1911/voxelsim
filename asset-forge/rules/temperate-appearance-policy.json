@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "revision": "temperate-spring-variation-v1",
+  "season": "spring",
+  "scope": "All assets included in the temperate forest vertical slice",
+  "color_space": "sRGB",
+  "variation": {
+    "voxel_gain": 0.085,
+    "face_gain": 0.045,
+    "warmth": 0.025,
+    "coordinate_frame": "original source voxel coordinates; stable across instance rotation, edits and restore"
+  },
+  "palette_policy": "Preserve species and material base palettes; do not recolor petals, stems, stone or other materials to tree green or bark brown. Apply deterministic subtle voxel and face variation to each material.",
+  "geometry_policy": "Appearance-only update: preserve occupancy, voxel pitch, seeds, source geometry identity and user endorsement/rejection decisions.",
+  "foliage_policy": "Existing approved foliage cutouts remain foliage-only; the common color variation policy does not make wood, petals or nonfoliage materials transparent.",
+  "activation_status": "Forge rollout complete: 5956 saved assets; runtime engine integration remains separately validated",
+  "rollout_report": "out/temperate-appearance-rollout/runtime-audit.json"
+}

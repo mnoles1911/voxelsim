@@ -153,6 +153,8 @@ def check_manifest(out: Path) -> list[str]:
 
 
 def main() -> int:
+    from library_layers import configure
+    configure(ROOT)
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default=str(ROOT / "out" / "engine"))
     ap.add_argument("--deep", action="store_true",

@@ -61,7 +61,8 @@ DECLARE_GPU_STAT_NAMED(VoxelStreamPoolUpload, TEXT("VoxelStreamPoolUpload"));
 // Out of line because FVoxelGpuPoolBuffers holds two FRDGPooledBuffer
 // references through a forward declaration -- this is the one translation unit
 // with the complete type, so it is the one place they may be destroyed.
-FVoxelGpuPoolBuffers::FVoxelGpuPoolBuffers() = default;
+FVoxelGpuPoolBuffers::FVoxelGpuPoolBuffers()
+	: Appearance(MakeShared<FVoxelTerrainAppearanceGpuState, ESPMode::ThreadSafe>()) {}
 FVoxelGpuPoolBuffers::~FVoxelGpuPoolBuffers() = default;
 
 // Wave S0 (docs/speculative-generation-plan.md §4, executing T0-1): time what
@@ -640,11 +641,15 @@ public:
 	                        const TArray<UVoxelGpuPoolComponent::FChunkRun>& InRuns,
 	                        const FString& InPoolName,
 	                        int32 InChunkTableCapacity,
-	                        FVoxelGpuPoolBuffersRef InSharedBuffers)
+	                        FVoxelGpuPoolBuffersRef InSharedBuffers,
+                            TArray<FVoxelTerrainAppearanceGpuState::FEntry>&& InAppearance,
+                            FVoxelPoolInitialShadow&& InDirtyShadow)
 		: FPrimitiveSceneProxy(Component)
 		, VertexFactory(GetScene().GetFeatureLevel())
 		, PoolName(InPoolName)
 		, SharedBuffers(MoveTemp(InSharedBuffers))
+		, DirtyShadow(MoveTemp(InDirtyShadow))
+		, InitialAppearance(MoveTemp(InAppearance))
 		, InitialShadow(MoveTemp(InInitialShadow))
 		, Origins(InOrigins)
 		, Params(InParams)
@@ -948,6 +953,19 @@ public:
 			       *PoolName, BufferQuads, double(BufferQuads) * 4.0 / (1024.0 * 1024.0));
 		}
 
+		// Only exact dirty CPU slices survive recreation. Replaying the full shadow
+		// would clobber GPU-written ranges; later GPU reuse already subtracts these runs.
+		UpdateQuadRange_RenderThread(RHICmdList, DirtyShadow.Quads, DirtyShadow.Ids,
+		    DirtyShadow.Corners, DirtyShadow.Runs, NumQuads);
+		DirtyShadow = FVoxelPoolInitialShadow{};
+		if (!InitialAppearance.IsEmpty())
+		{
+			FString Error;
+			if (!SharedBuffers->Appearance->ApplyBatch(FRHICommandListExecutor::GetImmediateCommandList(), uint32(Origins.Num()), {}, InitialAppearance, Error))
+			    UE_LOG(LogTemp, Error, TEXT("%s initial quad appearance: %s"), *PoolName, *Error);
+			InitialAppearance.Reset();
+		}
+		VertexFactory.SetAppearanceBuffers(RHICmdList, SharedBuffers->Appearance->GetViews(FRHICommandListExecutor::GetImmediateCommandList()));
 		VertexFactory.SetQuadBufferSRV(QuadBufferSRV);
 		VertexFactory.SetPoolBuffers(OriginSRV, ChunkIdSRV, ParamsSRV);
 		// Before InitResource: the uniform buffer is built in InitRHI, so a
@@ -1565,6 +1583,13 @@ public:
 
 	// The chunk table is tiny (one float4 + one float2 per chunk), so it is
 	// rewritten wholesale rather than tracked range by range.
+	void RetireGeometry_RenderThread() { NumQuads = 0; }
+
+	void RefreshAppearance_RenderThread(FRHICommandListImmediate& RHI)
+	{
+		VertexFactory.SetAppearanceBuffers(RHI, SharedBuffers->Appearance->GetViews(RHI));
+	}
+
 	void UpdateChunkTable_RenderThread(FRHICommandListBase& RHICmdList,
 	                                   const TArray<FVector4f>& NewOrigins,
 	                                   const TArray<FVector4f>& NewParams,
@@ -1667,6 +1692,8 @@ private:
 	// quads/ids halves on a first creation or capacity rebuild, the corner
 	// half on EVERY creation (the corner buffer is per-proxy; nothing GPU-
 	// writes corners, so the shadow is always its authority).
+	FVoxelPoolInitialShadow DirtyShadow;
+	TArray<FVoxelTerrainAppearanceGpuState::FEntry> InitialAppearance;
 	FVoxelPoolInitialShadow InitialShadow;
 	TArray<FVector4f> Origins;
 	TArray<FVector4f> Params;
@@ -2653,6 +2680,16 @@ UVoxelGpuPoolComponent::UVoxelGpuPoolComponent()
 
 void UVoxelGpuPoolComponent::InitPool(uint32 CapacityQuads)
 {
+	PendingAppearance.Reset();
+	if (PoolBuffers.IsValid())
+	{
+		ENQUEUE_RENDER_COMMAND(VoxelQuadAppearanceReset)([Buffers=PoolBuffers, Proxy=LiveProxy](FRHICommandListImmediate& RHI)
+		{
+			if (Proxy) Proxy->RetireGeometry_RenderThread();
+			Buffers->Appearance->Reset();
+			if (Proxy) Proxy->RefreshAppearance_RenderThread(RHI);
+		});
+	}
 	Pool.Init(CapacityQuads);
 	// S2-5: the CPU shadow is PAGED and allocates on first CPU write -- see
 	// ShadowPages. Only the (small) page table is sized here. On the
@@ -2909,8 +2946,9 @@ void UVoxelGpuPoolComponent::WriteQuadRange(uint32 Offset, uint32 ChunkId, const
 int32 UVoxelGpuPoolComponent::AddChunk(const TArray<uint64>& InQuads,
                                        const FVector3f& OriginUU, int32 Level,
                                        const FVector4f& Params,
-                                       const TArray<uint32>* InCornerHeights)
+                                       const TArray<uint32>* InCornerHeights, TSharedPtr<const FVoxelTerrainAppearanceUpload, ESPMode::ThreadSafe> Appearance)
 {
+	if (Appearance && (Appearance->Level != uint32(Level) || Level < 0 || Level > 7)) return INDEX_NONE;
 	check(Pool.GetCapacityQuads() > 0);   // InitPool first
 
 	const FVoxelGpuPoolAllocation Alloc = Pool.Alloc(uint32(InQuads.Num()));
@@ -2972,6 +3010,7 @@ int32 UVoxelGpuPoolComponent::AddChunk(const TArray<uint64>& InQuads,
 	UnmarkGpuHide(Alloc.Offset, uint32(InQuads.Num()));
 	WriteQuadRange(Alloc.Offset, ChunkId, InQuads, InCornerHeights);
 
+	PendingAppearance.Add(ChunkId, MoveTemp(Appearance));
 	const int32 Handle = AcquireAllocationHandle(Alloc, ChunkId);
 	++NumLiveChunks;
 
@@ -2999,8 +3038,9 @@ bool UVoxelGpuPoolComponent::IsGpuWritable() const
 
 int32 UVoxelGpuPoolComponent::AddChunkFromGpu(const FVoxelGpuQuadPayloadRef& Src, uint32 NumQuads,
                                               const FVector3f& OriginUU, int32 Level,
-                                              const FVector4f& Params)
+                                              const FVector4f& Params, TSharedPtr<const FVoxelTerrainAppearanceUpload, ESPMode::ThreadSafe> Appearance)
 {
+	if (Appearance && (Appearance->Level != uint32(Level) || Level < 0 || Level > 7)) return INDEX_NONE;
 	check(Pool.GetCapacityQuads() > 0);   // InitPool first
 
 	if (!Src.IsValid() || NumQuads == 0)
@@ -3081,6 +3121,7 @@ int32 UVoxelGpuPoolComponent::AddChunkFromGpu(const FVoxelGpuQuadPayloadRef& Src
 	// S2-1: and the same for pending hides -- this range is live again.
 	UnmarkGpuHide(Alloc.Offset, NumQuads);
 
+	PendingAppearance.Add(ChunkId, MoveTemp(Appearance));
 	const int32 Handle = AcquireAllocationHandle(Alloc, ChunkId);
 	++NumLiveChunks;
 
@@ -3115,6 +3156,7 @@ void UVoxelGpuPoolComponent::RemoveChunkInternal(int32 Handle, bool bRecycleChun
 	}
 
 	const FVoxelGpuPoolAllocation Alloc = Allocations[Handle];
+	PendingAppearance.Add(AllocationChunkIds[Handle], nullptr);
 
 	// S2-3: a PARKED chunk being removed for real still owes its park counter.
 	// Without this NumParkedChunks only ever grows -- it read 124,841 against a
@@ -3711,14 +3753,26 @@ void UVoxelGpuPoolComponent::FlushUpdatesToProxy()
 	// drawable.
 	TArray<FPendingGpuWrite> GpuWrites = TakePendingGpuWrites();
 	TArray<FPendingGpuHide> GpuHides = TakePendingGpuHides();
+	TArray<FVoxelTerrainAppearanceGpuState::FEntry> AppearanceEntries;
+	AppearanceEntries.Reserve(PendingAppearance.Num());
+	for (auto& Pair : PendingAppearance) AppearanceEntries.Add({Pair.Key, MoveTemp(Pair.Value)});
+	PendingAppearance.Reset();
+	const uint32 AppearanceCapacity = uint32(ChunkOrigins.Num());
+	auto RetainAppearanceForProxy = [&]()
+	{
+		// A replacement proxy imports these after its geometry initialization.
+		// Do not mutate shared descriptors while the old proxy is still drawable.
+		for (auto& Entry : AppearanceEntries) PendingAppearance.Add(Entry.Slot, MoveTemp(Entry.Upload));
+	};
 
 	// No live proxy yet: the CPU arrays are the source of truth and the proxy
 	// will pick them up whole when it is created.
 	if (LiveProxy == nullptr)
 	{
 		FlushGpuWritesStandalone(MoveTemp(GpuWrites), MoveTemp(GpuHides));
+		RetainAppearanceForProxy();
 		MarkRenderStateDirty();
-		DirtyQuadRanges.Reset();
+		// Preserve exact CPU dirty ranges for the replacement proxy.
 		bChunkTableDirty = false;
 		bRunsDirty = false;
 		return;
@@ -3728,8 +3782,9 @@ void UVoxelGpuPoolComponent::FlushUpdatesToProxy()
 	if (ChunkOrigins.Num() > LiveProxy->GetMaxChunks())
 	{
 		FlushGpuWritesStandalone(MoveTemp(GpuWrites), MoveTemp(GpuHides));
+		RetainAppearanceForProxy();
 		MarkRenderStateDirty();
-		DirtyQuadRanges.Reset();
+		// Preserve exact CPU dirty ranges for the replacement proxy.
 		bChunkTableDirty = false;
 		bRunsDirty = false;
 		return;
@@ -3853,7 +3908,7 @@ void UVoxelGpuPoolComponent::FlushUpdatesToProxy()
 		[Proxy, QuadsSlice = MoveTemp(QuadsSlice), IdsSlice = MoveTemp(IdsSlice),
 		 CornersSlice = MoveTemp(CornersSlice),
 		 OriginsCopy = MoveTemp(OriginsCopy), ParamsCopy = MoveTemp(ParamsCopy), RunsCopy = MoveTemp(RunsCopy),
-		 bBuildRuns,
+		 bBuildRuns, AppearanceEntries=MoveTemp(AppearanceEntries), AppearanceCapacity,
 		 UploadRuns = MoveTemp(UploadRuns), NewNumQuads, bTableDirty,
 		 GpuWrites = MoveTemp(GpuWrites), GpuHides = MoveTemp(GpuHides),
 		 Buffers = GetOrCreatePoolBuffers(),
@@ -3883,12 +3938,19 @@ void UVoxelGpuPoolComponent::FlushUpdatesToProxy()
 			GraphBuilder.Execute();
 		}
 
+		Proxy->UpdateQuadRange_RenderThread(RHICmdList, QuadsSlice, IdsSlice, CornersSlice,
+		                                    UploadRuns, NewNumQuads);
+		if (!AppearanceEntries.IsEmpty())
+		{
+			FString Error;
+			if (!Buffers->Appearance->ApplyBatch(RHICmdList, AppearanceCapacity, {}, AppearanceEntries, Error))
+			    UE_LOG(LogTemp, Error, TEXT("%s quad appearance publication: %s"), *Name, *Error);
+			Proxy->RefreshAppearance_RenderThread(RHICmdList);
+		}
 		if (bTableDirty)
 		{
 			Proxy->UpdateChunkTable_RenderThread(RHICmdList, OriginsCopy, ParamsCopy, RunsCopy, bBuildRuns);
 		}
-		Proxy->UpdateQuadRange_RenderThread(RHICmdList, QuadsSlice, IdsSlice, CornersSlice,
-		                                    UploadRuns, NewNumQuads);
 	});
 
 	DirtyQuadRanges.Reset();
@@ -3919,20 +3981,20 @@ void UVoxelGpuPoolComponent::DestroyRenderState_Concurrent()
 	Super::DestroyRenderState_Concurrent();
 }
 
-int32 UVoxelGpuPoolComponent::UpdateChunk(int32 Handle, const TArray<uint64>& InQuads)
+int32 UVoxelGpuPoolComponent::UpdateChunk(int32 Handle, const TArray<uint64>& InQuads, TSharedPtr<const FVoxelTerrainAppearanceUpload, ESPMode::ThreadSafe> Appearance)
 {
-	return UpdateChunkInternal(Handle, InQuads, /*InCornerHeights=*/nullptr);
+	return UpdateChunkInternal(Handle, InQuads, /*InCornerHeights=*/nullptr, MoveTemp(Appearance));
 }
 
 int32 UVoxelGpuPoolComponent::UpdateChunk(int32 Handle, const TArray<uint64>& InQuads,
-                                          const TArray<uint32>& InCornerHeights)
+                                          const TArray<uint32>& InCornerHeights, TSharedPtr<const FVoxelTerrainAppearanceUpload, ESPMode::ThreadSafe> Appearance)
 {
 	check(InCornerHeights.Num() == InQuads.Num());
-	return UpdateChunkInternal(Handle, InQuads, &InCornerHeights);
+	return UpdateChunkInternal(Handle, InQuads, &InCornerHeights, MoveTemp(Appearance));
 }
 
 int32 UVoxelGpuPoolComponent::UpdateChunkInternal(int32 Handle, const TArray<uint64>& InQuads,
-                                                  const TArray<uint32>* InCornerHeights)
+                                                  const TArray<uint32>* InCornerHeights, TSharedPtr<const FVoxelTerrainAppearanceUpload, ESPMode::ThreadSafe> Appearance)
 {
 	if (!Allocations.IsValidIndex(Handle) || !Allocations[Handle].IsValid())
 	{
@@ -3940,6 +4002,9 @@ int32 UVoxelGpuPoolComponent::UpdateChunkInternal(int32 Handle, const TArray<uin
 	}
 
 	const FVoxelGpuPoolAllocation Existing = Allocations[Handle];
+	if (Appearance && (Appearance->Level > 7 ||
+	    (ChunkOrigins[int32(AllocationChunkIds[Handle])].W > 0.0f &&
+	     ChunkOrigins[int32(AllocationChunkIds[Handle])].W != float(1u << Appearance->Level)))) return INDEX_NONE;
 
 	// Fits the slot it already has: rewrite in place. This is the case that
 	// matters -- an actively dug chunk re-meshes constantly and its quad count
@@ -3947,6 +4012,7 @@ int32 UVoxelGpuPoolComponent::UpdateChunkInternal(int32 Handle, const TArray<uin
 	if (uint32(InQuads.Num()) <= Existing.NumQuads)
 	{
 		const uint32 ChunkId = AllocationChunkIds[Handle];
+		PendingAppearance.Add(ChunkId, InQuads.IsEmpty() ? nullptr : MoveTemp(Appearance));
 		WriteQuadRange(Existing.Offset, ChunkId, InQuads, InCornerHeights);
 		// Any tail the chunk no longer needs is hidden rather than left drawing
 		// its previous contents. The stale corner heights in that tail are left
@@ -4004,6 +4070,7 @@ int32 UVoxelGpuPoolComponent::UpdateChunkInternal(int32 Handle, const TArray<uin
 	// writing, or the pass will blank geometry the shadow upload is about to
 	// publish -- the failure the forced probe caught.
 	UnmarkGpuHide(Alloc.Offset, uint32(InQuads.Num()));
+	PendingAppearance.Add(ChunkId, MoveTemp(Appearance));
 	WriteQuadRange(Alloc.Offset, ChunkId, InQuads, InCornerHeights);
 	Allocations[Handle] = Alloc;
 	AllocationChunkIds[Handle] = ChunkId;
@@ -4850,9 +4917,20 @@ FPrimitiveSceneProxy* UVoxelGpuPoolComponent::CreateSceneProxy()
 		       WorldBounds.BoxExtent.X, WorldBounds.BoxExtent.Y, WorldBounds.BoxExtent.Z);
 	}
 
+	FVoxelPoolInitialShadow DirtyInit;
+	for (const FDirtyRange& Range : DirtyQuadRanges)
+	{
+		const uint32 Count = Range.Last - Range.First + 1;
+		DirtyInit.Runs.Add({Range.First, Count, uint32(DirtyInit.Quads.Num())});
+		ShadowCopySlice(Range.First, Count, DirtyInit.Quads, DirtyInit.Ids, bWaterMode ? &DirtyInit.Corners : nullptr);
+	}
+	DirtyQuadRanges.Reset();
+	TArray<FVoxelTerrainAppearanceGpuState::FEntry> InitialAppearance;
+	for (auto& Pair : PendingAppearance) InitialAppearance.Add({Pair.Key, MoveTemp(Pair.Value)});
+	PendingAppearance.Reset();
 	FVoxelGpuPoolSceneProxy* Proxy =
 		new FVoxelGpuPoolSceneProxy(this, MoveTemp(Init), GetNumQuads(), ChunkOrigins, ChunkParams,
-		                            BuildChunkRuns(), PoolName, ChunkTableCapacity, GetOrCreatePoolBuffers());
+		                            BuildChunkRuns(), PoolName, ChunkTableCapacity, GetOrCreatePoolBuffers(), MoveTemp(InitialAppearance), MoveTemp(DirtyInit));
 	LiveProxy = Proxy;
 	return Proxy;
 }

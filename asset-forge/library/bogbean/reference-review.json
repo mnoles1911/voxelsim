@@ -1,0 +1,151 @@
+{
+  "status": "passed pilot review",
+  "source": "https://gobotany.nativeplanttrust.org/species/menyanthes/trifoliata/",
+  "viewed_photos": [
+    "Ben Kimball plant form",
+    "Arthur Haines leaves",
+    "Glen Mittelhauser flowers"
+  ],
+  "findings": "Separate long petioles with three broad leaflets, upright white raceme above creeping wetland rhizome. Generic single terminal bloom rejected. Dedicated menyanthes staged. Current seeds 1, 4 and 7 and every panel in the 36-seed contact sheet were visually inspected. Trifoliate leaves on separate petioles accompany upright white racemes. The 20\u201340 cm forms vary colony spread and stalk height. Small raceme florets merge at the finest sizes; petal fringes are unresolved. Creeping basal connections should sit within wet soil. Accepted as a coarse stylized spring source at 25 mm; user endorsement remains separate.",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "batch_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+  ],
+  "generator_digest": "a4f51c9edc774521daa579c4236e2126d0efb5b85aff5634b50cd3ac7165d801",
+  "sheet_hash": "431fde5dd1f2dbdc28a5aeef5b47c9de100eff860d2d6fc4f0b426e525b4ca17",
+  "reviewed_at": 1788854429.3626122,
+  "pilot_hashes": {
+    "1": "80ba50845368c02e12c213893ed4ab765570bf59ba8c08e5527a9bddcd782dcb",
+    "4": "a703651cc2bb675bdb56db0edb929dd643e2bfd230534cb0bce8cca81b59a82a",
+    "7": "320f2412de001dea5357324a3814874a50ca0cd70fd942596de8cb7002eaffb1"
+  },
+  "profile": "bogbean",
+  "review_date": "2026-09-08",
+  "additional_sources": [],
+  "reference_catalog_photos": [
+    {
+      "url": "https://newfs.s3.amazonaws.com/taxon-images-1000s1000/Menyanthaceae/menyanthes-trifoliata-ha-bkimball.jpg",
+      "caption": "Plant form: Menyanthes trifoliata.",
+      "credit": "By Ben Kimball. \u00b7 Copyright \u00a9 2026 Ben Kimball.",
+      "license": "See source credit; remotely hosted",
+      "image_id": "https://newfs.s3.amazonaws.com/taxon-images-1000s1000/Menyanthaceae/menyanthes-trifoliata-ha-bkimball.jpg"
+    },
+    {
+      "url": "https://newfs.s3.amazonaws.com/taxon-images-1000s1000/Menyanthaceae/menyanthes-trifoliata-le-ahaines-a.jpg",
+      "caption": "Leaves: Menyanthes trifoliata.",
+      "credit": "By Arthur Haines. \u00b7 Copyright \u00a9 2026 Arthur Haines.",
+      "license": "See source credit; remotely hosted",
+      "image_id": "https://newfs.s3.amazonaws.com/taxon-images-1000s1000/Menyanthaceae/menyanthes-trifoliata-le-ahaines-a.jpg"
+    },
+    {
+      "url": "https://newfs.s3.amazonaws.com/taxon-images-1000s1000/Menyanthaceae/menyanthes-trifoliata-fl-gmittelhauser-a.jpg",
+      "caption": "Flowers: Menyanthes trifoliata.",
+      "credit": "By Glen Mittelhauser. \u00b7 Copyright \u00a9 2026 Glen Mittelhauser.",
+      "license": "See source credit; remotely hosted",
+      "image_id": "https://newfs.s3.amazonaws.com/taxon-images-1000s1000/Menyanthaceae/menyanthes-trifoliata-fl-gmittelhauser-a.jpg"
+    },
+    {
+      "url": "https://newfs.s3.amazonaws.com/taxon-images-1000s1000/Menyanthaceae/menyanthes-trifoliata-fr-dmcgrady.jpg",
+      "caption": "Fruits: Menyanthes trifoliata.",
+      "credit": "By Douglas McGrady. \u00b7 Copyright \u00a9 2026 Douglas McGrady.",
+      "license": "See source credit; remotely hosted",
+      "image_id": "https://newfs.s3.amazonaws.com/taxon-images-1000s1000/Menyanthaceae/menyanthes-trifoliata-fr-dmcgrady.jpg"
+    },
+    {
+      "url": "https://newfs.s3.amazonaws.com/taxon-images-1000s1000/Menyanthaceae/menyanthes-trifoliata-le-gmittelhauser-b.jpg",
+      "caption": "Leaves: Menyanthes trifoliata.",
+      "credit": "By Glen Mittelhauser. \u00b7 Copyright \u00a9 2026 Glen Mittelhauser.",
+      "license": "See source credit; remotely hosted",
+      "image_id": "https://newfs.s3.amazonaws.com/taxon-images-1000s1000/Menyanthaceae/menyanthes-trifoliata-le-gmittelhauser-b.jpg"
+    },
+    {
+      "url": "https://newfs.s3.amazonaws.com/taxon-images-1000s1000/Menyanthaceae/menyanthes-trifoliata-le-gmittelhauser-c.jpg",
+      "caption": "Leaves: Menyanthes trifoliata.",
+      "credit": "By Glen Mittelhauser. \u00b7 Copyright \u00a9 2026 Glen Mittelhauser.",
+      "license": "See source credit; remotely hosted",
+      "image_id": "https://newfs.s3.amazonaws.com/taxon-images-1000s1000/Menyanthaceae/menyanthes-trifoliata-le-gmittelhauser-c.jpg"
+    }
+  ],
+  "taxon": "Menyanthes trifoliata",
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "431fde5dd1f2dbdc28a5aeef5b47c9de100eff860d2d6fc4f0b426e525b4ca17"
+  }
+}

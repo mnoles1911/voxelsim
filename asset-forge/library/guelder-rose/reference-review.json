@@ -1,0 +1,151 @@
+{
+  "status": "passed pilot review",
+  "source": "https://plants.ces.ncsu.edu/plants/viburnum-opulus/",
+  "viewed_photos": [
+    "Jim Robbins Flower Form Close-up",
+    "Cranbrook Science Multicolored foliage; seasonal color excluded",
+    "Tero-Laakso Flower detail"
+  ],
+  "findings": "Compared spring flower form and lacecap detail; red seasonal foliage excluded. Replaced simple leaves with opposite three-lobed foliage and terminal flat corymbs. First pass was too sparse and second too planar; added secondary twig foliage and irregular 3D branching, restaged and actually inspected final seeds 1,4,7 and all 36 variants. Final 1.5-3.5 m irregular shrubs have connected branch-led foliage, modest white spring lacecaps, varied spread and density. Fine serrations and fertile florets remain below 25 mm. Accepted stylized spring source; user variant endorsement remains separate.",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "batch_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+  ],
+  "generator_digest": "2314f5748737fb9926609313b993212473d5070d34cb773c7fe498e6dfdbcb11",
+  "sheet_hash": "b97561e88a3cf91eb57e7aa77b9d4b87b1072f2fcd6f6d75137e60cae80d34c5",
+  "reviewed_at": 1788851186.8457744,
+  "pilot_hashes": {
+    "1": "9bf26ddcf390495b4a71655b15723efd29eabb6ae7eb3ae51a28b10d0ffa7f9b",
+    "4": "c10b7118dc05a930de8fdce1a43ddd28217feca989155bc3597f6f014acca82f",
+    "7": "9728700c10bd6dea62aa9e071d5fee505c9b636ecbe82b5249ea1df1cf61e80e"
+  },
+  "profile": "guelder-rose",
+  "review_date": "2026-09-08",
+  "additional_sources": [],
+  "reference_catalog_photos": [
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Viburnum_opulus_flfm_Tv0uja3Os8mg.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=WeDnXffy4T7OhTzSfFy4HdwijnQ%3D&Expires=1788853960",
+      "caption": "Flower Form Close-up",
+      "credit": "Jim Robbins",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc-nd/4.0/legalcode'>CC BY-NC-ND 4.0</a>",
+      "image_id": "17788"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Viburnum-trilobum--C_CkcxpARcekoB.jpe?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=mP9v2iudHIE4WG8pnegWxF74WCI%3D&Expires=1788853960",
+      "caption": "Multicolored foliage",
+      "credit": "Cranbrook Science",
+      "license": "<a href='http://creativecommons.org/licenses/by/4.0/legalcode'>CC BY 4.0</a>",
+      "image_id": "15757"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Viburnum-opulus--Tero-Laakso--CC-BY-SA.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=zP3xHmvnbKH02dyv7cyXNnBUO48%3D&Expires=1788853960",
+      "caption": "Flower detail",
+      "credit": "Tero-Laakso",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/2.0/'>CC-BY-SA 2.0</a>",
+      "image_id": "2672"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Viburnum-trilobum--C_iQ6vPjP9CnFK.jpe?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=Sh6A2pAevbAZkXBf0vE2KEreBRw%3D&Expires=1788853960",
+      "caption": "Closeup of leaves",
+      "credit": "Cranbrook Science",
+      "license": "<a href='http://creativecommons.org/licenses/by/4.0/legalcode'>CC BY 4.0</a>",
+      "image_id": "15759"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Viburnum-Opulus-stem_j799LXix5vwz.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=LjqB2HZH1dWm5P072QTSdwD%2BEs8%3D&Expires=1788853960",
+      "caption": "Stem and buds",
+      "credit": "",
+      "license": "<a href='https://creativecommons.org/about/cc0/'>CC0</a>",
+      "image_id": "25746"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Viburnum_opulus_H._Z_LRuyqzmeSjuk.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=seF2q%2FBcgWQVG3Fsc508SsEbRMU%3D&Expires=1788853960",
+      "caption": "Flowers",
+      "credit": "H. Zell",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/3.0/deed.en'>CC BY-SA 3.0</a>",
+      "image_id": "31474"
+    }
+  ],
+  "taxon": "Viburnum opulus",
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "b97561e88a3cf91eb57e7aa77b9d4b87b1072f2fcd6f6d75137e60cae80d34c5"
+  }
+}

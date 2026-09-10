@@ -1,0 +1,23 @@
+#include "/Engine/Public/Platform.ush"
+#include "/VoxelEarth/VoxelSparseAppearance.ush"
+StructuredBuffer<uint> PageWords;
+StructuredBuffer<uint> SourceWords;
+StructuredBuffer<uint2> SourceRanges;
+StructuredBuffer<uint4> Queries;
+RWStructuredBuffer<uint4> Results;
+uint QueryCount;
+uint PageLength;
+uint ResourceCount;
+[numthreads(64,1,1)]
+void SparseAppearanceProbeMain(uint3 Tid:SV_DispatchThreadID){
+    if(Tid.x>=QueryCount)return;
+    uint4 Q=Queries[Tid.x];uint Resource,Yaw,Packed,Needle;int3 Cell;uint3 Zero;
+    uint4 A=0u,B=0u,C=0u;
+    if(VoxelAppearanceLookupPage(PageWords,0u,PageLength,Q.xyz,Resource,Cell,Yaw)&&Resource<ResourceCount){
+        uint2 Range=SourceRanges[Resource];
+        if(VoxelAppearanceLookupSource(SourceWords,Range.x,Range.y,Cell,Q.w,Packed,Zero,Needle)){
+            A=uint4(1u,Resource,Packed,Needle);B=uint4(asuint(Cell),Yaw);C=uint4(Zero,0u);
+        }
+    }
+    Results[Tid.x*3u]=A;Results[Tid.x*3u+1u]=B;Results[Tid.x*3u+2u]=C;
+}
