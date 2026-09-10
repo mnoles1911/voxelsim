@@ -1146,6 +1146,13 @@ struct FVoxelDetailAssetImpl
 	TSet<uint32> GeometryKnown;                      // geometry seen (built or pending)
 	TMap<uint32, TUniquePtr<FMeshGeometry>> PendingGeometry; // awaiting budgeted mesh build
 	TMap<uint32, FMeshEntry> Meshes;
+    // Opt-in opportunistic retirement; not a residency hard cap.
+    TArray<uint32> RetirementKeys;
+    TMap<uint32,double> RetirementUnusedSince;
+    double RetirementNextScan=0,RetirementBlockedSince=0,RetirementLogTimer=0;
+    uint64 RetirementProbes=0,RetirementKeysRemoved=0,RetirementObjectsUnrooted=0;
+    uint64 RetirementDeferredTicks=0,RetirementLimitSkips=0,RetirementHismDeferred=0;
+
     TSharedPtr<const FVoxelDetailMeshCacheIndex,ESPMode::ThreadSafe> Cache;
     FStreamableManager CacheStreamable;
     struct FCacheLoad {TArray<FGroupResult::FCacheRequest> Requests;TSharedPtr<FStreamableHandle> Handle;bool bChecked=false,bFilesValid=false;};
@@ -1497,6 +1504,73 @@ UStaticMesh* VoxelBakePersistentDetailMesh(const vxc::AssetGrid& Grid,
 // The tick pipeline
 // ---------------------------------------------------------------------------
 
+// Shared action used by Tick and real-UObject lifecycle tests below.
+static bool TickDetailMeshRetirement(FVoxelDetailAssetImpl& S,
+    TArray<TObjectPtr<UStaticMesh>>& BuiltMeshes,
+    TArray<TObjectPtr<UHierarchicalInstancedStaticMeshComponent>>& HismComponents,
+    float DeltaTime,double Now)
+{
+    check(IsInGameThread());bool bRetiredDetailMeshThisTick=false;
+        CSV_SCOPED_TIMING_STAT(VoxelStream,DetailRetirementMs);
+        const bool Bounded=S.Meshes.Num()<=4096&&S.CachedMeshes.Num()<=4096&&BuiltMeshes.Num()<=8192&&S.Tasks.Num()<=4096;
+        // Completion FIRST, then queue observations. Every worker producer is
+        // registered in Tasks before GT can enter here. UE task completion's
+        // atomic closed state synchronizes prior task-body queue publication.
+        // No GT launch/drain/cache mutation interleaves this synchronous block.
+        bool Quiescent=true;
+        for(const auto& Task:S.Tasks)if(!Task.IsCompleted()){Quiescent=false;break;}
+        if(Quiescent)Quiescent=S.InFlight.IsEmpty()&&S.Results.IsEmpty()&&S.PendingGeometry.IsEmpty()&&S.CacheLoads.IsEmpty()&&
+            S.PendingCachedMeshes.IsEmpty()&&S.CacheChecks.IsEmpty()&&!S.PendingCacheFallbacks&&!S.bUnresolvedMeshFailure;
+        if(!Bounded){++S.RetirementLimitSkips;Quiescent=false;}
+        if(!Quiescent){++S.RetirementDeferredTicks;if(!S.RetirementBlockedSince)S.RetirementBlockedSince=Now;}
+        else {
+            S.RetirementBlockedSince=0;
+            if(S.RetirementKeys.IsEmpty()&&Now>=S.RetirementNextScan){
+                S.RetirementNextScan=Now+1.;S.Meshes.GetKeys(S.RetirementKeys);
+            }
+            int Removed=0;
+            for(int Probe=0;Probe<32&&!S.RetirementKeys.IsEmpty()&&Removed<2;++Probe){
+                const uint32 Key=S.RetirementKeys.Pop(EAllowShrinking::No);++S.RetirementProbes;
+                auto* Entry=S.Meshes.Find(Key);if(!Entry){S.RetirementUnusedSince.Remove(Key);continue;}
+                const auto* Members=S.KeyGroups.Find(Key);
+                if((Members&&!Members->IsEmpty())||Entry->bDirty||!Entry->Hism||Entry->Hism->GetInstanceCount()!=0||!Entry->Mesh||Entry->Mesh->IsCompiling()){
+                    S.RetirementUnusedSince.Remove(Key);continue;
+                }
+                // ClearInstances marks the tree out of date; game-thread bDirty
+                // alone does not establish that HISM worker/build application ended.
+                if(Entry->Hism->IsAsyncBuilding()||!Entry->Hism->IsTreeFullyBuilt()){
+                    ++S.RetirementHismDeferred;continue;
+                }
+                const double* Since=S.RetirementUnusedSince.Find(Key);
+                if(!Since){S.RetirementUnusedSince.Add(Key,Now);continue;}
+                if(Now-*Since<30.)continue;
+                // Drain barrier above protects groups, fallback work, cache requests
+                // and worker KnownGeometry promises. A live alias retains its mesh.
+                UStaticMesh* Mesh=Entry->Mesh;auto* Hism=Entry->Hism;
+                Hism->SetStaticMesh(nullptr);Hism->DestroyComponent();HismComponents.Remove(Hism);
+                S.Meshes.Remove(Key);S.KeyGroups.Remove(Key);S.GeometryKnown.Remove(Key);S.RetirementUnusedSince.Remove(Key);
+                bool Shared=false;for(const auto& Other:S.Meshes)if(Other.Value.Mesh==Mesh){Shared=true;break;}
+                if(!Shared){
+                    for(auto It=S.CachedMeshes.CreateIterator();It;++It)if(It.Value()==Mesh)It.RemoveCurrent();
+                    // Remove ALL root duplicates created by alias installation.
+                    BuiltMeshes.RemoveAll([Mesh](const auto& Root){return Root.Get()==Mesh;});
+                    ++S.RetirementObjectsUnrooted;
+                }
+                ++Removed;++S.RetirementKeysRemoved;bRetiredDetailMeshThisTick=true;
+            }
+        }
+        // Independent cadence: convergence is exactly when this pilot often
+        // retires objects, so progress/convergence logging must not gate it.
+        S.RetirementLogTimer+=DeltaTime;
+        if(S.RetirementLogTimer>=5.0){S.RetirementLogTimer=0;
+            UE_LOG(LogVoxelEarth,Log,TEXT("DetailRetirement opportunistic totals: probes=%llu keys=%llu objectsUnrooted=%llu deferredTicks=%llu limitSkips=%llu hismDeferred=%llu blockedSeconds=%.3f meshes=%d cachedResources=%d roots=%d components=%d queuedKeys=%d; no hardcap or reclaimed-byte claim"),
+                S.RetirementProbes,S.RetirementKeysRemoved,S.RetirementObjectsUnrooted,S.RetirementDeferredTicks,S.RetirementLimitSkips,S.RetirementHismDeferred,
+                S.RetirementBlockedSince?FPlatformTime::Seconds()-S.RetirementBlockedSince:0.,S.Meshes.Num(),S.CachedMeshes.Num(),BuiltMeshes.Num(),HismComponents.Num(),S.RetirementKeys.Num());
+        }
+
+    return bRetiredDetailMeshThisTick;
+}
+
 void UVoxelDetailAssetSubsystem::Tick(float DeltaTime)
 {
 	CSV_SCOPED_TIMING_STAT(VoxelStream, DetailTickMs);
@@ -1691,6 +1765,7 @@ void UVoxelDetailAssetSubsystem::Tick(float DeltaTime)
 	double BudgetSpentMs = 0.0;
 
     auto InstallMesh=[&](uint32 Key,UStaticMesh* Mesh,uint64 SolidVoxels){
+            S.RetirementUnusedSince.Remove(Key);
 			BuiltMeshes.Add(Mesh);
 
 			UHierarchicalInstancedStaticMeshComponent* Hism =
@@ -1887,6 +1962,7 @@ void UVoxelDetailAssetSubsystem::Tick(float DeltaTime)
 			for (const FDetailInstanceRec& Inst : Rec.Instances)
 			{
 				S.KeyGroups.FindOrAdd(Inst.MeshKey).Add(R->Group);
+                S.RetirementUnusedSince.Remove(Inst.MeshKey);
 				if (FVoxelDetailAssetImpl::FMeshEntry* Entry = S.Meshes.Find(Inst.MeshKey);
 				    Entry != nullptr && Entry->Hism != nullptr && !Entry->bDirty)
 				{
@@ -2076,6 +2152,11 @@ void UVoxelDetailAssetSubsystem::Tick(float DeltaTime)
 		}
 	}
 
+    // Opportunistic only: no hard residency cap under continuous work.
+    static const bool bRetireUnusedDetailMeshes=FParse::Param(FCommandLine::Get(),TEXT("VoxelDetailRetireUnused"));
+    const bool bRetiredDetailMeshThisTick=bRetireUnusedDetailMeshes&&
+        TickDetailMeshRetirement(S,BuiltMeshes,HismComponents,DeltaTime,FPlatformTime::Seconds());
+
 	// --- 5. dispatch new resolve jobs --------------------------------------
 	{
 		CSV_SCOPED_TIMING_STAT(VoxelStream, DetailDispatchMs);
@@ -2084,7 +2165,7 @@ void UVoxelDetailAssetSubsystem::Tick(float DeltaTime)
 		S.Tasks.RemoveAll([](const UE::Tasks::TTask<void>& T) { return T.IsCompleted(); });
 
 		const int32 Capacity =
-			FMath::Min(kMaxDispatchPerTick, JobsInFlightCap - S.InFlight.Num());
+			bRetiredDetailMeshThisTick?0:FMath::Min(kMaxDispatchPerTick, JobsInFlightCap - S.InFlight.Num());
 		if (Capacity > 0)
 		{
 			FVoxelFineTileStreamer* Streamer = VoxelWorld->GetFineTileStreamer();
@@ -2279,6 +2360,120 @@ void UVoxelDetailAssetSubsystem::Tick(float DeltaTime)
 namespace {
 void DetailFixtureWrite(TArray<uint8>& Bytes,int Offset,uint32 Value){for(int I=0;I<4;++I)Bytes[Offset+I]=uint8(Value>>(8*I));}
 }
+#include "UObject/StrongObjectPtr.h"
+#include "HAL/Event.h"
+#include "HAL/PlatformProcess.h"
+namespace {
+struct FRetirementTestState {
+    FVoxelDetailAssetImpl Impl;
+    TStrongObjectPtr<UStaticMesh> Mesh{NewObject<UStaticMesh>()};
+    TArray<TStrongObjectPtr<UHierarchicalInstancedStaticMeshComponent>> KeepComponents;
+    TArray<TObjectPtr<UStaticMesh>> Roots;
+    TArray<TObjectPtr<UHierarchicalInstancedStaticMeshComponent>> Components;
+    void Add(uint32 Key){
+        auto H=NewObject<UHierarchicalInstancedStaticMeshComponent>();
+        KeepComponents.Emplace(H);
+        // Empty real component, valid tree; no fake async/build flags.
+        H->SetStaticMesh(Mesh.Get());H->BuildTreeIfOutdated(false,true);
+        auto& E=Impl.Meshes.Add(Key);E.Mesh=Mesh.Get();E.Hism=H;
+        Components.Add(H);Roots.Add(Mesh.Get());Impl.GeometryKnown.Add(Key);
+        Impl.CachedMeshes.Add(Key,Mesh.Get());Impl.RetirementUnusedSince.Add(Key,1.);
+    }
+    bool Tick(uint32 Key){Impl.RetirementKeys.Reset();Impl.RetirementKeys.Add(Key);
+        return TickDetailMeshRetirement(Impl,Roots,Components,0.f,40.);}
+};
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVoxelDetailRetirementLifecycleTest,"Voxel.Appearance.DetailRetirementLifecycle",EAutomationTestFlags::EditorContext|EAutomationTestFlags::EngineFilter)
+bool FVoxelDetailRetirementLifecycleTest::RunTest(const FString&){
+    FRetirementTestState T;T.Add(11);T.Add(22);
+    auto Pinned=[&](const TCHAR* Why){TestFalse(Why,T.Tick(11));TestTrue(TEXT("promise retains key"),T.Impl.GeometryKnown.Contains(11));TestEqual(TEXT("promise retains roots"),T.Roots.Num(),2);};
+    T.Impl.PendingGeometry.Add(11,MakeUnique<FMeshGeometry>());Pinned(TEXT("pending geometry pins"));T.Impl.PendingGeometry.Empty();
+    T.Impl.Results.Enqueue(MakeUnique<FGroupResult>());Pinned(TEXT("undrained result pins"));TUniquePtr<FGroupResult> Result;T.Impl.Results.Dequeue(Result);
+    T.Impl.CacheLoads.Add(11);Pinned(TEXT("cache request/load promise pins"));T.Impl.CacheLoads.Empty();
+    T.Impl.CacheChecks.Enqueue({11,true});Pinned(TEXT("undrained cache check pins"));FVoxelDetailAssetImpl::FCacheCheck Check;T.Impl.CacheChecks.Dequeue(Check);
+    T.Impl.PendingCachedMeshes.Add(11,{T.Mesh.Get(),1});Pinned(TEXT("ready mesh promise pins"));T.Impl.PendingCachedMeshes.Empty();
+    T.Impl.PendingCacheFallbacks=1;Pinned(TEXT("fallback promise pins"));T.Impl.PendingCacheFallbacks=0;
+    const FGroupKey Group{1,2};T.Impl.Groups.Add(Group);T.Impl.KeyGroups.FindOrAdd(11).Add(Group);
+    Pinned(TEXT("active group pins clean component"));T.Impl.KeyGroups.Remove(11);T.Impl.Groups.Remove(Group);
+    T.Impl.RetirementUnusedSince.Add(11,1.);
+    TestTrue(TEXT("first alias retires"),T.Tick(11));TestFalse(TEXT("retired geometry promise cleared for revisit"),T.Impl.GeometryKnown.Contains(11));
+    TestEqual(TEXT("remaining alias keeps duplicate mesh roots until final alias"),T.Roots.Num(),2);
+    TestEqual(TEXT("only retired component root removed"),T.Components.Num(),1);TestTrue(TEXT("cached alias still usable"),T.Impl.CachedMeshes.Contains(22));
+    TestTrue(TEXT("last alias retires"),T.Tick(22));TestEqual(TEXT("all root duplicates removed"),T.Roots.Num(),0);TestEqual(TEXT("all cached pointer aliases removed"),T.Impl.CachedMeshes.Num(),0);
+    T.Add(11);TestTrue(TEXT("revisit can install retired key again"),T.Impl.GeometryKnown.Contains(11));TestEqual(TEXT("revisit owns a component"),T.Components.Num(),1);
+    return true;
+}
+// Actual asynchronous HISM build, not a substituted predicate/flag. This test
+// intentionally needs a running editor automation loop and real engine cube.
+class FDetailRetirementAsyncCommand final : public IAutomationLatentCommand {
+public:
+    FAutomationTestBase* Test;TSharedPtr<FRetirementTestState> State;int Phase=0;
+    FDetailRetirementAsyncCommand(FAutomationTestBase* In):Test(In),State(MakeShared<FRetirementTestState>()){}
+    bool Update() override {
+        auto& T=*State;
+        if(Phase==0){
+            auto Mesh=LoadObject<UStaticMesh>(nullptr,TEXT("/Engine/BasicShapes/Cube.Cube"));
+            if(!Mesh){Test->AddError(TEXT("real mesh prerequisite absent"));return true;}
+            T.Mesh.Reset(Mesh);Phase=1;
+        }
+        if(Phase==1){
+            if(T.Mesh->IsCompiling())return false;
+            T.Add(31);auto H=T.Components[0];H->SetStaticMesh(T.Mesh.Get());H->bAutoRebuildTreeOnInstanceChanges=false;
+            for(int I=0;I<256;++I)H->AddInstance(FTransform(FVector(I*200.,0,0)),false);
+            H->BuildTreeIfOutdated(true,true);
+            if(!H->IsAsyncBuilding()){Test->AddError(TEXT("async HISM path not exercised"));return true;}
+            // This removes the instance-count veto while the REAL tree job is
+            // outstanding; only async/out-of-date safety prevents destruction.
+            H->ClearInstances();
+            Test->TestEqual(TEXT("cleared component has zero instances"),H->GetInstanceCount(),0);
+            Test->TestFalse(TEXT("real asynchronous HISM task pins retirement"),T.Tick(31));
+            Test->TestTrue(TEXT("HISM pin counter exercised"),T.Impl.RetirementHismDeferred>0);
+            Phase=2;return false;
+        }
+        auto H=T.Components[0];
+        if(H->IsAsyncBuilding())return false; // no flush/wait/forced GC
+        if(!H->IsTreeFullyBuilt()){H->BuildTreeIfOutdated(true,false);return false;}
+        Test->TestTrue(TEXT("drained real HISM can retire"),T.Tick(31));
+        Test->TestEqual(TEXT("component root released after build completion"),T.Components.Num(),0);
+        return true;
+    }
+};
+// Real producer handoff: event controls publication, not a substituted flag.
+class FDetailRetirementProducerCommand final : public IAutomationLatentCommand {
+public:
+    FAutomationTestBase* Test;int Phase=0;
+    TSharedPtr<FRetirementTestState,ESPMode::ThreadSafe> State=MakeShared<FRetirementTestState,ESPMode::ThreadSafe>();
+    TSharedPtr<FEvent,ESPMode::ThreadSafe> Gate{FPlatformProcess::GetSynchEventFromPool(true),[](FEvent* E){FPlatformProcess::ReturnSynchEventToPool(E);}};
+    FDetailRetirementProducerCommand(FAutomationTestBase* In):Test(In){}
+    bool Update() override {
+        auto& T=*State;
+        if(Phase==0){
+            T.Add(41);
+            T.Impl.Tasks.Add(UE::Tasks::Launch(UE_SOURCE_LOCATION,[Keep=State,Event=Gate](){
+                Event->Wait();
+                Keep->Impl.Results.Enqueue(MakeUnique<FGroupResult>());
+                Keep->Impl.CacheChecks.Enqueue({41,true});
+            },UE::Tasks::ETaskPriority::BackgroundNormal));
+            Test->TestFalse(TEXT("tracked live producer pins despite initially empty queues"),T.Tick(41));
+            Gate->Trigger();Phase=1;return false;
+        }
+        if(!T.Impl.Tasks[0].IsCompleted())return false;
+        Test->TestFalse(TEXT("completed producer's undrained publications pin retirement"),T.Tick(41));
+        Test->TestTrue(TEXT("result really published"),!T.Impl.Results.IsEmpty());
+        Test->TestTrue(TEXT("cache check really published"),!T.Impl.CacheChecks.IsEmpty());
+        TUniquePtr<FGroupResult> Result;T.Impl.Results.Dequeue(Result);
+        Test->TestFalse(TEXT("remaining cache publication alone still pins"),T.Tick(41));
+        FVoxelDetailAssetImpl::FCacheCheck Check;T.Impl.CacheChecks.Dequeue(Check);
+        Test->TestTrue(TEXT("fully drained producer permits retirement"),T.Tick(41));
+        return true;
+    }
+};
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVoxelDetailRetirementProducerTest,"Voxel.Appearance.DetailRetirementProducerBarrier",EAutomationTestFlags::EditorContext|EAutomationTestFlags::EngineFilter)
+bool FVoxelDetailRetirementProducerTest::RunTest(const FString&){AddCommand(new FDetailRetirementProducerCommand(this));return true;}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVoxelDetailRetirementAsyncTest,"Voxel.Appearance.DetailRetirementAsyncHism",EAutomationTestFlags::EditorContext|EAutomationTestFlags::EngineFilter)
+bool FVoxelDetailRetirementAsyncTest::RunTest(const FString&){AddCommand(new FDetailRetirementAsyncCommand(this));return true;}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVoxelDetailSizeCullTest,"Voxel.Appearance.DetailSizeCull",EAutomationTestFlags::EditorContext|EAutomationTestFlags::EngineFilter)
 bool FVoxelDetailSizeCullTest::RunTest(const FString&) {
     const FVector Unit(1,1,1);
