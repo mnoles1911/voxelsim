@@ -50,7 +50,7 @@ TSharedPtr<const FVoxelDetailMeshCacheIndex,ESPMode::ThreadSafe> FVoxelDetailMes
         if(!O->TryGetStringField(TEXT("id"),ID)||!CachePart(ID)||Sources.Contains(ID)||!O->TryGetStringField(TEXT("species"),S.Species)||!CachePart(S.Species)||
            !CacheHash(O,TEXT("geometry_sha256"),S.Geometry)||!CacheHash(O,TEXT("sha256"),S.Appearance)||
            !O->TryGetStringField(TEXT("geometry_md5"),MD5)||!CacheHex(MD5,32))return Fail(TEXT("invalid publication source identity"));
-        S.Resource=Catalog->FindResource(MD5);if(!S.Resource||S.Resource>=uint32(Catalog->Sources().Num()))return Fail(TEXT("publication does not match catalog"));
+        S.Resource=Catalog->FindResourceId(MD5);if(!S.Resource||S.Resource>=uint32(Catalog->Sources().Num()))return Fail(TEXT("publication does not match catalog"));
         const auto& Verified=Catalog->Sources()[S.Resource];
         if(S.Geometry!=Verified.GeometrySHA256||S.Appearance!=Verified.AppearanceSHA256)return Fail(TEXT("publication hashes do not match retained catalog"));
         Sources.Add(ID,MoveTemp(S));

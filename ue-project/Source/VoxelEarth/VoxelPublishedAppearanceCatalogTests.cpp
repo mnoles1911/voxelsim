@@ -39,10 +39,10 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVoxelPublishedCatalogTest,"Voxel.Appearance.Pu
 bool FVoxelPublishedCatalogTest::RunTest(const FString&){
     FCatalogFixture F;FString Error;F.Write();auto Empty=FVoxelPublishedAppearanceCatalog::Load(F.Directory,Error);
     if(!TestTrue(TEXT("empty publication accepted"),Empty.IsValid()))return false;
-    TestEqual(TEXT("only reserved zero entry"),Empty->Sources().Num(),1);TestEqual(TEXT("stale packet does not authorize"),Empty->FindResource(F.Hash),0u);
+    TestEqual(TEXT("only reserved zero entry"),Empty->Sources().Num(),1);TestEqual(TEXT("stale packet does not authorize"),Empty->FindResourceId(F.Hash),0u);
     auto Row=F.Add(1);F.Write();auto One=FVoxelPublishedAppearanceCatalog::Load(F.Directory,Error);
     if(!TestTrue(TEXT("published matching VXA/VAC accepted"),One.IsValid())){AddError(Error);return false;}
-    TestEqual(TEXT("published resource ID"),One->FindResource(F.Hash.ToUpper()),1u);
+    TestEqual(TEXT("published resource ID"),One->FindResourceId(F.Hash.ToUpper()),1u);
     F.Add(2);F.Write();auto Dedup=FVoxelPublishedAppearanceCatalog::Load(F.Directory,Error);
     if(!TestTrue(TEXT("duplicate geometry distinct seeds accepted"),Dedup.IsValid()))return false;
     TestEqual(TEXT("one resource for shared geometry"),Dedup->Sources().Num(),2);
@@ -71,8 +71,8 @@ bool FVoxelPublishedCatalogTest::RunTest(const FString&){
     F.Hash=One->Sources()[1].GeometryMD5;
     F.Rows.Reset();F.Packet=OriginalPacket;F.Write();auto Revoked=FVoxelPublishedAppearanceCatalog::Load(F.Directory,Error);
     if(!TestTrue(TEXT("revoked inventory loads empty"),Revoked.IsValid()))return false;
-    TestEqual(TEXT("revoked source with stale bank and packet absent"),Revoked->FindResource(F.Hash),0u);
-    TestEqual(TEXT("prior immutable snapshot remains valid"),One->FindResource(F.Hash),1u);
+    TestEqual(TEXT("revoked source with stale bank and packet absent"),Revoked->FindResourceId(F.Hash),0u);
+    TestEqual(TEXT("prior immutable snapshot remains valid"),One->FindResourceId(F.Hash),1u);
     return true;
 }
 #endif

@@ -67,7 +67,7 @@ TSharedPtr<const FVoxelTerrainAppearancePage,ESPMode::ThreadSafe> FVoxelTerrainA
         if(!ID)continue;
         if(!Snapshot||ID>=uint32(Snapshot->Sources().Num()))return Fail(TEXT("resource outside retained catalog"));
         const auto& Source=Snapshot->Sources()[ID];
-        if(!Source.Appearance||!Source.Sparse||Source.Appearance->PitchMm()!=100||Snapshot->FindResource(Source.GeometryMD5)!=ID)return Fail(TEXT("invalid approved source identity or pitch"));
+        if(!Source.Appearance||!Source.Sparse||Source.Appearance->PitchMm()!=100||Snapshot->FindResourceId(Source.GeometryMD5)!=ID)return Fail(TEXT("invalid approved source identity or pitch"));
         const auto& W=Source.Sparse->Words;const auto& G=*Instance.grid;
         if(W.Num()<20||(W[0]!=1&&W[0]!=2)||W[1]!=uint32(W.Num())||W[13]!=(W[0]==1?100u:100000u)||W[7]!=uint32(G.sizeX())||W[8]!=uint32(G.sizeY())||W[9]!=uint32(G.sizeZ())||
            int32(W[10])!=G.originX()||int32(W[11])!=G.originY()||int32(W[12])!=G.originZ()||W[2]!=G.solidCount())return Fail(TEXT("bound grid differs from approved source layout"));

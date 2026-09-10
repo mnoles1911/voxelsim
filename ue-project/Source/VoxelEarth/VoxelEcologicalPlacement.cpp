@@ -172,7 +172,7 @@ bool VoxelEcologicalPlacement::Load(const FString& Path,const FString& Directory
     std::string Why;
     const bool Bound=vxc::ecoBindPublished(Config,BiomeMask,Named,Manifest,Banks,
         [&](const vxc::AssetGrid& Grid,const std::string& Identity){
-            const auto Expected=Catalog->FindResource(UTF8_TO_TCHAR(Identity.c_str()));
+            const auto Expected=Catalog->FindResourceId(UTF8_TO_TCHAR(Identity.c_str()));
             return Expected!=0&&Binding.ResourceFor(&Grid)==Expected;
         },Output,Why);
     if(!Bound)return Fail(UTF8_TO_TCHAR(Why.c_str()));

@@ -19,7 +19,7 @@ void GenericWrite(TArray<uint8>& B,int O,uint32 V){for(int I=0;I<4;++I)B[O+I]=ui
 TArray<uint8> GenericMesh(AActor* Actor){TArray<uint8> B;FMemoryWriter W(B);TArray<UProceduralMeshComponent*> Cs;Actor->GetComponents(Cs);for(auto C:Cs)if(auto S=C->GetProcMeshSection(0)){for(auto V:S->ProcVertexBuffer)W<<V.Position<<V.Normal<<V.UV0<<V.UV1<<V.Color;auto I=S->ProcIndexBuffer;W<<I;}return B;}
 bool GenericMode(AActor* Actor,bool Mask){TArray<UProceduralMeshComponent*> Cs;Actor->GetComponents(Cs);int Count=0;for(auto C:Cs){if(!C->GetProcMeshSection(0))continue;++Count;auto M=C->GetMaterial(0);if(!M)return false;float A=-1,N=-1,F=-1;M->GetScalarParameterValue(FMaterialParameterInfo(TEXT("TreeAppearance")),A);M->GetScalarParameterValue(FMaterialParameterInfo(TEXT("TreeNeedle")),N);M->GetScalarParameterValue(FMaterialParameterInfo(TEXT("FoliageCutout")),F);if(A!=1||N!=0||F!=(Mask?1.f:0.f))return false;}return Count>0;}
 struct FGenericDone {bool Done=false,OK=false;};
-struct FGenericStage {AActor* Actor=nullptr;bool Timber=false,Mask=false;TSharedPtr<FGenericDone> Status;TArray<uint8> Expected;FString SourceHash;};
+struct FGenericStage {AActor* Actor=nullptr;bool Timber=false,Mask=false;TSharedPtr<FGenericDone> Status;TArray<uint8> Expected;FString SourceHash;double Mm=0;};
 class FGenericRestoreProbe final:public IAutomationLatentCommand {
     FAutomationTestBase* Test;UWorld* World;TArray<FGenericStage> Items;TArray<FString> Files;double Start=FPlatformTime::Seconds();
 public:
@@ -29,7 +29,7 @@ public:
         for(auto& I:Items){if(I.Timber)CastChecked<AVoxelFallingTimber>(I.Actor)->AdvanceStagedObjectRestore();else CastChecked<AVoxelEnvironmentLODPrototype>(I.Actor)->AdvanceStagedObjectRestore();Done&=I.Status->Done;}
         if(!Done&&FPlatformTime::Seconds()-Start<90)return false;
         for(auto& I:Items){
-            if(Test->TestTrue(TEXT("generic/legacy staged completion"),I.Status->Done&&I.Status->OK)){
+            if(Test->TestTrue(*FString::Printf(TEXT("generic/legacy staged completion (%g mm %s)"),I.Mm,I.Timber?TEXT("timber"):TEXT("environment")),I.Status->Done&&I.Status->OK)){
                 Test->TestTrue(TEXT("staged geometry hidden until publication"),I.Actor->IsHidden());
                 const bool Published=I.Timber?CastChecked<AVoxelFallingTimber>(I.Actor)->PublishStagedObjectRestore():CastChecked<AVoxelEnvironmentLODPrototype>(I.Actor)->PublishStagedObjectRestore();
                 Test->TestTrue(TEXT("staged appearance publication"),Published);
@@ -49,7 +49,9 @@ bool FVoxelGenericRestoreTest::RunTest(const FString&){
     IFileManager::Get().MakeDirectory(*Directory,true);
     UWorld* World=UWorld::CreateWorld(EWorldType::Game,false,FName(*FGuid::NewGuid().ToString()));if(!World){AddError(TEXT("create isolated world"));return false;}
     TArray<FString> Files;TArray<FGenericStage> Staged;bool Good=true;
-    for(double Mm:{12.5,25.,100.}){
+    // Environment sources sit on the world ladder (ADR-0010: 100/50/25 mm; 12.5 mm is
+    // reserved for craftables and creatures), so the finest generic case is 25 mm.
+    for(double Mm:{50.,25.,100.}){
         const bool Legacy=Mm==100.;const uint8 Material=Legacy?19:24;const uint32 Um=uint32(Mm*1000);
         constexpr int Size=8,Count=Size*Size*Size;
         TArray<uint8> Vxa;Vxa.SetNumZeroed(53);FMemory::Memcpy(Vxa.GetData(),"VXA1",4);GenericWrite(Vxa,4,Mm==12.5?4:3);
@@ -67,7 +69,7 @@ bool FVoxelGenericRestoreTest::RunTest(const FString&){
         auto Source=World->SpawnActor<AVoxelEnvironmentLODPrototype>();FVoxelEnvironmentAssetDescriptor Descriptor;Descriptor.SpecId=Legacy?TEXT("legacy-mask-fixture"):TEXT("opaque-petal-fixture");Descriptor.Kind=Legacy?TEXT("tree"):TEXT("flower");Descriptor.Category=TEXT("environment");Descriptor.Fellable=false;
         if(!TestTrue(TEXT("initialize source actor"),Source&&Source->InitializeAssetFromVxa(Descriptor,Vxa,true,false))){Good=false;break;}
         TestTrue(TEXT("source material24 petals opaque, legacy foliage masked"),GenericMode(Source,Legacy));
-        const int ExpectedLevels=Mm==12.5?4:Mm==25?3:1;
+        const int ExpectedLevels=Mm==25?3:Mm==50?2:1;
         TestEqual(TEXT("complete hierarchy through 100mm"),Source->LevelCount(),ExpectedLevels);
         TArray<int> FacesPerLevel;FacesPerLevel.Init(0,ExpectedLevels);
         TArray<UProceduralMeshComponent*> Meshes;Source->GetComponents(Meshes);int Faces=0;
@@ -94,7 +96,7 @@ bool FVoxelGenericRestoreTest::RunTest(const FString&){
         TestTrue(TEXT("sync actor appearance flags"),GenericMode(Restored,Legacy));TestTrue(TEXT("sync actor RGB UV geometry exact"),GenericMesh(Restored)==GenericMesh(Source));
         auto ActorStage=World->SpawnActor<AVoxelEnvironmentLODPrototype>();auto ActorDone=MakeShared<FGenericDone>();
         if(!TestNotNull(TEXT("spawn staged actor"),ActorStage)){Good=false;break;}
-        ActorStage->BeginStagedObjectRestore(Geometry,Dynamic,[ActorDone](bool OK){ActorDone->OK=OK;ActorDone->Done=true;});Staged.Add({ActorStage,false,Legacy,ActorDone,GenericMesh(Source),Hash});
+        ActorStage->BeginStagedObjectRestore(Geometry,Dynamic,[ActorDone](bool OK){ActorDone->OK=OK;ActorDone->Done=true;});Staged.Add({ActorStage,false,Legacy,ActorDone,GenericMesh(Source),Hash,Mm});
         // Transfer actual rendered source sections through the same public timber
         // ownership path used by felling, then test its packed save serializer.
         Meshes.Reset();Restored->GetComponents(Meshes);auto Timber=World->SpawnActor<AVoxelFallingTimber>();
@@ -106,7 +108,7 @@ bool FVoxelGenericRestoreTest::RunTest(const FString&){
         TestTrue(TEXT("bit4 opaque disabled only for legacy cutouts"),GenericMode(TimberSync,Legacy));TestTrue(TEXT("sync detached RGB UV geometry exact"),GenericMesh(TimberSync)==GenericMesh(Timber));
         auto TimberStage=World->SpawnActor<AVoxelFallingTimber>();auto TimberDone=MakeShared<FGenericDone>();
         if(!TestNotNull(TEXT("spawn staged detached actor"),TimberStage)){Good=false;break;}
-        TimberStage->BeginStagedObjectRestore(TG,TD,[TimberDone](bool OK){TimberDone->OK=OK;TimberDone->Done=true;});Staged.Add({TimberStage,true,Legacy,TimberDone,GenericMesh(TimberSync),{}});
+        TimberStage->BeginStagedObjectRestore(TG,TD,[TimberDone](bool OK){TimberDone->OK=OK;TimberDone->Done=true;});Staged.Add({TimberStage,true,Legacy,TimberDone,GenericMesh(TimberSync),{},Mm});
     }
     if(Good){ADD_LATENT_AUTOMATION_COMMAND(FGenericRestoreProbe(this,World,MoveTemp(Staged),MoveTemp(Files)));return true;}
     for(auto& I:Staged){if(I.Timber)CastChecked<AVoxelFallingTimber>(I.Actor)->CancelStagedObjectRestore();else CastChecked<AVoxelEnvironmentLODPrototype>(I.Actor)->CancelStagedObjectRestore();}

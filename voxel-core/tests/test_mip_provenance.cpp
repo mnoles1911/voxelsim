@@ -13,7 +13,11 @@ MaterialId oracleMaterial(const MaterialId (&cells)[8],int threshold,bool surfac
     for(auto m:cells)if(m!=MAT_AIR)sorted[static_cast<size_t>(count++)]=m;
     if(count<threshold||count==0)return MAT_AIR;
     if(surface){for(int z=1;z>=0;--z)for(int i=z*4;i<z*4+4;++i)if(cells[i]!=MAT_AIR)return cells[i];}
-    std::sort(sorted.begin(),sorted.begin()+count);
+    // Insertion sort over at most eight votes: std::sort on a bounded std::array trips
+    // GCC 13 -Warray-bounds inside the introsort at -O2, which -Werror turns fatal.
+    for(int i=1;i<count;++i){const MaterialId v=sorted[static_cast<size_t>(i)];int j=i;
+        while(j>0&&sorted[static_cast<size_t>(j-1)]>v){sorted[static_cast<size_t>(j)]=sorted[static_cast<size_t>(j-1)];--j;}
+        sorted[static_cast<size_t>(j)]=v;}
     MaterialId winner=MAT_AIR;int best=0;
     for(int first=0;first<count;){int end=first+1;while(end<count&&sorted[static_cast<size_t>(end)]==sorted[static_cast<size_t>(first)])++end;if(end-first>best){best=end-first;winner=sorted[static_cast<size_t>(first)];}first=end;}
     return winner;

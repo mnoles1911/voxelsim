@@ -1,0 +1,2362 @@
+{
+  "schema": 1,
+  "scope": "One matched actual256m editor pair, draw-distance policy only. Not residency savings, shipping or broad gameplay acceptance; no48m inference.",
+  "baseline": "D:\\voxelsim\\asset-forge\\out\\ecological-placement\\walk-capture-26-full256-cull-off",
+  "current": "D:\\voxelsim\\asset-forge\\out\\ecological-placement\\walk-capture-27-full256-cull-on",
+  "matching_pins": {
+    "configurationSha256": "E68B98F5D52952D59CECE8E4403C6D42EADDB9FEE5D3259DABB999A6F1AD0936",
+    "speciesManifestSha256": "0197DA097E17A2634C2F15DCA0589E5E98157EB631C2998513769738427DD4F6",
+    "detailCacheManifestSha256": "603C973EC9E8CC57F25EBF3C1C4D52A0CE61DD53F24D44FCD347683189E3B0D0"
+  },
+  "matching_runtime_module_hashes": {
+    "UnrealEditor-VoxelEarthUI.dll": "5DC6C1D3DBC6FE5941DE8E9EC4C02EC74A41B6AF4C9DB3C7E9C7FB129A342B09",
+    "UnrealEditor-VoxelEarth.dll": "D198449B933726B974A2E12B82BF45C5ACF33CB9222AEFF2202986DBA1FED678",
+    "UnrealEditor-VoxelEarthShaders.dll": "2F9A3F7AD8D706DF2ABCA410C49583E5A81F9A47BA172462278463967E66CC2C"
+  },
+  "binary_scope": "Both captures have passing persisted receipts binding manifest, artifacts, and matching start/end module and input hashes; no competing UE/compiler process observed.",
+  "initial_instances": 123005,
+  "internal_resolutions": [
+    [
+      832,
+      468
+    ]
+  ],
+  "shader_identity": [
+    "6935",
+    "3C83B3508B5CD1A5",
+    "12AEDEA4664A74C1CFFA76FE316182800344C428"
+  ],
+  "size_policy_exercise": [
+    {
+      "key": "00290001",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "000b0001",
+      "start_m": 68.0,
+      "end_m": 80.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00400002",
+      "start_m": 54.4,
+      "end_m": 64.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00550001",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "004a0001",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00480002",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00300001",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00570001",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00990001",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00840001",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00680001",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00240001",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "002d0001",
+      "start_m": 217.6,
+      "end_m": 256.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00070002",
+      "start_m": 217.6,
+      "end_m": 256.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "004f0002",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "007b0001",
+      "start_m": 54.4,
+      "end_m": 64.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00670001",
+      "start_m": 204.0,
+      "end_m": 240.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00990000",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00050002",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "007f0002",
+      "start_m": 68.0,
+      "end_m": 80.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00650001",
+      "start_m": 136.0,
+      "end_m": 160.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "002d0002",
+      "start_m": 217.6,
+      "end_m": 256.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "000b0002",
+      "start_m": 95.2,
+      "end_m": 112.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00770001",
+      "start_m": 217.6,
+      "end_m": 256.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00950001",
+      "start_m": 176.8,
+      "end_m": 208.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00130002",
+      "start_m": 81.6,
+      "end_m": 96.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00640002",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00210001",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "005b0002",
+      "start_m": 68.0,
+      "end_m": 80.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00650002",
+      "start_m": 204.0,
+      "end_m": 240.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00160001",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "004b0001",
+      "start_m": 54.4,
+      "end_m": 64.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "009b0001",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00570002",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "007f0001",
+      "start_m": 54.4,
+      "end_m": 64.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00500002",
+      "start_m": 81.6,
+      "end_m": 96.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00340001",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00640001",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00330001",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00240002",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00540002",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00130001",
+      "start_m": 68.0,
+      "end_m": 80.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00280001",
+      "start_m": 149.6,
+      "end_m": 176.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00680000",
+      "start_m": 54.4,
+      "end_m": 64.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00540000",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "003c0001",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "009f0001",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "007b0002",
+      "start_m": 95.2,
+      "end_m": 112.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "005b0001",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "004f0001",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00570000",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "005e0003",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "005e0000",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "007f0003",
+      "start_m": 81.6,
+      "end_m": 96.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "003f0002",
+      "start_m": 217.6,
+      "end_m": 256.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "000c0003",
+      "start_m": 176.8,
+      "end_m": 208.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "006d0001",
+      "start_m": 95.2,
+      "end_m": 112.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00340002",
+      "start_m": 54.4,
+      "end_m": 64.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00290002",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "005e0001",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "000a0001",
+      "start_m": 149.6,
+      "end_m": 176.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00480001",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00160003",
+      "start_m": 68.0,
+      "end_m": 80.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "005b0000",
+      "start_m": 68.0,
+      "end_m": 80.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00630000",
+      "start_m": 81.6,
+      "end_m": 96.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00200001",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "005b0003",
+      "start_m": 68.0,
+      "end_m": 80.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "003c0003",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00370001",
+      "start_m": 95.2,
+      "end_m": 112.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00680002",
+      "start_m": 54.4,
+      "end_m": 64.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "003c0000",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00050000",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "000b0003",
+      "start_m": 95.2,
+      "end_m": 112.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00160000",
+      "start_m": 68.0,
+      "end_m": 80.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00400000",
+      "start_m": 54.4,
+      "end_m": 64.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "009f0000",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00200000",
+      "start_m": 68.0,
+      "end_m": 80.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00640003",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00270000",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "009d0001",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "000b0000",
+      "start_m": 95.2,
+      "end_m": 112.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "009f0003",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00030001",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00540001",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "001d0000",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "001d0003",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00210002",
+      "start_m": 54.4,
+      "end_m": 64.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00550000",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00550003",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00410003",
+      "start_m": 54.4,
+      "end_m": 64.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "007f0000",
+      "start_m": 81.6,
+      "end_m": 96.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00240003",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00950002",
+      "start_m": 217.6,
+      "end_m": 256.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "001a0001",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00540003",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00050001",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "000c0002",
+      "start_m": 149.6,
+      "end_m": 176.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00730001",
+      "start_m": 122.4,
+      "end_m": 144.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00050003",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00570003",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00990002",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00210003",
+      "start_m": 81.6,
+      "end_m": 96.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00070001",
+      "start_m": 217.6,
+      "end_m": 256.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00240000",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "009f0002",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "005d0002",
+      "start_m": 54.4,
+      "end_m": 64.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00400003",
+      "start_m": 54.4,
+      "end_m": 64.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00640000",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "009d0002",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00160002",
+      "start_m": 54.4,
+      "end_m": 64.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "001a0002",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "001d0001",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00410002",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00400001",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00950000",
+      "start_m": 217.6,
+      "end_m": 256.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00770000",
+      "start_m": 217.6,
+      "end_m": 256.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00330002",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00680003",
+      "start_m": 54.4,
+      "end_m": 64.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "005d0001",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "001f0002",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "003c0002",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00200002",
+      "start_m": 54.4,
+      "end_m": 64.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00410000",
+      "start_m": 54.4,
+      "end_m": 64.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "005e0002",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "001b0002",
+      "start_m": 190.4,
+      "end_m": 224.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "001f0003",
+      "start_m": 54.4,
+      "end_m": 64.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00270002",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "001f0000",
+      "start_m": 54.4,
+      "end_m": 64.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "001b0000",
+      "start_m": 217.6,
+      "end_m": 256.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "000c0001",
+      "start_m": 95.2,
+      "end_m": 112.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00070003",
+      "start_m": 217.6,
+      "end_m": 256.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00840002",
+      "start_m": 68.0,
+      "end_m": 80.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00630002",
+      "start_m": 68.0,
+      "end_m": 80.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00280002",
+      "start_m": 217.6,
+      "end_m": 256.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "009b0002",
+      "start_m": 54.4,
+      "end_m": 64.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00370002",
+      "start_m": 122.4,
+      "end_m": 144.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "005d0003",
+      "start_m": 68.0,
+      "end_m": 80.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00330003",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00630003",
+      "start_m": 81.6,
+      "end_m": 96.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00410001",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "005d0000",
+      "start_m": 68.0,
+      "end_m": 80.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "004a0002",
+      "start_m": 54.4,
+      "end_m": 64.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00630001",
+      "start_m": 54.4,
+      "end_m": 64.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00480000",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00500001",
+      "start_m": 54.4,
+      "end_m": 64.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00130003",
+      "start_m": 108.8,
+      "end_m": 128.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "001f0001",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00670002",
+      "start_m": 217.6,
+      "end_m": 256.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00550002",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "009b0000",
+      "start_m": 68.0,
+      "end_m": 80.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00200003",
+      "start_m": 68.0,
+      "end_m": 80.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00270001",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00840000",
+      "start_m": 68.0,
+      "end_m": 80.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00210000",
+      "start_m": 81.6,
+      "end_m": 96.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "001d0002",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00330000",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "007b0000",
+      "start_m": 122.4,
+      "end_m": 144.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00390002",
+      "start_m": 176.8,
+      "end_m": 208.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "000a0002",
+      "start_m": 190.4,
+      "end_m": 224.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "000a0003",
+      "start_m": 217.6,
+      "end_m": 256.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00390001",
+      "start_m": 136.0,
+      "end_m": 160.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "003f0000",
+      "start_m": 217.6,
+      "end_m": 256.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00070000",
+      "start_m": 217.6,
+      "end_m": 256.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00270003",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00280003",
+      "start_m": 217.6,
+      "end_m": 256.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00730002",
+      "start_m": 176.8,
+      "end_m": 208.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00030002",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00390003",
+      "start_m": 217.6,
+      "end_m": 256.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00950003",
+      "start_m": 217.6,
+      "end_m": 256.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "003f0001",
+      "start_m": 217.6,
+      "end_m": 256.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "001b0001",
+      "start_m": 136.0,
+      "end_m": 160.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00390000",
+      "start_m": 217.6,
+      "end_m": 256.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "002d0000",
+      "start_m": 217.6,
+      "end_m": 256.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "000c0000",
+      "start_m": 176.8,
+      "end_m": 208.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00770002",
+      "start_m": 217.6,
+      "end_m": 256.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00730003",
+      "start_m": 204.0,
+      "end_m": 240.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00280000",
+      "start_m": 217.6,
+      "end_m": 256.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "006d0002",
+      "start_m": 136.0,
+      "end_m": 160.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "000a0000",
+      "start_m": 217.6,
+      "end_m": 256.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "001b0003",
+      "start_m": 217.6,
+      "end_m": 256.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00030003",
+      "start_m": 54.4,
+      "end_m": 64.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00300003",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00300002",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "009d0003",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00810003",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00130000",
+      "start_m": 108.8,
+      "end_m": 128.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00030000",
+      "start_m": 54.4,
+      "end_m": 64.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00300000",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00500000",
+      "start_m": 108.8,
+      "end_m": 128.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "007b0003",
+      "start_m": 122.4,
+      "end_m": 144.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "009d0000",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "009b0003",
+      "start_m": 68.0,
+      "end_m": 80.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00810000",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00340000",
+      "start_m": 68.0,
+      "end_m": 80.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "004f0003",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "006d0003",
+      "start_m": 149.6,
+      "end_m": 176.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00670003",
+      "start_m": 217.6,
+      "end_m": 256.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00990003",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "006d0000",
+      "start_m": 149.6,
+      "end_m": 176.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00340003",
+      "start_m": 68.0,
+      "end_m": 80.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "001a0003",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00730000",
+      "start_m": 204.0,
+      "end_m": 240.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "001a0000",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "004f0000",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00430001",
+      "start_m": 217.6,
+      "end_m": 256.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00500003",
+      "start_m": 108.8,
+      "end_m": 128.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00580003",
+      "start_m": 217.6,
+      "end_m": 256.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00650003",
+      "start_m": 217.6,
+      "end_m": 256.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "003f0003",
+      "start_m": 217.6,
+      "end_m": 256.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00580000",
+      "start_m": 217.6,
+      "end_m": 256.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00770003",
+      "start_m": 217.6,
+      "end_m": 256.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00100001",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00370003",
+      "start_m": 163.2,
+      "end_m": 192.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00670000",
+      "start_m": 217.6,
+      "end_m": 256.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00810001",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00580001",
+      "start_m": 204.0,
+      "end_m": 240.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "003b0001",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "004c0001",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "009c0001",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "003b0002",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00650000",
+      "start_m": 217.6,
+      "end_m": 256.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "009c0002",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "002d0003",
+      "start_m": 217.6,
+      "end_m": 256.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "004c0002",
+      "start_m": 68.0,
+      "end_m": 80.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00580002",
+      "start_m": 217.6,
+      "end_m": 256.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00100002",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "004c0000",
+      "start_m": 68.0,
+      "end_m": 80.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00810002",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "003d0001",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "003d0002",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00620001",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "009a0002",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00750002",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00620002",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "001e0002",
+      "start_m": 217.6,
+      "end_m": 256.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "001c0002",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00750001",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "006f0002",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "003b0000",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00470002",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00740002",
+      "start_m": 68.0,
+      "end_m": 80.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "005f0001",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00590002",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00890002",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00360001",
+      "start_m": 54.4,
+      "end_m": 64.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00530002",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00870001",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "006b0002",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "008e0002",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00520001",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00010001",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00110002",
+      "start_m": 136.0,
+      "end_m": 160.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00260001",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "006f0001",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "004e0002",
+      "start_m": 54.4,
+      "end_m": 64.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00850002",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "008b0001",
+      "start_m": 95.2,
+      "end_m": 112.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "005c0001",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "000e0001",
+      "start_m": 136.0,
+      "end_m": 160.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00140002",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "005f0002",
+      "start_m": 54.4,
+      "end_m": 64.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "008c0002",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "004e0001",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00760002",
+      "start_m": 54.4,
+      "end_m": 64.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "000f0001",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "008d0002",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00660001",
+      "start_m": 95.2,
+      "end_m": 112.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00610002",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "000e0002",
+      "start_m": 190.4,
+      "end_m": 224.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00890001",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00880002",
+      "start_m": 81.6,
+      "end_m": 96.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00a10002",
+      "start_m": 54.4,
+      "end_m": 64.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "001c0001",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "008a0002",
+      "start_m": 54.4,
+      "end_m": 64.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00380002",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00a00002",
+      "start_m": 81.6,
+      "end_m": 96.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00520002",
+      "start_m": 54.4,
+      "end_m": 64.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "000d0002",
+      "start_m": 68.0,
+      "end_m": 80.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00970002",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "007a0002",
+      "start_m": 68.0,
+      "end_m": 80.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00090001",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00a00001",
+      "start_m": 68.0,
+      "end_m": 80.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00080002",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "009a0001",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00760001",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00090002",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "006b0001",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00220001",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00860000",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00530001",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "003a0002",
+      "start_m": 217.6,
+      "end_m": 256.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "005c0002",
+      "start_m": 54.4,
+      "end_m": 64.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00110001",
+      "start_m": 95.2,
+      "end_m": 112.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00970001",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00690001",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "000d0001",
+      "start_m": 54.4,
+      "end_m": 64.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "006b0000",
+      "start_m": 54.4,
+      "end_m": 64.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "008e0001",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00690002",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00960001",
+      "start_m": 54.4,
+      "end_m": 64.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00220002",
+      "start_m": 40.8,
+      "end_m": 48.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00870002",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00880001",
+      "start_m": 54.4,
+      "end_m": 64.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "00880000",
+      "start_m": 95.2,
+      "end_m": 112.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    },
+    {
+      "key": "008d0000",
+      "start_m": 27.2,
+      "end_m": 32.0,
+      "ring_m": 256.0,
+      "fallback": 0
+    }
+  ],
+  "csv_column_diagnostics": [
+    {
+      "ambiguous_columns_excluded": {
+        "FMsgLogf/FMsgLogfCount": [
+          96,
+          393
+        ]
+      },
+      "duplicate_policy": "Exclude every occurrence of ambiguous nonprimary names; primary/route duplicates are fatal. No inferred thread sums."
+    },
+    {
+      "ambiguous_columns_excluded": {
+        "FMsgLogf/FMsgLogfCount": [
+          375,
+          391
+        ]
+      },
+      "duplicate_policy": "Exclude every occurrence of ambiguous nonprimary names; primary/route duplicates are fatal. No inferred thread sums."
+    }
+  ],
+  "phases": {
+    "WalkForward": {
+      "FrameTime": {
+        "off_ms": {
+          "median": 43.3969,
+          "p95": 338.67195,
+          "max": 395.3234
+        },
+        "on_ms": {
+          "median": 38.4888,
+          "p95": 317.2671449999999,
+          "max": 412.6005
+        },
+        "change_percent": {
+          "median": -11.309794017545038,
+          "p95": -6.320217839121334,
+          "max": 4.370371194824285
+        }
+      },
+      "GameThreadTime": {
+        "off_ms": {
+          "median": 40.2474,
+          "p95": 339.20875,
+          "max": 391.7262
+        },
+        "on_ms": {
+          "median": 39.042249999999996,
+          "p95": 316.54185499999994,
+          "max": 408.7287
+        },
+        "change_percent": {
+          "median": -2.994354914851649,
+          "p95": -6.6822848762008835,
+          "max": 4.340404088365801
+        }
+      },
+      "GPUTime": {
+        "off_ms": {
+          "median": 42.4472,
+          "p95": 45.5798,
+          "max": 47.2581
+        },
+        "on_ms": {
+          "median": 21.58925,
+          "p95": 23.1357,
+          "max": 23.4206
+        },
+        "change_percent": {
+          "median": -49.13857686726097,
+          "p95": -49.24133058942777,
+          "max": -50.4410884060087
+        }
+      },
+      "VoxelStream/TickMs": {
+        "off_ms": {
+          "median": 3.6318,
+          "p95": 301.2745,
+          "max": 354.0549
+        },
+        "on_ms": {
+          "median": 2.2535,
+          "p95": 282.3826299999999,
+          "max": 373.9049
+        },
+        "change_percent": {
+          "median": -37.95087835233218,
+          "p95": -6.270650187785587,
+          "max": 5.6064751539944835
+        }
+      },
+      "VoxelStream/GameThread/DetailTickMs": {
+        "off_ms": {
+          "median": 1.0667,
+          "p95": 2.7527999999999997,
+          "max": 7.1474
+        },
+        "on_ms": {
+          "median": 1.1080999999999999,
+          "p95": 3.4201849999999987,
+          "max": 7.4273
+        },
+        "change_percent": {
+          "median": 3.881128714727655,
+          "p95": 24.243860796280114,
+          "max": 3.91610935445057
+        }
+      }
+    },
+    "SprintGate": {
+      "FrameTime": {
+        "off_ms": {
+          "median": 51.889700000000005,
+          "p95": 354.54765,
+          "max": 556.4869
+        },
+        "on_ms": {
+          "median": 54.5131,
+          "p95": 492.8056,
+          "max": 598.7001
+        },
+        "change_percent": {
+          "median": 5.055723968340531,
+          "p95": 38.99559057858657,
+          "max": 7.585659249121601
+        }
+      },
+      "GameThreadTime": {
+        "off_ms": {
+          "median": 51.2851,
+          "p95": 337.4919,
+          "max": 557.4053
+        },
+        "on_ms": {
+          "median": 53.6567,
+          "p95": 432.63405,
+          "max": 492.5597
+        },
+        "change_percent": {
+          "median": 4.624345082684833,
+          "p95": 28.190943249304645,
+          "max": -11.633473883366374
+        }
+      },
+      "GPUTime": {
+        "off_ms": {
+          "median": 39.1854,
+          "p95": 44.292075,
+          "max": 49.3714
+        },
+        "on_ms": {
+          "median": 20.3803,
+          "p95": 26.2054,
+          "max": 29.9671
+        },
+        "change_percent": {
+          "median": -47.99006772930735,
+          "p95": -40.8350139387238,
+          "max": -39.302713716848224
+        }
+      },
+      "VoxelStream/TickMs": {
+        "off_ms": {
+          "median": 9.525649999999999,
+          "p95": 268.836675,
+          "max": 475.4692
+        },
+        "on_ms": {
+          "median": 10.7079,
+          "p95": 304.80695000000003,
+          "max": 377.8473
+        },
+        "change_percent": {
+          "median": 12.411226530472996,
+          "p95": 13.379973175162952,
+          "max": -20.531697952254312
+        }
+      },
+      "VoxelStream/GameThread/DetailTickMs": {
+        "off_ms": {
+          "median": 1.9997,
+          "p95": 9.608725,
+          "max": 12.9121
+        },
+        "on_ms": {
+          "median": 2.5259,
+          "p95": 11.00095,
+          "max": 18.873
+        },
+        "change_percent": {
+          "median": 26.313947092063806,
+          "p95": 14.489175202745418,
+          "max": 46.165224866597995
+        }
+      }
+    }
+  }
+}

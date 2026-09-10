@@ -14,7 +14,7 @@ public:
         // VXA admission already bounded the input. Hash exactly the bytes used
         // by the parser, never a second filesystem read of the same path.
         uint32 ID=0;
-        if(Catalog&&Size<=uint64(MAX_int32))ID=Catalog->FindResource(FMD5::HashBytes(Bytes,int32(Size)));
+        if(Catalog&&Size<=uint64(MAX_int32))ID=Catalog->FindResourceId(FMD5::HashBytes(Bytes,int32(Size)));
         FScopeLock Lock(&Mutex);Resources.Add(&Grid,ID);
     }
     uint32 ResourceFor(const vxc::AssetGrid* Grid) const {
