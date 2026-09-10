@@ -1151,7 +1151,7 @@ struct FVoxelDetailAssetImpl
     TMap<uint32,double> RetirementUnusedSince;
     double RetirementNextScan=0,RetirementBlockedSince=0,RetirementLogTimer=0;
     uint64 RetirementProbes=0,RetirementKeysRemoved=0,RetirementObjectsUnrooted=0;
-    uint64 RetirementDeferredTicks=0,RetirementLimitSkips=0,RetirementHismDeferred=0;
+    uint64 RetirementDeferredTicks=0,RetirementLimitSkips=0,RetirementHismDeferred=0,RetirementHismRebuilt=0;
 
     TSharedPtr<const FVoxelDetailMeshCacheIndex,ESPMode::ThreadSafe> Cache;
     FStreamableManager CacheStreamable;
@@ -1538,8 +1538,14 @@ static bool TickDetailMeshRetirement(FVoxelDetailAssetImpl& S,
                 }
                 // ClearInstances marks the tree out of date; game-thread bDirty
                 // alone does not establish that HISM worker/build application ended.
-                if(Entry->Hism->IsAsyncBuilding()||!Entry->Hism->IsTreeFullyBuilt()){
-                    ++S.RetirementHismDeferred;continue;
+                if(Entry->Hism->IsAsyncBuilding()){++S.RetirementHismDeferred;continue;}
+                if(!Entry->Hism->IsTreeFullyBuilt()){
+                    // ClearInstances leaves the tree out of date and nothing ever rebuilds a
+                    // hidden empty one, so the first pilot route (route-capture-9) pinned
+                    // 1,282 probes here and retired nothing. Request the (empty) rebuild
+                    // once; eligibility comes on a later probe. No wait, no flush, no GC.
+                    ++S.RetirementHismDeferred;++S.RetirementHismRebuilt;
+                    Entry->Hism->BuildTreeIfOutdated(true,false);continue;
                 }
                 const double* Since=S.RetirementUnusedSince.Find(Key);
                 if(!Since){S.RetirementUnusedSince.Add(Key,Now);continue;}
@@ -1563,8 +1569,8 @@ static bool TickDetailMeshRetirement(FVoxelDetailAssetImpl& S,
         // retires objects, so progress/convergence logging must not gate it.
         S.RetirementLogTimer+=DeltaTime;
         if(S.RetirementLogTimer>=5.0){S.RetirementLogTimer=0;
-            UE_LOG(LogVoxelEarth,Log,TEXT("DetailRetirement opportunistic totals: probes=%llu keys=%llu objectsUnrooted=%llu deferredTicks=%llu limitSkips=%llu hismDeferred=%llu blockedSeconds=%.3f meshes=%d cachedResources=%d roots=%d components=%d queuedKeys=%d; no hardcap or reclaimed-byte claim"),
-                S.RetirementProbes,S.RetirementKeysRemoved,S.RetirementObjectsUnrooted,S.RetirementDeferredTicks,S.RetirementLimitSkips,S.RetirementHismDeferred,
+            UE_LOG(LogVoxelEarth,Log,TEXT("DetailRetirement opportunistic totals: probes=%llu keys=%llu objectsUnrooted=%llu deferredTicks=%llu limitSkips=%llu hismDeferred=%llu hismRebuilt=%llu blockedSeconds=%.3f meshes=%d cachedResources=%d roots=%d components=%d queuedKeys=%d; no hardcap or reclaimed-byte claim"),
+                S.RetirementProbes,S.RetirementKeysRemoved,S.RetirementObjectsUnrooted,S.RetirementDeferredTicks,S.RetirementLimitSkips,S.RetirementHismDeferred,S.RetirementHismRebuilt,
                 S.RetirementBlockedSince?FPlatformTime::Seconds()-S.RetirementBlockedSince:0.,S.Meshes.Num(),S.CachedMeshes.Num(),BuiltMeshes.Num(),HismComponents.Num(),S.RetirementKeys.Num());
         }
 

@@ -1,0 +1,18 @@
+{
+  "status": "passed",
+  "pinsVerified": true,
+  "arrivals": 18,
+  "checkpointImages": 18,
+  "trajectorySamples": 297,
+  "legsShorterThanSampleIntervalWithoutCsvRows": [],
+  "actualSpeedMedianMps": 2.2,
+  "groundedSamples": 295,
+  "waitingSamples": 0,
+  "heightRangeM": [
+    92.801,
+    102.101
+  ],
+  "terminalResult": "PASS: All authored waypoints reached; optional foundation evidence recorded, not approved; arrived=18/18; travel_m=340.877; no broad navigability or building-support acceptance",
+  "authoredRouteScope": "Out-and-back hill revisit pilot. Outbound route completed in captures6/7; reverse direction and resource restoration remain unverified. Designed for48m diagnostic residency ring, not256m unload acceptance.",
+  "scope": "One authored pawn route; no general navigation, sightline, building-support or performance acceptance."
+}

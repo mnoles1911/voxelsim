@@ -29,3 +29,22 @@ itself in its final phase; production never did.
 Fix applied for the second run: when a candidate is not async-building but its tree is out of
 date, request `BuildTreeIfOutdated(true,false)` once (counted as `hismRebuilt`) and keep
 deferring; eligibility follows on a later probe. No wait, flush or forced GC is introduced.
+
+## Second run with the fix (route captures 10 OFF / 11 ON), same day
+
+Binary: the pilot branch plus the empty-tree rebuild request (`.scratch/retirement-build-2`,
+coherent). Fourth bake `temperate-authored-lods-full-4` (identity source changed again),
+verified, geometry identical. Automation 8/8 again (`automation-run-2.txt`).
+
+Both arms 18/18 arrivals, 295/297 and 296/297 grounded, zero waiting, 2.2 m/s. Frame medians
+identical (23.0 vs 23.1 ms frame, 13.4 ms GPU).
+
+**The ON arm now retires** (`route-capture-11-retirement-telemetry.txt`): final totals
+probes=29,017 keys=13 objectsUnrooted=13 hismDeferred=39 hismRebuilt=39 blockedSeconds=0,
+meshes 94 resident at the end (new species keep arriving along the route). Every deferral
+was a rebuild request and every request later cleared, so the pin from run 1 is gone. Thirteen
+retirements on a 344 m out-and-back at the 48 m ring is the honest size of the effect: the
+pilot is opportunistic, continuous travel keeps most keys in use, and no byte reclamation is
+claimed. What it establishes: the barrier, the alias/root bookkeeping and the rebuild path
+work on real assets without touching navigation or frame time. The 256 m unload/revisit case
+and actual memory accounting remain to be measured.

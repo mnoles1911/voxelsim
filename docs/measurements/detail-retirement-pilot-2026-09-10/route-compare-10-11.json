@@ -1,0 +1,153 @@
+﻿{
+  "schema": 1,
+  "before": "D:\\voxelsim\\asset-forge\\out\\ecological-placement\\route-capture-10-revisit-retire-off",
+  "after": "D:\\voxelsim\\asset-forge\\out\\ecological-placement\\route-capture-11-revisit-retire-on",
+  "scope": "One same-route editor comparison of combined builds, not an isolated optimization A/B, repeated-run confidence, culling or default256m acceptance.",
+  "matching_scene_pins": true,
+  "matching_cache_model_fingerprints": 339,
+  "runtime_module_hashes": [
+    {
+      "UnrealEditor-VoxelEarthShaders.dll": "2F9A3F7AD8D706DF2ABCA410C49583E5A81F9A47BA172462278463967E66CC2C",
+      "UnrealEditor-VoxelEarth.dll": "5EFE4816B3F32161CC19E10928D35EDE89088EAA8ED505AD3D48262AFF0107A0"
+    },
+    {
+      "UnrealEditor-VoxelEarthShaders.dll": "2F9A3F7AD8D706DF2ABCA410C49583E5A81F9A47BA172462278463967E66CC2C",
+      "UnrealEditor-VoxelEarth.dll": "5EFE4816B3F32161CC19E10928D35EDE89088EAA8ED505AD3D48262AFF0107A0"
+    }
+  ],
+  "walking_frames": [
+    4892,
+    4851
+  ],
+  "route_evidence": [
+    {
+      "pinsVerified": true,
+      "arrivals": 18,
+      "trajectorySamples": 297,
+      "groundedSamples": 295,
+      "waitingSamples": 0
+    },
+    {
+      "pinsVerified": true,
+      "arrivals": 18,
+      "trajectorySamples": 297,
+      "groundedSamples": 296,
+      "waitingSamples": 0
+    }
+  ],
+  "csv_column_diagnostics": [
+    {
+      "ambiguous_columns_excluded": {
+        "ShadowCacheUsageMB": [
+          73,
+          425
+        ],
+        "LightCount/UpdatedShadowMaps": [
+          74,
+          426
+        ],
+        "FMsgLogf/FMsgLogfCount": [
+          268,
+          410
+        ]
+      },
+      "duplicate_policy": "Exclude every occurrence of ambiguous nonprimary names; primary/route duplicates are fatal. No inferred thread sums."
+    },
+    {
+      "ambiguous_columns_excluded": {
+        "FMsgLogf/FMsgLogfCount": [
+          269,
+          411
+        ]
+      },
+      "duplicate_policy": "Exclude every occurrence of ambiguous nonprimary names; primary/route duplicates are fatal. No inferred thread sums."
+    }
+  ],
+  "metrics": {
+    "FrameTime": {
+      "before_ms": {
+        "median": 23.0116,
+        "p95": 43.52002999999999,
+        "max": 1650.7131
+      },
+      "after_ms": {
+        "median": 23.135,
+        "p95": 44.456500000000005,
+        "max": 1664.475
+      },
+      "change_percent": {
+        "median": 0.5362512819621523,
+        "p95": 2.1518137740254684,
+        "max": 0.8336942379629786
+      }
+    },
+    "GameThreadTime": {
+      "before_ms": {
+        "median": 22.96065,
+        "p95": 38.307289999999995,
+        "max": 1651.2421
+      },
+      "after_ms": {
+        "median": 23.1067,
+        "p95": 38.10795,
+        "max": 1664.7614
+      },
+      "change_percent": {
+        "median": 0.6360882640517485,
+        "p95": -0.5203709267870171,
+        "max": 0.8187351812311672
+      }
+    },
+    "GPUTime": {
+      "before_ms": {
+        "median": 13.362,
+        "p95": 15.491670000000001,
+        "max": 24.7722
+      },
+      "after_ms": {
+        "median": 13.3793,
+        "p95": 15.5364,
+        "max": 28.8012
+      },
+      "change_percent": {
+        "median": 0.12947163598264755,
+        "p95": 0.28873581737798304,
+        "max": 16.264199384794242
+      }
+    },
+    "VoxelStream/TickMs": {
+      "before_ms": {
+        "median": 0.090297,
+        "p95": 6.529119999999995,
+        "max": 1624.4556
+      },
+      "after_ms": {
+        "median": 0.0908,
+        "p95": 6.69835,
+        "max": 1641.1626
+      },
+      "change_percent": {
+        "median": 0.557050621836841,
+        "p95": 2.591926630235064,
+        "max": 1.0284676294015194
+      }
+    },
+    "VoxelStream/SubmitMs": {
+      "before_ms": {
+        "median": 0.0,
+        "p95": 0.0,
+        "max": 1554.7207
+      },
+      "after_ms": {
+        "median": 0.0,
+        "p95": 0.0,
+        "max": 1570.9027
+      },
+      "change_percent": {
+        "median": null,
+        "p95": null,
+        "max": 1.0408300346165023
+      }
+    }
+  }
+}
