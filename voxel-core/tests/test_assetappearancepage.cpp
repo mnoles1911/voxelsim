@@ -9,7 +9,7 @@ AssetGrid fixture(MaterialId material,bool holes=false){
     std::vector<uint8_t> b;auto put=[&](uint32_t v){for(int i=0;i<4;++i)b.push_back(uint8_t(v>>(8*i)));};
     put(kVxaMagic);put(kVxaVersion);put(uint32_t(-4));put(uint32_t(-7));put(uint32_t(-2));
     put(2);put(3);put(2);put(100);put(12);put(0);put(0);
-    for(int i=0;i<12;++i){b.push_back(uint8_t(holes&&i%3==0?MAT_AIR:material));put(1);}
+    for(int i=0;i<12;++i){b.push_back(uint8_t(holes&&i%3==0?MaterialId(MAT_AIR):material));put(1);}
     AssetGrid g;CHECK(g.parse(b)==AssetParseError::kOk);return g;
 }
 AssetField::ResolvedAssetInstance instance(const AssetGrid& g,uint8_t yaw){

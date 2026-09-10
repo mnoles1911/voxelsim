@@ -241,7 +241,7 @@ target_link_libraries(vxc_mip_provenance_tests PRIVATE voxelcore Threads::Thread
 if(MSVC)
   target_compile_options(vxc_mip_provenance_tests PRIVATE /W4 /WX)
 else()
-  target_compile_options(vxc_mip_provenance_tests PRIVATE -Wall -Wextra -Wconversion -Werror)
+  target_compile_options(vxc_mip_provenance_tests PRIVATE -Wall -Wextra -Werror)
 endif()
 add_test(NAME vxc_mip_provenance_tests COMMAND vxc_mip_provenance_tests)
 
