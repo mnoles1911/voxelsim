@@ -19,23 +19,37 @@ if(Get-Process UnrealEditor,UnrealEditor-Cmd,cl,link,MSBuild,dotnet -ErrorAction
 # because failing closed on a missing instrument would block every capture on a
 # machine that simply does not expose it).
 function Get-ForeignGpuLoad {
-    param([int[]]$OwnPids = @())
-    try { $samples = (Get-Counter '\GPU Engine(*)\Utilization Percentage' -ErrorAction Stop).CounterSamples }
-    catch { return $null }
-    $byProc = @{}
-    foreach ($c in $samples) {
-        if ($c.CookedValue -le 1) { continue }
-        if ($c.InstanceName -match 'pid_(\d+)') {
-            $procId = [int]$Matches[1]
-            if ($OwnPids -contains $procId) { continue }
-            $byProc[$procId] = $byProc[$procId] + $c.CookedValue
+    # Three samples, and judge on the MINIMUM per process. A single sample cannot
+    # tell a browser compositing a frame from a game holding the card: both read
+    # ~20% for an instant. Sustained load shows up in every sample; a spike does
+    # not. Measured 2026-09-11: a game sat at 77% and a video tab at a steady
+    # 16.5-20.7%, while an idle desktop reads nothing above 1%.
+    param([int[]]$OwnPids = @(), [int]$Samples = 3, [int]$GapMs = 700)
+    $mins = @{}
+    for ($i = 0; $i -lt $Samples; $i++) {
+        try { $set = (Get-Counter '\GPU Engine(*)\Utilization Percentage' -ErrorAction Stop).CounterSamples }
+        catch { return $null }
+        $byProc = @{}
+        foreach ($c in $set) {
+            if ($c.CookedValue -le 0.5) { continue }
+            if ($c.InstanceName -match 'pid_(\d+)') {
+                $procId = [int]$Matches[1]
+                if ($OwnPids -contains $procId) { continue }
+                $byProc[$procId] = $byProc[$procId] + $c.CookedValue
+            }
         }
+        foreach ($k in @($mins.Keys)) { if (-not $byProc.ContainsKey($k)) { $mins[$k] = 0 } }
+        foreach ($k in $byProc.Keys) {
+            if ($i -eq 0) { $mins[$k] = $byProc[$k] }
+            elseif ($byProc[$k] -lt $mins[$k]) { $mins[$k] = $byProc[$k] }
+        }
+        if ($i -lt $Samples - 1) { Start-Sleep -Milliseconds $GapMs }
     }
     $busy = @()
-    foreach ($k in $byProc.Keys) {
-        if ($byProc[$k] -ge 10) {
+    foreach ($k in $mins.Keys) {
+        if ($mins[$k] -ge 10) {
             $p = Get-Process -Id $k -ErrorAction SilentlyContinue
-            $busy += [pscustomobject]@{ ProcessId = $k; Name = $(if ($p) { $p.ProcessName } else { '(exited)' }); Percent = [math]::Round($byProc[$k], 1) }
+            $busy += [pscustomobject]@{ ProcessId = $k; Name = $(if ($p) { $p.ProcessName } else { '(exited)' }); Percent = [math]::Round($mins[$k], 1) }
         }
     }
     return , $busy
