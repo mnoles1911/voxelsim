@@ -4,7 +4,12 @@ param(
     [Parameter(Mandatory=$true)][string]$Output,
     [ValidateRange(60,7200)][int]$TimeoutSeconds=3900,
     [switch]$ProfileFrames,[switch]$DiagnoseStalls,[switch]$DetailMeshLOD,[switch]$DetailSizeCull,[switch]$NoDetailSizeCull,[switch]$DetailRetireUnused,[string]$DetailMeshCache='',
-    [switch]$AllowPreviewDetailCache,[ValidateRange(16,512)][double]$DetailRingMeters=48
+    [switch]$AllowPreviewDetailCache,[ValidateRange(16,512)][double]$DetailRingMeters=48,
+    # Opt-in flags the route needs but has no switch for -- e.g. -VoxelDetailNanite,
+    # which MUST ride alongside a nanite=1 cache or the identity guard refuses the
+    # run. Same validation as the walk harness, and recorded in the manifest's
+    # argument list like every other flag, so a receipt binds them.
+    [string[]]$ExtraArgs=@()
 )
 $ErrorActionPreference='Stop'
 if(Get-Process UnrealEditor,UnrealEditor-Cmd,cl,link,MSBuild,dotnet -ErrorAction SilentlyContinue){throw 'UE or build process already running'}
@@ -92,6 +97,7 @@ if($NoDetailSizeCull){$runArgs+='-VoxelNoDetailSizeCull'}
 if($DetailRetireUnused){$runArgs+='-VoxelDetailRetireUnused'}
 if($cachePath){$runArgs+="-VoxelDetailMeshCache=$cachePath"}
 if($AllowPreviewDetailCache){$runArgs+='-VoxelDetailMeshCachePreview'}
+foreach($extra in $ExtraArgs){if($extra -notmatch '^-[A-Za-z0-9=.:,_-]+$'){throw 'Unsupported extra argument'};$runArgs+=$extra}
 foreach($arg in $runArgs){if($arg -match '["\r\n]'){throw 'Unsupported quote/newline in command argument'}}
 $record=@{arguments=$runArgs;configurationSha256=$configHash;speciesManifestSha256=$speciesHash;routeSha256=$routeHash;
     startedUtc=[DateTime]::UtcNow.ToString('o');scope='Authored actual-pawn route, with optional endpoint evidence; no broad navigation or building acceptance'}
