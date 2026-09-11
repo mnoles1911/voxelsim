@@ -216,12 +216,39 @@ instanced triangle counts with weak LODs. Whether it suits 25 mm voxel foliage w
 two-sided materials is a real question and it may not, but it has not been tried and the workload
 now provably matches its purpose.
 
-**The marcher, and an honest problem with the target.** The marcher does scale with pixels, but not
-purely: fitting the two resolution points gives a fixed 3.71 ms plus 14.25 ns per pixel. It is also
-roughly twice as expensive here as on the terrain-only flight leg, 9.26 ms against 5.04 ms. A
-plausible mechanism exists, since marcher cost tracks how far rays travel through empty air and a
-walking camera looks at the horizon while a flying one looks down, but nothing has measured that and
-it should not be assumed.
+**The marcher, corrected.** An earlier draft of this section fitted the two resolution points to
+"3.71 ms fixed plus 14.25 ns per pixel" and inferred a large resolution-independent cost. **That was
+wrong, and the flight leg refutes it in one line:** the marcher costs 5.04 ms in total there, at
+921,600 pixels, which is 2.4 times the forest capture's pixel count. A 3.71 ms fixed term cannot fit
+inside a 5.04 ms total. A two-point fit through a non-linear curve manufactures an intercept, and
+that is all that happened. There is also an in-tree sweep that already measured the kernel as linear:
+4.37 / 3.99 / 3.91 ms per million rays across a 5.7x range, within 2%
+(`VoxelMarchRenderer.cpp:1806-1808`).
+
+Read per pixel instead, which is the honest unit:
+
+| leg | pixels | marcher ms | ns/pixel |
+|---|---|---|---|
+| terrain-only flight leg | 921,600 | 5.04 | 5.47 |
+| forest walk, 65% screen | 389,376 | 9.26 | 23.78 |
+| forest walk, 33% screen | 100,674 | 5.14 | 51.09 |
+
+Two things follow, and both are more interesting than a fixed cost. **Per-ray cost rises as rays get
+fewer**, 2.15x more expensive per ray for 3.87x fewer rays, which is the signature of a latency-bound
+kernel losing cache reuse rather than of a constant overhead. And **the forest is 4.3x the flight leg
+per pixel, not the 1.8x a raw millisecond comparison suggests.**
+
+That kills the mechanism the earlier draft guessed at. Camera pose was the hypothesis, since marcher
+cost rises when rays travel through empty air and a walking camera faces the horizon. But the entire
+measured pose range on bare terrain spans 0.82 ns/pixel looking down to 4.16 looking at sky
+(`docs/marcher-direction-baseline.md`), and the forest sits at 23.78, far above the top of that
+range. **Pose cannot explain a 4.3x gap when the whole pose effect is 5x between its extremes.**
+
+The candidate that fits is one the plan had not connected: **trees are marched voxels, not instances**
+(`docs/environment-residency-audit.md`). Every terrain-only baseline was measured on bare ground. The
+forest site presents the marcher with a canopy: high-variance occupancy with rays threading gaps,
+which is the worst case for a cost law that charges per segment entry. Nothing has measured this, and
+it should be measured before anything is built.
 
 The problem for the target is arithmetic. At the default 48 m ring the marcher is about 9.9 ms of a
 13.2 ms GPU frame, and the whole-frame budget for 100 FPS is 10 ms. **Terrain alone spends the
@@ -231,8 +258,15 @@ and an explicit instruction not to re-propose ray-count reduction. Those two fac
 at the current resolution. This plan does not try to resolve that; it names it, because a plan that
 quietly aims at an unreachable number is worse than one that says where the wall is.
 
-**Gate:** understory GPU under 10 ms at the 256 m ring, and a decision recorded on the marcher
-arithmetic above.
+**Gate:** understory GPU under 10 ms at the 256 m ring; the marcher's forest premium attributed to a
+named cause; and a decision recorded on the marcher arithmetic above.
+
+**Before any marcher work is built, three measurements, none of which need code.** A GPU profile
+capture at the forest site, which splits the single `VoxelMarch` timer into its passes (it currently
+encloses a per-frame reduce over the whole brick pool as well as the march itself). A four-point
+resolution sweep, to replace the two-point fit above with a real curve. And a direction sweep at the
+forest spawn against the vista baseline, which is the experiment that decides whether this is a
+renderer problem or a site-coverage problem. The harness for all three already exists.
 
 ### Phase 5 — measure at the speed the target is written for
 
@@ -242,6 +276,114 @@ the condition it is supposed to pass. This needs a flight or sprint leg through 
 
 **Gate:** a capture at 20 m/s through the fixture, with the same receipt discipline, so the plan's
 own target is measured rather than assumed.
+
+## Research addendum, 2026-09-11: the candidate levers
+
+Three investigations (engine source, repo history, published practice) ran against the measurements
+above. What follows is what survived them. Several popular ideas did not, and they are listed too,
+because knowing what not to try is most of the value.
+
+### The understory: Nanite is the only route that removes a whole pass
+
+The two understory passes are a base pass and a near-identical velocity pass. The velocity pass
+exists because the wind material moves vertices, and Unreal submits vertex-deforming geometry a
+second time to compute motion vectors.
+
+**The motion vectors are correct, so the pass cannot simply be deleted.** I checked, because a
+plausible failure mode would have made it useless work: if the wind's animation used a value with no
+previous-frame history, the computed velocity for the sway would be zero and the pass would be
+paying 15 ms for nothing. It does not. The material translator substitutes the previous frame's time
+automatically when it builds the velocity variant
+(`HLSLMaterialTranslator.cpp:5278`, `bCompilingPreviousFrame ? View.PrevFrameGameTime : View.GameTime`).
+Only the slowly-changing weather vector, which comes from a parameter collection, lacks history, and
+that changes on weather timescales rather than per frame. Turning the pass off would therefore cost
+visible smearing on moving grass, which is a real trade rather than a free win.
+
+**Nanite removes the pass structurally while keeping correct velocity.** Nanite vertex factories are
+excluded from velocity shader compilation entirely (`VelocityRendering.cpp:201-202`), because Nanite
+computes velocity per pixel from the visibility buffer instead
+(`NaniteDepthExport.usf`, `NaniteExportGBuffer.usf`). Nanite geometry is rasterised once; depth,
+material and velocity all become screen-space exports from that single pass. On top of that it brings
+continuous cluster LOD, which attacks the base pass too, and it does per-instance culling on the GPU
+while honouring the existing cull distances. Instanced components already return a Nanite proxy when
+the asset has Nanite data (`HierarchicalInstancedStaticMesh.cpp:2993-3004`).
+
+**Why it is currently off, and why that may not apply here.** The recorded reason is not performance.
+It is arbitrary voxel destruction: `docs/tree-appearance-pilot-status.md` records the decision, and it
+is about **trees** on the editable procedural-mesh path. The understory is explicitly the opposite
+case, accepted as instanced meshes that are never edited in place. Whether the objection binds them
+is an owner decision, not an engineering one, but the technical half of it is now settled: the
+understory components never touch the destructible path. `VoxelDetailAssetSubsystem.cpp` contains no
+per-instance destruction code at all, it consumes baked static meshes rather than procedural ones,
+and the procedural plant component has exactly one consumer, the separate opt-in environment
+prototype. So the flag on line 1455 disables Nanite on the understory as a side effect of a decision
+taken for trees, which fits the code site carrying no comment and the introducing commit carrying no
+rationale. **Scope any change to the 25 mm understory profiles**: trees still have the
+destructibility constraint and it is still correct for them.
+
+**Three costs that would not show up in the pass counters.** Geometry below 32-pixel edges goes
+through Nanite's software rasteriser, which is its design case but not free. Masked materials sort
+last in the raster bins, mitigable per component with a programmable-raster distance. And instanced
+foliage currently contributes nothing to the global illumination scene
+(`HierarchicalInstancedStaticMesh.cpp:806-807`); under Nanite it would, which is a lighting change to
+judge by eye and a cost that will not appear in the base pass.
+
+**A method trap worth more than the lever.** Testing this by toggling the Nanite cvar measures the
+simplified fallback mesh, not the real geometry, because the proxy render mode falls back by default.
+Both arms must be rebakes with the flag flipped in the asset. The repo learned this once already and
+wrote it down in `ue-project/Tools/capture_tree_appearance_pilot.py`.
+
+### The understory: the LOD chain, and why it is weak
+
+The coarsest LOD is a median 74% of LOD0 triangles. It is worth knowing that this is **not** the
+previously-fixed bug where Unreal's default reduction overwrote authored LODs; that fix is live
+(`VoxelDetailAssetSubsystem.cpp:1462` sets the reduction base per source model, and the cache
+identity carries `authoredLOD=1`). The 74% is what the authoring pipeline actually produces. For a
+geometry-bound workload that is the thing to change, and it is independent of Nanite: the two can
+ship together. Re-voxelising coarse levels at a coarser pitch is the obvious route for blocky assets,
+where aggressive simplification is far more visually acceptable than it would be for realistic
+foliage.
+
+### The marcher: measure before building, because the timer is not what it says
+
+The single `VoxelMarch` timer encloses more than the march. Inside it, among others, a reduction
+dispatches **393,216 threads every frame** over the whole brick pool to produce eight numbers whose
+input changes at streaming rate, not frame rate. Nothing isolates it, which is why it has never been
+named or priced.
+
+Three measurements, none needing code, should precede any marcher work: a GPU profile capture at the
+forest site to split that timer into its passes; a four-point resolution sweep to replace the
+two-point fit this plan already had to retract; and a camera-direction sweep at the forest spawn
+against the bare-terrain baseline, which decides whether the forest premium is a renderer problem or
+a site-coverage problem. The harness for all three exists.
+
+After that, the candidates in rough order of expected value:
+
+- **The per-entry constant.** An entry costs roughly 2,000 GPU cycles for what is two to four
+  dependent memory loads, which is latency, serialised. This is the repo's own second open item, named
+  in August and never run, and no vendor GPU profiler has ever been pointed at this renderer. It
+  attacks every entry including the useless ones.
+- **Wave width.** The kernel runs 64-wide on hardware that is natively 32-wide, which halves the
+  waves available to hide that latency. One attribute and a permutation, with an engagement counter
+  that can fail.
+- **One address space over the cascade.** Today a ray can pay up to fourteen segment entries, seven
+  rings times a retry ladder. Behind a single page table it would pay about two. This is the largest
+  structural number available and it is genuinely untried, but it is weeks of work and the repo's own
+  bug history is full of per-level mistakes that a unified space would make global. Model it offline
+  first: if the simulated entry count does not collapse, do not build it.
+
+### What the research ruled out
+
+Ray coherence sorting and wavefront compaction predict nulls here, because the waves are already 99%
+lane-full and primary rays are the most coherent rays that exist. Cone-marched ray starts were
+refuted in-tree. Temporal reuse of hit distance already ships. Anything targeting iterations rather
+than segment entries is aimed at the wrong term of the cost law. And the whole empty-space-skipping
+family has seven dead arms behind it, one retired permanently with instructions not to rebuild it.
+
+One nuance worth preserving: the height pyramid is often lumped in with those, but it was retired on
+**correctness**, not cost, after missing 479 rays. It is world-derived rather than residency-derived
+and it targets entries. If anyone revisits it, the first task is diagnosing those missed rays, not
+timing it.
 
 ## How trustworthy these numbers are
 

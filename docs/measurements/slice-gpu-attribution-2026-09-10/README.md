@@ -48,9 +48,13 @@ That last point is worth stating plainly because the opposite was the natural re
 is masked, the depth prepass measures 0.009 ms across three draw calls, and so every layer of
 overlapping grass really is shaded. It simply is not where the time goes.
 
-The marcher does scale with pixels, but not purely. Fitting the two points gives **3.71 ms fixed
-plus 14.25 ns per pixel**, so about 40% of its cost at 65% screen percentage does not shrink with
-resolution.
+The marcher scales with pixels, but not linearly. **Correction, same day:** this record first read
+the two points as "3.71 ms fixed plus 14.25 ns per pixel". That is refuted by the terrain-only flight
+leg, where the marcher costs 5.04 ms in total at 921,600 pixels, which cannot contain a 3.71 ms fixed
+term. A two-point fit through a curve manufactures an intercept. Per pixel the three known points are
+5.47 ns (flight leg), 23.78 ns (forest 65%) and 51.09 ns (forest 33%): **per-ray cost rises as rays
+get fewer**, which is a latency signature, not a constant. A four-point sweep is needed to
+characterise it properly, and the harness now supports it.
 
 ## What follows
 
