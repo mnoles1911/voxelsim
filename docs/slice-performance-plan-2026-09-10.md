@@ -59,6 +59,14 @@ Read together, facts 1 to 4 say the whole thing in one line each:
 256 m ring the binding constraint is the same 21–23 ms game thread, of which 8.3 ms is water
 simulation on dry land.
 
+*Provenance, because the three rows are not one sitting.* The 48 m row is walk-capture-21
+(2026-09-10 04:02 UTC, manifest predates module hashing); the 256 m rows are walk-capture-27
+(2026-09-10 13:58) and walk-capture-43 (2026-09-11 14:09), which are different binaries again. The
+48 m figure is corroborated independently by the first table above — route 10 at the same ring
+reads frame p50 22.88 against this row's 21.08 — so the conclusion survives, but **the three rows
+should not be quoted as a single matched experiment.** The size-cull claim itself does not depend
+on this: it rests on two same-sitting pairs, 24/25 and 26/27.
+
 
 ## Ordered work queue as of 2026-09-11
 
