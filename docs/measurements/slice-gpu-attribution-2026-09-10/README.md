@@ -59,7 +59,8 @@ characterise it properly, and the harness now supports it.
 ## What follows
 
 Because the workload is geometry-bound, the levers are the ones that reduce submitted geometry:
-the velocity pass (a full duplicate geometry pass, 14.96 ms, caused by vertex-deforming wind), the
+the traversal count (`RenderVelocities` is the depth pass for vertex-deforming geometry at the default
+`r.VelocityOutputPass=0`, not a spare pass, so the target is collapsing two traversals into one), the
 LOD chain (coarsest LOD is a median 74% of LOD0 triangles; the whole chain saves 29% library-wide;
 16 of 339 models have no LODs), size culling (21 ms, already built, drops 50 of the submitted
 components), and Nanite, which is explicitly disabled and exists for this exact shape of problem.

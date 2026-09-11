@@ -170,6 +170,13 @@ also retires, for this scene, the 15.8 ms terrain-shadow figure that circulates 
 belonged to the quad path the marcher replaced, and `docs/parked-floor-2026-08-28.md` measures
 shadow depths at 0.058 ms on the shipped path.
 
+**Which ring these numbers describe, because it decides how urgent this is.** The 29.76 ms is the
+**256 m experimental ring with size culling off**. At the shipping 48 m default the understory is
+roughly 1.8 ms of GPU and the marcher dominates instead. So the honest brief is not "cut 29.76 ms by
+90%"; it is **"what would it cost to ship a ring several times the default?"** That reframing changes
+which techniques are worth their implementation cost, and it means the understory is not currently
+the thing standing between this project and its frame budget. The marcher and the game thread are.
+
 **The decisive experiment.** The obvious story was overdraw: the plant material is masked, which
 disables early depth rejection, and the depth prepass measures 0.009 ms across three draw calls, so
 every layer of overlapping grass is shaded. That story is wrong, and one capture settles it.
@@ -191,14 +198,24 @@ resolution, and not the masked material's early-Z behaviour.
 That result kills a whole family of proposals before anyone spends a week on one, and it points at
 a different family that follows directly from it.
 
-**Lever 4a — the velocity pass, about 15 ms, half the understory cost.** `GPU/RenderVelocities`
-(14.96 ms, 179 draw calls) is a near-exact duplicate of the base pass (14.80 ms, 173 draw calls). It
-exists because the wind animation moves vertices in the shader, and Unreal puts anything with
-vertex-deforming materials into the velocity pass every frame whether or not it actually moved.
-`r.VelocityOutputPass` is not set anywhere in the project, so this is the engine default. The
-question to answer first is whether distant or small plants need per-vertex wind at all, since
-anything that stops deforming leaves the pass. This is the single largest identified saving in the
-frame and nothing has been tried against it.
+**Lever 4a — two geometry traversals, not one pass plus a bonus one. Corrected.** An earlier draft
+called `GPU/RenderVelocities` (14.96 ms) "a full duplicate geometry pass" and treated all of it as a
+saving. **That is wrong.** `r.VelocityOutputPass` defaults to 0, and the engine documents mode 0 as
+"renders during the depth pass; this splits the depth pass into 2 phases: with and without velocity"
+(`VelocityRendering.cpp:31-37`). The project overrides it nowhere.
+
+So `RenderVelocities` **is** the depth pass for velocity-relevant geometry, which is why `GPU/Prepass`
+reads 0.009 ms across three draw calls: the plants' depth work is not missing, it is in the other
+line. The understory therefore pays what any prepass renderer pays, one depth traversal and one base
+pass traversal, with velocity written during the first. Turning velocity off would move the plants
+back into the ordinary prepass rather than deleting a traversal, and the saving would be the velocity
+write plus one redundant vertex-offset evaluation, not 15 ms.
+
+That makes the real target the traversal count itself, and it is why Nanite matters here rather than
+any velocity switch: Nanite rasterises once into a visibility buffer and produces depth, material and
+velocity as screen-space exports from it, so **two geometry traversals become one** and the velocity
+is still correct. The remaining question is what a single Nanite traversal costs against the current
+two, which only the rebake A/B can answer.
 
 **Lever 4b — the LOD chain barely reduces geometry.** Across the 339 baked models, the coarsest LOD
 is a median of 74% of LOD0 triangles, and the whole chain saves 29% of triangles library-wide.
@@ -285,9 +302,11 @@ because knowing what not to try is most of the value.
 
 ### The understory: Nanite is the only route that removes a whole pass
 
-The two understory passes are a base pass and a near-identical velocity pass. The velocity pass
-exists because the wind material moves vertices, and Unreal submits vertex-deforming geometry a
-second time to compute motion vectors.
+The understory pays two geometry traversals per frame. One is the base pass. The other is reported as
+`RenderVelocities`, and at the engine default (`r.VelocityOutputPass=0`) that line **is** the depth
+pass for vertex-deforming geometry, which is why the ordinary prepass reads almost zero. So this is
+not a spare pass bolted on for motion vectors; it is the depth half of a normal two-traversal
+renderer, with velocity written into it.
 
 **The motion vectors are correct, so the pass cannot simply be deleted.** I checked, because a
 plausible failure mode would have made it useless work: if the wind's animation used a value with no
@@ -297,9 +316,10 @@ automatically when it builds the velocity variant
 (`HLSLMaterialTranslator.cpp:5278`, `bCompilingPreviousFrame ? View.PrevFrameGameTime : View.GameTime`).
 Only the slowly-changing weather vector, which comes from a parameter collection, lacks history, and
 that changes on weather timescales rather than per frame. Turning the pass off would therefore cost
-visible smearing on moving grass, which is a real trade rather than a free win.
+visible smearing on moving grass, and by the correction above it would not even recover the line's
+full cost. Both halves of that make it a poor lever.
 
-**Nanite removes the pass structurally while keeping correct velocity.** Nanite vertex factories are
+**Nanite collapses the two traversals into one while keeping correct velocity.** Nanite vertex factories are
 excluded from velocity shader compilation entirely (`VelocityRendering.cpp:201-202`), because Nanite
 computes velocity per pixel from the visibility buffer instead
 (`NaniteDepthExport.usf`, `NaniteExportGBuffer.usf`). Nanite geometry is rasterised once; depth,

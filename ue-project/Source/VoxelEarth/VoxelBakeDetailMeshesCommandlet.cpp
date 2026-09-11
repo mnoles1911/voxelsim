@@ -109,7 +109,7 @@ int32 UVoxelBakeDetailMeshesCommandlet::Main(const FString& Params){
     FParse::Value(FCommandLine::Get(),TEXT("VoxelDetailLodColorTolerance="),Tolerance);Tolerance=FMath::Clamp(Tolerance,0.f,.05f);
     FParse::Value(FCommandLine::Get(),TEXT("VoxelDetailLodMinSaving="),MinSaving);MinSaving=FMath::Clamp(MinSaving,0.f,1.f);
     if(!FMath::IsFinite(Tolerance)||!FMath::IsFinite(MinSaving))return Fail(TEXT("nonfinite LOD settings"));
-    const FString Settings=FString::Printf(TEXT("schema=2;lod=%d;tolerance=%.9g;minSaving=%.9g;screens=1,.10,.025;patches=2,4;bounds=windXY-v1-allLOD-margin0.01UU-unitScale-quarterYaw-Z0-missing30-rejectNonFinite;collision=0;nanite=0;cpuAccess=1;fingerprint=1;authoredLOD=1"),Lods?1:0,Tolerance,MinSaving);
+    const FString Settings=FString::Printf(TEXT("schema=2;lod=%d;tolerance=%.9g;minSaving=%.9g;screens=1,.10,.025;patches=2,4;bounds=windXY-v1-allLOD-margin0.01UU-unitScale-quarterYaw-Z0-missing30-rejectNonFinite;collision=0;nanite=%d;cpuAccess=1;fingerprint=1;authoredLOD=1"),Lods?1:0,Tolerance,MinSaving,FParse::Param(FCommandLine::Get(),TEXT("VoxelDetailNanite"))?1:0);
     const FString Engine=FEngineVersion::Current().ToString();
     const FString Host=UTF8_TO_TCHAR(FPlatformProperties::PlatformName());
     auto Manifest=MakeShared<FJsonObject>();Manifest->SetNumberField(TEXT("schema"),2);Manifest->SetNumberField(TEXT("render_attribute_fingerprint_schema"),FVoxelMeshAttributeFingerprint::SchemaVersion);Manifest->SetBoolField(TEXT("preview_only"),Preview);

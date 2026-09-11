@@ -42,7 +42,7 @@ TSharedPtr<const FVoxelDetailMeshCacheIndex,ESPMode::ThreadSafe> LoadDetailCache
     if(!DetailCacheHashFile(FPackageName::LongPackageNameToFilename(TEXT("/Game/Voxel/M_VoxelDetailAsset"),TEXT(".uasset")),E.MaterialSourceSHA256))return nullptr;
     float Tolerance=.015f,Saving=.20f;FParse::Value(FCommandLine::Get(),TEXT("VoxelDetailLodColorTolerance="),Tolerance);FParse::Value(FCommandLine::Get(),TEXT("VoxelDetailLodMinSaving="),Saving);
     if(!FMath::IsFinite(Tolerance)||!FMath::IsFinite(Saving))return nullptr;
-    E.Settings=FString::Printf(TEXT("schema=2;lod=%d;tolerance=%.9g;minSaving=%.9g;screens=1,.10,.025;patches=2,4;bounds=windXY-v1-allLOD-margin0.01UU-unitScale-quarterYaw-Z0-missing30-rejectNonFinite;collision=0;nanite=0;cpuAccess=1;fingerprint=1;authoredLOD=1"),FParse::Param(FCommandLine::Get(),TEXT("VoxelDetailMeshLOD"))?1:0,FMath::Clamp(Tolerance,0.f,.05f),FMath::Clamp(Saving,0.f,1.f));
+    E.Settings=FString::Printf(TEXT("schema=2;lod=%d;tolerance=%.9g;minSaving=%.9g;screens=1,.10,.025;patches=2,4;bounds=windXY-v1-allLOD-margin0.01UU-unitScale-quarterYaw-Z0-missing30-rejectNonFinite;collision=0;nanite=%d;cpuAccess=1;fingerprint=1;authoredLOD=1"),FParse::Param(FCommandLine::Get(),TEXT("VoxelDetailMeshLOD"))?1:0,FMath::Clamp(Tolerance,0.f,.05f),FMath::Clamp(Saving,0.f,1.f),FParse::Param(FCommandLine::Get(),TEXT("VoxelDetailNanite"))?1:0);
     return FVoxelDetailMeshCacheIndex::ParseEditorSource(Text,Publication,Binding->SourceSnapshot(),E,Error);
 #else
     return nullptr;
@@ -1452,7 +1452,31 @@ UStaticMesh* VoxelBakePersistentDetailMesh(const vxc::AssetGrid& Grid,
     auto Add=[&](const FVoxelDetailLodMesh& G){auto D=MakeUnique<FMeshDescription>();FillDetailMeshDescription(G,*D);Descs.Add(D.Get());Owned.Add(MoveTemp(D));};
     Add(Geometry);for(const auto& Lod:Geometry.Lods)Add(Lod);
     Mesh->SetNumSourceModels(Descs.Num());Mesh->SetAutoComputeLODScreenSize(false);
-    Mesh->NaniteSettings.bEnabled=false;
+    // OPT-IN EXPERIMENT, default off: -VoxelDetailNanite.
+    //
+    // Nanite is disabled here as a side effect of a decision taken for TREES, whose
+    // editable procedural-mesh path must support arbitrary voxel destruction
+    // (docs/tree-appearance-pilot-status.md). The understory is a different system:
+    // baked static meshes on HISM, never edited in place, explicitly accepted as
+    // instanced meshes. This subsystem contains no per-instance destruction code.
+    //
+    // Why it is worth measuring: the understory's 29.8 ms is GEOMETRY-bound (proven --
+    // 3.87x fewer shaded pixels moved it 0.4%), and half of it is a duplicate geometry
+    // submission for motion vectors. Nanite vertex factories are excluded from velocity
+    // shader compilation entirely (VelocityRendering.cpp:201-202) and export velocity
+    // from the visibility buffer instead, so that second pass disappears structurally
+    // rather than getting cheaper. Cluster LOD then attacks what remains.
+    //
+    // NOT A DEFAULT and NOT a decision: enabling it puts these plants into the Lumen
+    // scene for the first time (HierarchicalInstancedStaticMesh.cpp:806-807 excludes
+    // the non-Nanite dynamic path), which is a lighting change for the owner to judge.
+    // Trees keep the destructibility constraint.
+    //
+    // The flag is in the cache identity below, so one arm cannot silently reuse the
+    // other arm's bake. Note also that r.Nanite 0/1 is NOT a valid A/B: it measures the
+    // simplified fallback mesh (see ue-project/Tools/capture_tree_appearance_pilot.py).
+    static const bool bDetailNanite=FParse::Param(FCommandLine::Get(),TEXT("VoxelDetailNanite"));
+    Mesh->NaniteSettings.bEnabled=bDetailNanite;
     for(int32 L=0;L<Descs.Num();++L){
         auto& Source=Mesh->GetSourceModel(L);
         // SetNumSourceModels initializes missing descriptions with 50%^LOD
