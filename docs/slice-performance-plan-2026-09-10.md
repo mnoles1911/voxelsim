@@ -55,6 +55,20 @@ Read together, facts 1 to 4 say the whole thing in one line each:
 | 256 m ring | 41.7 | 24 | 40.5 | 21.8 |
 | **256 m ring + size cull** | **22.7** | **44** | **19.5** | 22.7 |
 
+**Both halves are now measured, and they compose.** As of 2026-09-11 the game
+thread is **13.30 ms**, down from 21.58, because one prepared asset shortlist now
+serves the whole frame instead of only the movement tick
+(`docs/measurements/asset-shortlist-scope-2026-09-11/`). Neither change is a
+visual trade on the timing side: size culling is a draw-distance policy awaiting
+the owner's verdict on the pictures, and the shortlist computes the identical
+answer once instead of three times.
+
+| at the 256 m ring, standing still | GPU | game thread |
+|---|---|---|
+| this morning | 40.5 ms | 21.6 ms |
+| with size culling | 20.0 ms | 21.6 ms |
+| with both | 20.0 ms | **13.3 ms** |
+
 **Size culling buys a 5.3× larger ring for nothing.** And at both the shipping ring and the culled
 256 m ring the binding constraint is the same 21–23 ms game thread, of which 8.3 ms is water
 simulation on dry land.
