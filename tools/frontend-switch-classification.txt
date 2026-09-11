@@ -213,14 +213,10 @@ VoxelGpuMesh
 VoxelGpuMeshQueueDepth
 VoxelGpuPoolAlloc
 VoxelGpuWorldGenBatch
-VoxelEditedLaneGate
-VoxelRadialCensus
 VoxelRecomputeCensus
 VoxelDetailRetireUnused
 VoxelR0EntryProfile
 VoxelResidencyAdmitBudget
-VoxelRingOrderScan
-VoxelHierarchicalCoverage
 VoxelInnerHysteresisChunks
 VoxelNoHierarchicalCoverage
 VoxelNoSharedGridCache
@@ -286,7 +282,6 @@ VoxelUINoAssets
 VoxelLoadGateMaxRing
 VoxelLoadMinHold
 VoxelLoadMaxHold
-VoxelLoadTheatre
 # The three below arrived with the 2026-09-07 overlay family and were missed
 # when it landed; the lint has been reporting them since. They are all
 # configuration for a capture that some OTHER switch drives -- passing
@@ -407,7 +402,6 @@ VoxelAdmissionCapDrainSec
 VoxelAdmissionCapMax
 VoxelBrickPoolMatMiB
 VoxelBrickPoolOccMiB
-VoxelBucketedExitScan
 VoxelCutoffClamp
 VoxelCutoffHeadroomDiv
 VoxelGpuBandColdOnly
@@ -427,7 +421,6 @@ VoxelGpuRasterAtlasFillTasks
 VoxelGpuResidency
 VoxelGpuStackClaim
 VoxelGpuWorklistBandChunks
-VoxelIncrementalAdmission
 VoxelLeadHorizonSec
 VoxelNearestAdmit
 VoxelPerRingRelax
@@ -545,6 +538,7 @@ VoxelEcologyWorldOutput
 VoxelMarchDispatchIdentity
 VoxelNoEcologyResolveCache
 VoxelPredictiveAssetResolve
+VoxelNoPredictiveAssetResolve
 VoxelRayQuery
 VoxelWalkWaitForEcology
 
