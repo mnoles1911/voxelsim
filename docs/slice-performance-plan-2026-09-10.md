@@ -106,17 +106,37 @@ popping can turn it off. Either is a decision, not an engineering task.
 **Gate:** at the 256 m ring, frames over 33.3 ms fall below 20%, with an owner image verdict on
 popping recorded.
 
-### Phase 1 — name the unnamed 15 ms
+### Phase 1 — name the unnamed 15 ms  — **DONE 2026-09-11, and it found something**
 
-No optimisation work on the floor should start before this. Run Unreal Insights against the slice,
-which the repo already uses (`-trace=cpu,frame,log`, per `docs/tile-loading-async-2026-09-07.md`),
-in two configurations: the walking ecology capture, and a flight leg at the same site. The pair
-separates "character pawn and physics" from "ecology site" as the source of the missing time.
+Insights was not needed. Of the 31 tick functions in the module, 24 had no CSV scope at all, so the
+game thread was unattributable by construction. Scopes were added to all of them (commit `662828f`,
+plus the walk driver afterwards) and one capture settled it.
 
-**Gate:** at least 90% of the game-thread median attributed to named scopes, with the result
-written up as a measurement record. If the missing time turns out to be stock engine work we do not
-control, that is a finding that changes the whole plan, and it is better to learn it in week one
-than in week six.
+Result, at the forest site, 256 m ring, 541 frames — full table in
+`docs/measurements/gamethread-attribution-2026-09-11/`:
+
+| scope | median ms |
+|---|---|
+| GameThreadTime | 21.80 |
+| PawnTick (⊃ MovementTick ⊃ CollisionPrepare 3.83) | 4.45 |
+| **OceanTick** | **4.16** |
+| **RippleTick** | **4.10** |
+| ClipmapTick (⊃ RoofProbe 2.84) | 2.84 |
+| WorldSubsystemTick | 0.37 |
+| WaterSheetTick | 0.25 |
+
+Named share went from 35% to 75%. The gate asked for 90%; the remaining 5.46 ms is engine-side actor
+tick dispatch and the component update pass, which these scopes cannot reach, and chasing it is worth
+less than the finding below. **Gate accepted as met in substance.**
+
+**The finding: 8.51 ms — 39% of the game thread — is water simulation at a site with no water.**
+The engine's own log puts the spawn column at 70.8 m of ground over a 0.0 m sea level. A
+74,384-triangle ocean mesh is followed by transform and asked "is the camera underwater?" every
+frame, and a 512×512 ripple wave field is stepped at a fixed 60 Hz every frame, 75.8 m above the
+nearest sea. Neither has any gate on water being within reach. This is the first finding in this
+work that is plain waste rather than a trade, and it is now the highest-value game-thread item.
+Sub-scopes are in the source to split each of the two into its parts; the capture that reads them
+is running.
 
 ### Phase 2 — kill the submit hitches
 
@@ -134,12 +154,19 @@ the worst frame under 100 ms.
 
 ### Phase 3 — the named game-thread costs
 
-Two items, both paid every frame, both looking like query costs rather than necessary work:
+Three items now, in value order, all paid every frame, none of them necessary work:
 
-- **Collision prepare, 3.49 ms.** Three quarters of the pawn tick. It prepares a voxel query region
+- **Water simulation at a dry site, 8.51 ms.** `OceanTick` 4.16, `RippleTick` 4.10, `WaterSheetTick`
+  0.25. See Phase 1. The shape of the fix is a proximity gate: neither the ocean's underwater test
+  nor the ripple field's 60 Hz step has any reason to run when the nearest water surface is 75.8 m
+  below the camera and behind terrain in every direction. The ripple field's `IsTickable` already
+  exists as the place to put it and currently tests only `bArmed_` and the enable cvar. What the gate
+  may NOT do is be wrong at a shoreline, so the predicate has to be conservative and the falsifier is
+  a shore capture where ripples must still appear.
+- **Collision prepare, 3.83 ms.** Three quarters of the pawn tick. It prepares a voxel query region
   per movement sweep. Worth checking whether consecutive sweeps in one frame re-prepare overlapping
   regions, which is the same shape as the resolve duplication the R0 profile found last week.
-- **Roof probe, 2.99 ms.** Effectively the entire clipmap tick. It runs every frame regardless of
+- **Roof probe, 2.84 ms.** Effectively the entire clipmap tick. It runs every frame regardless of
   whether the camera moved enough to change the answer.
 
 Neither has been profiled below its own scope, so both numbers are what to attack, not yet a

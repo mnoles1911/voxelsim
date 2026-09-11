@@ -1652,7 +1652,22 @@ void UVoxelRippleFieldSubsystem::Tick(float DeltaTime)
 		return;
 	}
 
-	AutoWatch(DeltaTime);
+	// SUB-SCOPES, BECAUSE THE PARENT READ 4.10 ms AT A DRY FOREST SITE.
+	//
+	// walk-capture-43 (2026-09-11) named RippleTickMs at 4.10 ms median with no
+	// open water anywhere in the cascade. Nothing here is gated on water being
+	// nearby: the window is centred on the camera and stepped at a fixed 60 Hz
+	// regardless. AutoWatch polls the pawn and two actor classes every frame;
+	// StepOnce/RunDerive enqueue render commands; PublishWindow writes a
+	// Material Parameter Collection, which is a game-thread operation that
+	// dirties every material instance referencing it.
+	//
+	// These four partition the tick. Nested inside RippleTickMs, so the parent
+	// total is unchanged.
+	{
+		CSV_SCOPED_TIMING_STAT(VoxelStream, RippleAutoWatchMs);
+		AutoWatch(DeltaTime);
+	}
 
 	double CamX = 0.0, CamY = 0.0;
 	if (!GetCameraXY(CamX, CamY))
@@ -1718,16 +1733,25 @@ void UVoxelRippleFieldSubsystem::Tick(float DeltaTime)
 	OriginPy_ = WantPy;
 	bHaveOrigin_ = true;
 
-	for (int32 i = 0; i < Steps; ++i)
 	{
-		// The window moves ONCE PER FRAME, not once per step: the camera has one
-		// position this frame, and applying the same shift on each substep would
-		// scroll the field N times as far as the camera actually moved.
-		StepOnce(i == 0 ? ShiftUvX : 0.0, i == 0 ? ShiftUvY : 0.0);
+		CSV_SCOPED_TIMING_STAT(VoxelStream, RippleStepMs);
+		for (int32 i = 0; i < Steps; ++i)
+		{
+			// The window moves ONCE PER FRAME, not once per step: the camera has one
+			// position this frame, and applying the same shift on each substep would
+			// scroll the field N times as far as the camera actually moved.
+			StepOnce(i == 0 ? ShiftUvX : 0.0, i == 0 ? ShiftUvY : 0.0);
+		}
+		RunDerive();
 	}
-	RunDerive();
-	PublishWindow(FMath::Max(0.0f, CVarVoxelWaterRippleGain.GetValueOnGameThread()));
-	SampleFieldHealth();
+	{
+		CSV_SCOPED_TIMING_STAT(VoxelStream, RipplePublishMs);
+		PublishWindow(FMath::Max(0.0f, CVarVoxelWaterRippleGain.GetValueOnGameThread()));
+	}
+	{
+		CSV_SCOPED_TIMING_STAT(VoxelStream, RippleHealthMs);
+		SampleFieldHealth();
+	}
 }
 
 // ============================================================================

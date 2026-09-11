@@ -11,6 +11,7 @@
 #include "VoxelMovementTuning.h"
 #include "VoxelWorldSubsystem.h"
 #include "VoxelDetailAssetSubsystem.h"
+#include "VoxelFrameProfiling.h"
 #include "voxelcore/assetfield.h"
 #include "voxelcore/amplifier.h"
 
@@ -151,6 +152,12 @@ void UVoxelWalkTestSubsystem::EnterPhase(EPhase Next)
 
 void UVoxelWalkTestSubsystem::Tick(float DeltaTime)
 {
+	// The capture DRIVER itself, named for the same reason as the 23 ticks in
+	// commit 662828f: every leg in the archive was timed with this running, so
+	// whatever it costs has been inside every game-thread number ever quoted
+	// for this project, unattributed. It is expected to be small; "expected" is
+	// exactly the claim that has been wrong most often here.
+	CSV_SCOPED_TIMING_STAT(VoxelStream, WalkTestTickMs);
 	if(EcologicalRoute){EcologicalRoute->Tick(GetWorld(),DeltaTime);return;}
 	if (!bArmed || Phase == EPhase::Done)
 	{

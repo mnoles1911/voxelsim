@@ -319,8 +319,29 @@ void AVoxelOceanActor::Tick(float DeltaTime)
 		BuildOceanGrid();
 	}
 
-	UpdateFollowPlane();
-	UpdateUnderwaterState(DeltaTime);
+	// TWO SUB-SCOPES, BECAUSE THE PARENT READ 4.16 ms AT A DRY FOREST SITE.
+	//
+	// walk-capture-43 (2026-09-11, temperate forest, no sea within the cascade)
+	// named OceanTickMs at 4.16 ms median -- a fifth of a 21.8 ms game thread,
+	// spent on the surface of an ocean that is not on screen. The three things
+	// this Tick can do are the grid rebuild (gated on a toggle that never
+	// changes during a capture, so it is not this), the follow transform, and
+	// the underwater test. The underwater test asks
+	// UVoxelWaterSubsystem::IsUnderwaterAtWorld, which composes simulated water,
+	// the implicit field AND a worldgen surface query -- a per-frame worldgen
+	// sample is the shape of thing that costs milliseconds, and it is asked
+	// every frame whether or not there is any water within kilometres.
+	//
+	// These two scopes decide between them. They are nested inside OceanTickMs,
+	// so the parent still reads the same total and the pair partitions it.
+	{
+		CSV_SCOPED_TIMING_STAT(VoxelStream, OceanFollowMs);
+		UpdateFollowPlane();
+	}
+	{
+		CSV_SCOPED_TIMING_STAT(VoxelStream, OceanUnderwaterMs);
+		UpdateUnderwaterState(DeltaTime);
+	}
 }
 
 namespace
