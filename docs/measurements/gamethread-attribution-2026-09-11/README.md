@@ -48,6 +48,14 @@ A 74,384-triangle ocean mesh is being followed by transform and asked "is the
 camera underwater?" every frame, and a 512x512 wave simulation is being stepped
 at a fixed 60 Hz every frame, 75.8 m above the only sea within reach.
 
+**CORRECTED 2026-09-11 by `docs/measurements/water-query-split-2026-09-11/`.**
+Neither the mesh nor the wave simulation is the cost. The follow transform
+measures 0.001 ms and the wave step 0.069 ms. **Both ticks are the same
+function**: `IsUnderwaterAtWorld`, called for the camera by the ocean and for
+the pawn and watched actors by the ripple field's auto-watcher. Two calls a
+frame, 8.0 ms. The fix is an algebraic short circuit above the waterline, not a
+proximity gate, and it is in flight.
+
 This is the largest single finding of the performance work so far, and it is
 the first one that is a plain waste rather than a trade.
 
