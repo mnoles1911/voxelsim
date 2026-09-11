@@ -148,18 +148,91 @@ diagnosis of why.
 **Gate:** each under 1 ms at median, with placement, collision behaviour and the clipmap image
 unchanged.
 
-### Phase 4 — the GPU floor
+### Phase 4 — the GPU, which is a geometry problem and not a pixel problem
 
-GPU p50 is 13.16 ms at the default ring against a 10 ms whole-frame budget, so the GPU alone
-currently exceeds the target. For reference the terrain-only leg measured 7.75 ms steady GPU
-(marcher 5.04, TSR 1.26), so the slice's ecology content is adding roughly 5.4 ms, with the caveat
-that the two captures are at different sites.
+This phase was rewritten on the day it was drafted, because the measurements below arrived and
+contradicted the obvious reading. Keep the order: attribution, then the decisive experiment, then
+the levers that survive it.
 
-This phase depends on Phase 0 landing first, because size culling changes what the GPU is doing,
-and on a proper GPU attribution of the slice scene, which does not exist yet in the same form as
-the terrain-only one.
+**Where the GPU goes at the 256 m ring** (capture 26, `GPU/*` columns, medians over the
+WalkForward phase):
 
-**Gate:** GPU p50 under 8 ms at the default ring with the ecology fixture loaded.
+| contributor | ms | share |
+|---|---|---|
+| Understory base pass | 14.80 | 35% |
+| Understory velocity pass | 14.96 | 35% |
+| Terrain marcher | 9.26 | 22% |
+| Everything else: shadows, water, sky, lighting, post, TSR, HUD | ~1.0 | ~2.5% |
+
+Shadows are 0.118 ms, water 0.120 ms, all lighting 0.192 ms, all sky and fog 0.149 ms. **Together
+they are about 2% of the frame.** Anyone who proposes optimising them is optimising noise. This
+also retires, for this scene, the 15.8 ms terrain-shadow figure that circulates in older notes: it
+belonged to the quad path the marcher replaced, and `docs/parked-floor-2026-08-28.md` measures
+shadow depths at 0.058 ms on the shipped path.
+
+**The decisive experiment.** The obvious story was overdraw: the plant material is masked, which
+disables early depth rejection, and the depth prepass measures 0.009 ms across three draw calls, so
+every layer of overlapping grass is shaded. That story is wrong, and one capture settles it.
+Capture 35 runs the identical scene at `r.ScreenPercentage=33` instead of 65, which is 3.87 times
+fewer shaded pixels with identical geometry, instances and draw calls:
+
+| counter | 65% (mean of two runs) | 33% | change |
+|---|---|---|---|
+| GPU/Basepass | 14.803 | 14.724 | −0.5% |
+| GPU/RenderVelocities | 14.956 | 14.916 | −0.3% |
+| GPU/VoxelMarch | 9.258 | 5.143 | −44% |
+| GPU total | 40.699 | 36.326 | −11% |
+
+**The understory passes did not move.** Cutting shaded pixels by a factor of 3.87 changed them by
+0.4%, which is inside the noise floor measured below. The understory cost is entirely geometry:
+vertex processing, primitive assembly and instance handling. It is not shading, not overdraw, not
+resolution, and not the masked material's early-Z behaviour.
+
+That result kills a whole family of proposals before anyone spends a week on one, and it points at
+a different family that follows directly from it.
+
+**Lever 4a — the velocity pass, about 15 ms, half the understory cost.** `GPU/RenderVelocities`
+(14.96 ms, 179 draw calls) is a near-exact duplicate of the base pass (14.80 ms, 173 draw calls). It
+exists because the wind animation moves vertices in the shader, and Unreal puts anything with
+vertex-deforming materials into the velocity pass every frame whether or not it actually moved.
+`r.VelocityOutputPass` is not set anywhere in the project, so this is the engine default. The
+question to answer first is whether distant or small plants need per-vertex wind at all, since
+anything that stops deforming leaves the pass. This is the single largest identified saving in the
+frame and nothing has been tried against it.
+
+**Lever 4b — the LOD chain barely reduces geometry.** Across the 339 baked models, the coarsest LOD
+is a median of 74% of LOD0 triangles, and the whole chain saves 29% of triangles library-wide.
+Sixteen models have no LODs at all, and 260 of 323 have only two levels. For a workload that has now
+been measured as geometry-bound, that is close to having no LOD system. Real decimation on the
+coarse levels attacks the cost directly.
+
+**Lever 4c — size culling, about 21 ms, already built.** Covered in Phase 0. Its mechanism is now
+understood: it drops 50 of the submitted HISM components by cutting most species' draw distance from
+256 m to 32-48 m, which is a geometry reduction, which is exactly what this workload responds to.
+
+**Lever 4d — Nanite is switched off.** `VoxelDetailAssetSubsystem.cpp:1455` sets
+`NaniteSettings.bEnabled = false`. Nanite exists for precisely this shape of problem: enormous
+instanced triangle counts with weak LODs. Whether it suits 25 mm voxel foliage with masked
+two-sided materials is a real question and it may not, but it has not been tried and the workload
+now provably matches its purpose.
+
+**The marcher, and an honest problem with the target.** The marcher does scale with pixels, but not
+purely: fitting the two resolution points gives a fixed 3.71 ms plus 14.25 ns per pixel. It is also
+roughly twice as expensive here as on the terrain-only flight leg, 9.26 ms against 5.04 ms. A
+plausible mechanism exists, since marcher cost tracks how far rays travel through empty air and a
+walking camera looks at the horizon while a flying one looks down, but nothing has measured that and
+it should not be assumed.
+
+The problem for the target is arithmetic. At the default 48 m ring the marcher is about 9.9 ms of a
+13.2 ms GPU frame, and the whole-frame budget for 100 FPS is 10 ms. **Terrain alone spends the
+entire budget before a single plant is drawn.** Marcher cost tracks ray count, ray count tracks
+pixels, and reducing rays has been rejected twice by the owner, with half-resolution marked rejected
+and an explicit instruction not to re-propose ray-count reduction. Those two facts cannot both hold
+at the current resolution. This plan does not try to resolve that; it names it, because a plan that
+quietly aims at an unreachable number is worse than one that says where the wall is.
+
+**Gate:** understory GPU under 10 ms at the 256 m ring, and a decision recorded on the marcher
+arithmetic above.
 
 ### Phase 5 — measure at the speed the target is written for
 
@@ -170,12 +243,40 @@ the condition it is supposed to pass. This needs a flight or sprint leg through 
 **Gate:** a capture at 20 m/s through the fixture, with the same receipt discipline, so the plan's
 own target is measured rather than assumed.
 
+## How trustworthy these numbers are
+
+Capture 34 repeats capture 26's configuration exactly, which gives a run-to-run noise floor that
+every single-pair claim in this document can be read against:
+
+| counter | capture 26 | capture 34 | difference |
+|---|---|---|---|
+| GPU total | 40.739 | 40.659 | −0.2% |
+| GPU/Basepass | 14.852 | 14.754 | −0.7% |
+| GPU/RenderVelocities | 14.943 | 14.969 | +0.2% |
+| GPU/VoxelMarch | 9.239 | 9.276 | +0.4% |
+| Game thread | 23.117 | 23.769 | +2.8% |
+| Frame time | 42.355 | 42.101 | −0.6% |
+
+**GPU counters reproduce to within 0.7%.** The 20.8 ms size-cull saving and the 0.4% resolution
+result are both far outside that, so neither is a one-run artefact. The game thread is looser at
+2.8%, so treat small game-thread differences with more suspicion than GPU ones.
+
+Two instrument notes worth keeping. `-ResX`/`-ResY` are inert in this harness: a capture requesting
+2560x1440 still rendered 832x468. The knob that works is `r.ScreenPercentage` passed through
+`-dpcvars`, since it is latched at startup, and the proof it engaged is the log's own
+`px of a WxH view` line. And two CSV counters must not be quoted for instancing work:
+`RHI/PrimitivesDrawn` counts each draw call's triangles once rather than once per instance, and
+`GPUSceneInstanceCount` counts registered rather than drawn instances. Neither moves when culling
+works.
+
 ## What this plan does not claim
 
-It does not claim the target is reachable. Terrain alone reached p50 8.78 ms and was 1.7 ms from
-the p95 bar; the slice adds content and a character pawn on top of that, and 15 ms of the gap is
-currently unexplained. Whether 100 FPS with this much ground cover is achievable is a question
-Phase 1 answers, not this document.
+It does not claim the target is reachable, and Phase 4 now gives a concrete reason to doubt it at
+the current resolution: the marcher alone costs about 9.9 ms against a 10 ms whole-frame budget,
+and the one lever that moves it has been rejected twice on visual grounds. Terrain alone reached
+p50 8.78 ms on a flight leg and was 1.7 ms from the p95 bar, but that is a different pawn, site and
+speed from anything measured here. Whether 100 FPS is achievable with this much ground cover is
+what Phases 1 and 4 answer between them, not this document.
 
 It also does not propose new rendering architecture. Every phase above is either shipping something
 already built, measuring something currently unmeasured, or attacking a specific named cost. If

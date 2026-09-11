@@ -3,7 +3,17 @@ param([Parameter(Mandatory=$true)][string]$AssetDirectory,[Parameter(Mandatory=$
     [switch]$DetailMeshLOD,[switch]$DetailSizeCull,[switch]$DetailRetireUnused,[string]$DetailMeshCache='',
     [switch]$PredictiveAssetResolve,[switch]$NoPredictiveAssetResolve,[switch]$MarchDispatchIdentity,
     [switch]$AllowPreviewDetailCache,[ValidateRange(16,512)][double]$DetailRingMeters=48,
-    [string[]]$ExtraArgs=@())
+    [string[]]$ExtraArgs=@(),
+    # Output resolution. The engine renders at a screen percentage of this and TSR
+    # upscales; the log's "px of a WxH view" line is the real internal size. Default
+    # 1280x720 keeps every historical capture comparable -- change it only to measure
+    # resolution scaling, and never between the arms of an A/B.
+    [ValidateRange(640,3840)][int]$RenderWidth=1280,[ValidateRange(360,2160)][int]$RenderHeight=720,
+    # Screen percentage. THIS is the resolution knob that works: -ResX/-ResY are inert here
+    # (2560x1440 requested still rendered 832x468, 2026-09-10), and the project default is
+    # r.ScreenPercentage=65 in DefaultEngine.ini. Passed via -dpcvars because it is
+    # Init-latched. Use it to measure pixel scaling; never vary it between A/B arms.
+    [ValidateRange(10,100)][int]$ScreenPercentage=0)
 $ErrorActionPreference='Stop'
 if(Get-Process UnrealEditor,UnrealEditor-Cmd,cl,link,MSBuild,UnrealBuildTool,dotnet -ErrorAction SilentlyContinue){throw 'UE or a build process is already running'}
 $outPath=[IO.Path]::GetFullPath($Output)
@@ -17,7 +27,7 @@ $cachePath=$null
 if($DetailMeshCache){$cachePath=(Resolve-Path -LiteralPath $DetailMeshCache).Path}
 New-Item -ItemType Directory -Path $outPath | Out-Null
 $runArgs=@('D:\voxelsim\ue-project\VoxelEarth.uproject','/Engine/Maps/Entry','-game','-dx12','-RenderOffscreen','-unattended','-nosplash','-nop4',
-    '-ResX=1280','-ResY=720','-csvGpuStats','-csvCompression=0',"-VoxelAssetDir=$assetPath","-VoxelEcologyConfig=$config",
+    "-ResX=$RenderWidth","-ResY=$RenderHeight",'-csvGpuStats','-csvCompression=0',"-VoxelAssetDir=$assetPath","-VoxelEcologyConfig=$config",
     '-VoxelWalkTest=1','-VoxelWalkWaitForEcology',"-VoxelDetailRingMeters=$($DetailRingMeters.ToString([Globalization.CultureInfo]::InvariantCulture))","-VoxelSpawnAt=$SpawnAt",'-VoxelSpawnAltM=5',
     '-VoxelTimeOfDay=10:00','-VoxelDate=2026-05-15','-VoxelTimeScale=0',"-UserDir=$outPath/session","-abslog=$outPath/game.log")
 if($DetailMeshLOD){$runArgs+='-VoxelDetailMeshLOD'}
@@ -30,6 +40,7 @@ if($cachePath){$runArgs+="-VoxelDetailMeshCache=$cachePath"}
 if($AllowPreviewDetailCache){$runArgs+='-VoxelDetailMeshCachePreview'}
 # Opt-in diagnostics (e.g. -VoxelR0EntryProfile -VoxelRecomputeCensus). Recorded in the manifest's
 # argument list like every other flag, so a receipt binds them; never used for A/B arms.
+if($ScreenPercentage){$runArgs+="-dpcvars=r.ScreenPercentage=$ScreenPercentage"}
 foreach($extra in $ExtraArgs){if($extra -notmatch '^-[A-Za-z0-9=.:,_-]+$'){throw 'Unsupported extra argument'};$runArgs+=$extra}
 $record=@{arguments=$runArgs;configurationSha256=(Get-FileHash -LiteralPath $config).Hash;startedUtc=[DateTime]::UtcNow.ToString('o');
     scope='Actual movement controller in ecological forest after streaming settles; scripted straight route, not general navigation acceptance'}
