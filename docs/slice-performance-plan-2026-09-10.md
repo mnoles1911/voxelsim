@@ -37,6 +37,28 @@ and it is opt-in today.
 understory's entire game-thread cost at median is about 0.02 ms: detail tick 0.010, dispatch
 0.005, unload 0.002, HISM rebuild 0.001, drain 0.000. The floor is 22.83 ms of something else.
 
+**4. Added 2026-09-11 — that "something else" is 39% water simulation, at a site with no water.**
+Twenty-four of the module's tick functions had no instrument at all, which is why fact 3 could only
+say "something else". They have one now. `OceanTick` reads 4.16 ms and `RippleTick` 4.10 ms, at a
+forest column the engine's own log puts at 70.8 m of ground over a 0.0 m sea level. A
+74,384-triangle ocean mesh is followed by transform and asked "is the camera underwater?" every
+frame, and a 512×512 ripple wave field is stepped at a fixed 60 Hz every frame, 75.8 m above the
+nearest sea. `voxel.Water.Ripple.Enable` defaults to true with no config override, so this ships
+that way. Neither actor has any gate on water being within reach. Both read the same 4.1 ms
+standing still as walking — a flat tax that does not care what the player is doing.
+
+Read together, facts 1 to 4 say the whole thing in one line each:
+
+| configuration | frame p50 | fps | GPU p50 | game thread p50 |
+|---|---|---|---|---|
+| 48 m ring, ships today | 21.1 | 47 | 12.7 | 21.1 |
+| 256 m ring | 41.7 | 24 | 40.5 | 21.8 |
+| **256 m ring + size cull** | **22.7** | **44** | **19.5** | 22.7 |
+
+**Size culling buys a 5.3× larger ring for nothing.** And at both the shipping ring and the culled
+256 m ring the binding constraint is the same 21–23 ms game thread, of which 8.3 ms is water
+simulation on dry land.
+
 ## What the floor is made of, and what it is not
 
 Named game-thread work at the 48 m default ring, medians, with nesting resolved from the scope
