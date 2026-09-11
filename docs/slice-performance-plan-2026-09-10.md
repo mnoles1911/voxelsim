@@ -71,13 +71,13 @@ on this: it rests on two same-sitting pairs, 24/25 and 26/27.
 ## Ordered work queue as of 2026-09-11
 
 The measurement runs below all use the current binary and the current detail
-cache. **Nothing in phase 2 may start until phase 1 finishes**, because
+cache. **Nothing in run order B may start until run order A finishes**, because
 `VoxelDetailAssetSubsystem.cpp` and `M_VoxelDetailAsset` are both part of the
 detail cache identity: editing either refuses every existing cache, and a
 capture that starts after such an edit fails rather than silently measuring the
 wrong geometry.
 
-### Phase 1 — measurement, current binary, current cache
+### Run order A — measurement, current binary, current cache
 
 1. **Size-cull screenshots.** Two route captures at the 256 m ring, size culling
    off and on, on the *detour* route. (The survey route aborts at its last
@@ -100,7 +100,7 @@ wrong geometry.
    does the 479-ray hole reproduce here? A null on the first kills the top
    marcher lever for the cost of two legs.
 
-### Phase 2 — the re-bake cycle, batched because the toll is paid once
+### Run order B — the re-bake cycle, batched because the toll is paid once
 
 Both changes invalidate every detail cache, so they go together.
 
@@ -116,7 +116,7 @@ Both changes invalidate every detail cache, so they go together.
    WPO-velocity off. The control is not optional — the material change moves the
    cache identity, so no earlier capture is comparable.
 
-Neither phase-2 change sets a default. Both are visual trades and both are the
+Neither run-order-B change sets a default. Both are visual trades and both are the
 owner's verdict under the settings-panel policy: Nanite puts these plants into
 the Lumen scene for the first time, and dropping wind motion vectors smears
 moving foliage under temporal upscaling.
@@ -165,10 +165,20 @@ FrameTime  807.94 | GT  808.26  GPU 11.56  RT 4.00 | TickMs=785.0  DispatchMs=77
 ```
 
 Game-thread time inside the streaming tick, inside dispatch, inside GPU submit. The GPU is idle at
-12 to 15 ms throughout. This is the failure class already documented in
-`docs/raster-atlas-warmup-2026-08-24.md` and `docs/submit-split-2026-08-28.md`, at a larger
-magnitude than those recorded. At median the same counter reads 0.086 ms, so this is purely a tail
+12 to 15 ms throughout. At median the same counter reads 0.086 ms, so this is purely a tail
 phenomenon: rare, enormous, and entirely on the game thread.
+
+**Updated 2026-09-11 — the hitches are now named, and at this site they are NOT the raster atlas.**
+Capture 43 splits cleanly into regimes: frames 0–199 and 450–540 are settled and put exactly one
+frame in two hundred over 33.3 ms; frames 200–449 are walking and streaming and put 134 of 250 over
+it. In that busy stretch `WorldSubsystemTick` reads 77.37 ms at p95 with `DispatchMs` at 41.45
+inside it, against 2.46 and 0.02 in the quiet stretch. Across the 135 frames above the line, 4,605
+ms of game-thread time sits above it and `DispatchMs` alone accounts for 2,022 ms — 44%. The worst
+frame is 400.8 ms, of which 371.1 is inside `WorldSubsystemTick` and 344.6 inside the dispatch.
+
+`RasterAtlasTick` reads 0.1 to 0.8 ms in every one of the twelve worst frames, so the failure class
+in `docs/raster-atlas-warmup-2026-08-24.md` is **not** what is firing here. A second and separate
+class shows at frame 356, where `DetailTick` alone takes 101.3 ms.
 
 ## The plan
 
@@ -421,7 +431,16 @@ Three investigations (engine source, repo history, published practice) ran again
 above. What follows is what survived them. Several popular ideas did not, and they are listed too,
 because knowing what not to try is most of the value.
 
-### The understory: Nanite is the only route that removes a whole pass
+### The understory: two routes remove the velocity pass, and Nanite is the expensive one
+
+**Superseded in part, 2026-09-11.** The heading below was written when Nanite looked like the only
+way to make the second geometry traversal disappear. There is a second route and it is one line:
+`bWorldPositionOffsetWritesVelocity = false` on the understory components. Without it the velocity
+pass rejects a component that never moves, and the wind is the only reason these components are in
+that pass at all. It is scoped to the ground cover rather than to the whole renderer, which
+`r.Velocity.EnableVertexDeformation` could not be. Same visual trade, far smaller change. See
+`docs/measurements/understory-cost-shape-2026-09-11/`. The reasoning below about *why* the pass
+exists and why its motion vectors are correct still stands and is worth reading.
 
 The understory pays two geometry traversals per frame. One is the base pass. The other is reported as
 `RenderVelocities`, and at the engine default (`r.VelocityOutputPass=0`) that line **is** the depth
