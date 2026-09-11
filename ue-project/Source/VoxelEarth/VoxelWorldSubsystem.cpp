@@ -3585,9 +3585,32 @@ bool AsyncAssetResolveEnabled()
 // resolved twice, and the pending queue is ~2,048 deep against ~96 dispatches
 // per tick, so a warm task has tens of ticks of head start. NOT TUNED BY
 // MEASUREMENT -- nothing has been run.
+// DEFAULT ON FOR ECOLOGY WORLDS since 2026-09-10, on the owner's decision, and it
+// follows AsyncAssetResolveEnabled's shape above for the same reasons: an ecology
+// world is exactly where the cold resolve is paid, legacy worlds stay byte-identical,
+// and -VoxelNoPredictiveAssetResolve is the control arm's off switch (a command line
+// switch, not a cvar, because a cvar lands after streaming has begun and a prewarm is
+// only interesting during the cold fill).
+//
+// WHAT MEASURED IT, so the next person does not re-litigate the default from scratch:
+// captures 30/31 (docs/measurements/predictive-resolve-ab-2026-09-10), flag-only, same
+// binary and cache, both receipts passing. Admission cold misses fell 410 -> 6 per
+// window, the R0 entry profile's Resolve total fell 73%, walking p95 frame time went
+// 329 -> 120 ms and sprint median 55.5 -> 48.7 ms. Medians elsewhere barely moved
+// because the ~40 ms GPU floor at the 256 m ring is untouched by this -- prewarming
+// removes a GAME-THREAD stall, and it cannot make the renderer faster.
+//
+// The earlier "predictive prewarm gave mixed results" verdict (walks 22/23) predates
+// the authored-LOD understory payload and is superseded, not contradicted.
 bool PredictiveAssetResolveEnabled()
 {
-	static const bool Enabled = FParse::Param(FCommandLine::Get(), TEXT("VoxelPredictiveAssetResolve"));
+	static const bool Enabled = []
+	{
+		if (FParse::Param(FCommandLine::Get(), TEXT("VoxelPredictiveAssetResolve"))) return true;
+		FString EcologyPath;
+		return !FParse::Param(FCommandLine::Get(), TEXT("VoxelNoPredictiveAssetResolve")) &&
+			FParse::Value(FCommandLine::Get(), TEXT("VoxelEcologyConfig="), EcologyPath) && !EcologyPath.IsEmpty();
+	}();
 	return Enabled && AsyncAssetResolveEnabled();
 }
 
