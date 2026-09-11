@@ -112,7 +112,56 @@ With one batch object the containment check does the rest: whoever asks widest
 pays once, everyone inside is free.
 
 Expected: one preparation per frame instead of two, and the ocean's remaining
-3.3 ms collapsing with it. Arms 52 and 53 are the same A/B on the same cvar.
+3.3 ms collapsing with it.
+
+### It did, and the prediction held on all three counts
+
+Walk 52 against walk 53, one binary, a cvar apart, both receipts passed with
+their eight movement checks.
+
+| scope (median ms) | shortlist OFF | shortlist ON | change |
+|---|---|---|---|
+| **GameThreadTime** | **21.583** | **13.301** | **−8.283** |
+| **UnderwaterQuery** | **8.096** | **0.027** | **−8.069** |
+| └ WaterFillImplicit | 8.079 | 0.011 | −8.068 |
+| OceanUnderwater | 4.111 | 0.004 | −4.108 |
+| RippleAutoWatch | 3.953 | 0.018 | −3.935 |
+| CollisionPrepare | 3.697 | 3.692 | −0.005 |
+| **CollisionPreparations** | **1** | **1** | **0** |
+| FrameShortlistPointCalls | — | 12 | |
+| GPUTime | 40.488 | 40.479 | −0.009 |
+| RenderThreadTime | 41.684 | 41.640 | −0.044 |
+| PawnTick | 4.286 | 4.258 | −0.028 |
+
+**−8.28 ms, 38% of the game thread.** The prediction written before the run was
+"about 8 ms off the game thread, `CollisionPreparations` still 1 per frame,
+nothing on the GPU moves." All three held.
+
+The 8.1 ms underwater query is **gone** — 0.027 ms. One prepare a frame now
+serves the movement sweep, the ocean's camera test and the ripple watcher
+together, and the prepare itself did not get more expensive for covering them:
+3.697 to 3.692 ms.
+
+`FrameTime` does not move in this pair, because these arms run with size culling
+off and the GPU is still the 40.5 ms wall. The two changes are independent and
+compose: size culling takes the GPU to 20.0, this takes the game thread to 13.3.
+
+## Where the game thread stands now
+
+| item | ms | note |
+|---|---|---|
+| GameThreadTime | **13.30** | was 21.58 |
+| PawnTick | 4.26 | ⊃ MovementTick 4.25 ⊃ **CollisionPrepare 3.69** |
+| ClipmapTick | 2.96 | ⊃ RoofProbe, a cave boolean recomputed every frame |
+| OceanTick | 0.006 | was 4.11 |
+| RippleTick | 0.088 | was 4.02 |
+
+**The single prepare is now the largest item on the thread.** It is the same
+3.69 ms it always was; what changed is that it is no longer paid three times.
+Reducing it means retaining the shortlist *across* frames, which is a different
+and more delicate change — the asset field carries a configuration revision that
+would serve as the invalidation signal, and the edited-brick overlay already
+protects against stale edits.
 
 ## Why this is the right target now
 
