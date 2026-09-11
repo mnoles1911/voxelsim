@@ -8492,8 +8492,24 @@ uint8 UVoxelWaterSubsystem::GetWaterFillAtWorld(const FVector& WorldUU) const
 	// already reads 0 there, so the max of the two is the whole water column
 	// with no double count in either direction (waterca.h's ownership
 	// partition is what guarantees that, not call order here).
-	const uint8 CaFill = Impl->CA.fillAt(Vx, Vy, Vz);
-	return CaFill > 0 ? CaFill : Impl->Mob.implicitFillAt(Vx, Vy, Vz);
+	// SPLIT, BECAUSE THIS LINE IS 99.8% OF THE QUERY AND NOBODY KNEW WHICH HALF.
+	//
+	// walk-capture-45/46 (2026-09-11) measured IsUnderwaterAtWorld at 8.10 ms of
+	// a 21.6 ms game thread, and its two sub-scopes said UnderwaterFillMs 8.088
+	// against UnderwaterSurfaceMs 0.013. So the worldgen ground sample was never
+	// the cost and the whole of it is here. These two name which of the pair it
+	// is: the CA cell read, or the implicit field.
+	uint8 CaFill;
+	{
+		CSV_SCOPED_TIMING_STAT(VoxelStream, WaterFillCaMs);
+		CaFill = Impl->CA.fillAt(Vx, Vy, Vz);
+	}
+	if (CaFill > 0)
+	{
+		return CaFill;
+	}
+	CSV_SCOPED_TIMING_STAT(VoxelStream, WaterFillImplicitMs);
+	return Impl->Mob.implicitFillAt(Vx, Vy, Vz);
 }
 
 double UVoxelWaterSubsystem::SeaLevelZUU()
@@ -8582,44 +8598,45 @@ bool UVoxelWaterSubsystem::GetBasinDatumNowZUU(int32 TileX, int32 TileY, int32 B
 	return true;
 }
 
-// THE ABOVE-THE-WATERLINE SHORT CIRCUIT, AND IT IS AN IDENTITY, NOT A GATE.
+// THE ABOVE-THE-WATERLINE SHORT CIRCUIT: BUILT, ENGAGED, MEASURED NULL, RETIRED.
 //
-// WHY IT EXISTS. Measured 2026-09-11 at the temperate forest site
-// (walk-capture-44, quiet stretch, 532 frames): this function is called twice
-// per frame from two different owners and costs 8.0 ms of a 21.1 ms game
-// thread -- 38% of it -- at a column the engine's own log puts at 70.8 m of
-// ground over a 0.0 m sea level. The two callers are
-// AVoxelOceanActor::UpdateUnderwaterState (OceanUnderwaterMs 4.075 ms, which is
-// 100% of the ocean tick) and UVoxelRippleFieldSubsystem::AutoWatch
-// (RippleAutoWatchMs 3.917 ms, which is 98% of the ripple tick -- the wave
-// simulation itself is 0.069 ms and was never the cost).
-//
-// WHY IT IS EXACT. IsOpenSeaNowAtWorld is
+// It skipped the worldgen ground sample whenever the point was at or above the
+// tided sea surface, on the grounds that IsOpenSeaNowAtWorld is
 //     WorldZ < SeaZ && GroundZ < SeaZ && WorldZ >= GroundZ
-// so when WorldZ >= SeaZ the FIRST term is already false and the conjunction is
-// false whatever the ground turns out to be. The ground is therefore not an
-// input to the answer in that half-space, and declining to compute it cannot
-// change the answer. This is algebra, not an approximation and not a tolerance,
-// which is why it ships on by default with no visual verdict attached.
+// so above the waterline the ground cannot change the answer. That reasoning is
+// still correct -- it is algebra, not a tolerance. It simply bought nothing.
 //
-// THE CVAR IS THE CONTROL ARM, NOT A FEATURE. 0 restores the original call
-// order byte for byte so one binary can measure both arms; see
-// docs/measurements/gamethread-query-recompute-2026-09-11/.
-static TAutoConsoleVariable<bool> CVarVoxelWaterUnderwaterFastPath(
-	TEXT("voxel.Water.UnderwaterFastPath"), true,
-	TEXT("Skip the worldgen ground sample in IsUnderwaterAtWorld when the point is at or above ")
-	TEXT("the tided sea surface, where IsOpenSeaNowAtWorld is false regardless of the ground. ")
-	TEXT("An identity, not a tolerance. 0 is the control arm and restores the original path."),
-	ECVF_Default);
-
+// walk-capture-45 against walk-capture-46, one binary, cvar apart, quiet
+// stretch of each: the arm ENGAGED perfectly, 12 of 12 calls a frame taking the
+// short circuit, and the game thread moved 21.604 -> 21.511 ms, which is inside
+// the 2.8% repeatability. The sub-scopes said why, and they are the reason this
+// took one capture instead of a week:
+//
+//     UnderwaterQueryMs     8.103      <- the whole call
+//     UnderwaterFillMs      8.088      <- 99.8% of it
+//     UnderwaterSurfaceMs   0.013      <- the half I removed
+//
+// So the worldgen ground sample was never the cost. It is 0.013 ms across all
+// twelve calls, and a branch and a cvar to avoid it is dead weight. Removed
+// rather than left switched on, per this file's standing rule that an arm which
+// measures null gets retired with its record instead of accumulating.
+//
+// WHAT IS STILL TRUE AND STILL EXPENSIVE. This function costs 8.10 ms of a
+// 21.6 ms game thread -- 38% -- at a column 70.8 m above a 0.0 m sea level, and
+// all of it is in GetWaterFillAtWorld, which now carries its own split. The two
+// owners are AVoxelOceanActor::UpdateUnderwaterState (one call, ~4.1 ms) and
+// UVoxelRippleFieldSubsystem::AutoWatch (the rest, ~0.36 ms each). Disabling
+// the ripple feature entirely takes the game thread to 17.00 ms, which prices
+// the watcher and is NOT a proposal -- it removes a feature.
+//
+// Record: docs/measurements/water-query-split-2026-09-11/.
 bool UVoxelWaterSubsystem::IsUnderwaterAtWorld(const FVector& WorldUU) const
 {
 	CSV_SCOPED_TIMING_STAT(VoxelStream, UnderwaterQueryMs);
 	CSV_CUSTOM_STAT(VoxelStream, UnderwaterQueryCalls, 1, ECsvCustomStatOp::Accumulate);
 	{
-		// Split so the next capture says WHICH half is the 4 ms, rather than
-		// leaving it to be inferred. GetWaterFillAtWorld is a CA cell read plus
-		// an implicit-field read; the other is a worldgen amplifier column.
+		// Kept: this split is what retired the arm above in one capture, and the
+		// same question will be asked again of whatever replaces it.
 		CSV_SCOPED_TIMING_STAT(VoxelStream, UnderwaterFillMs);
 		if (GetWaterFillAtWorld(WorldUU) > 0)
 		{
@@ -8628,14 +8645,6 @@ bool UVoxelWaterSubsystem::IsUnderwaterAtWorld(const FVector& WorldUU) const
 	}
 	if (!Impl)
 	{
-		return false;
-	}
-	if (CVarVoxelWaterUnderwaterFastPath.GetValueOnGameThread() &&
-	    WorldUU.Z >= SeaSurfaceZNowUU())
-	{
-		// See the block above this function. Not a gate: the ground cannot
-		// change the answer here.
-		CSV_CUSTOM_STAT(VoxelStream, UnderwaterFastOuts, 1, ECsvCustomStatOp::Accumulate);
 		return false;
 	}
 	// GetSurfaceHeightUU is the AMPLIFIER column surface -- worldgen, not the

@@ -44,7 +44,17 @@ mesh was never the problem either.
 **Two calls a frame, 8.0 ms, 38% of a 21.1 ms game thread**, at a column the
 engine's own log puts at 70.8 m of ground over a 0.0 m sea level.
 
-## The fix is an identity, not a gate
+## The fix was an identity, and it was still a null
+
+**Superseded within the hour by
+`docs/measurements/underwater-fastpath-null-2026-09-11/`.** The short circuit
+below is correct reasoning and it removed the wrong half. It engaged on 12 of 12
+calls a frame and moved the game thread 0.093 ms, because the sub-scopes shipped
+with it showed `UnderwaterFillMs` at 8.088 ms against `UnderwaterSurfaceMs` at
+**0.013 ms**. The worldgen ground sample was never the cost either. The arm is
+retired; the split inside `GetWaterFillAtWorld` is the live question.
+
+## What the fix was, kept for the record
 
 `IsOpenSeaNowAtWorld` is exactly
 
