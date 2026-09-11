@@ -119,6 +119,7 @@ try {
 $proc=Start-Process D:\UE_5.8\Engine\Binaries\Win64\UnrealEditor-Cmd.exe -ArgumentList $quotedArgs -WindowStyle Hidden -PassThru
 Write-Output "Ecological walking test PID $($proc.Id)"
 $deadline=[DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+$gpuTick=0
 while(-not $proc.WaitForExit(1000)){
     # Fail this owned capture if another renderer/compiler competes. Do not
     # terminate somebody else's process. ShaderCompileWorker and the engine's
@@ -127,6 +128,24 @@ while(-not $proc.WaitForExit(1000)){
     if($competing.Count){
         $validation.competingProcesses=@($competing | ForEach-Object {@{id=$_.Id;name=$_.ProcessName;observedUtc=[DateTime]::UtcNow.ToString('o')}})
         throw 'Competing UE/compiler process detected; capture is invalid'
+    }
+    # Foreign GPU load DURING the run, not only at the start. The start guard is not
+    # enough on its own: capture 37 began on an idle GPU and a browser resumed compositing
+    # before it finished. That one survived -- its GPU time was flat across every fifth of
+    # the run -- but nothing except luck made it so, and a start-only check cannot tell a
+    # clean capture from a lucky one.
+    #
+    # Sampled every ~10th tick rather than every second, because reading the counter costs
+    # real time and perturbing the thing being measured to check whether it is perturbed is
+    # its own mistake. Get-ForeignGpuLoad takes the minimum of three reads, so a one-frame
+    # spike does not void a good capture while sustained load does.
+    $gpuTick++
+    if($gpuTick % 10 -eq 0){
+        $foreignNow=Get-ForeignGpuLoad -OwnPids @($proc.Id)
+        if($null -ne $foreignNow -and $foreignNow.Count){
+            $validation.competingProcesses=@($foreignNow | ForEach-Object {@{id=$_.ProcessId;name=$_.Name;gpuPercent=$_.Percent;observedUtc=[DateTime]::UtcNow.ToString('o')}})
+            throw ('Another process began using the GPU mid-capture (' + (($foreignNow | ForEach-Object { "$($_.Name) $($_.Percent)%" }) -join ', ') + '); this capture is invalid')
+        }
     }
     foreach($module in $moduleMetadata.Keys){
         $info=Get-Item -LiteralPath (Join-Path 'D:\voxelsim\ue-project\Binaries\Win64' $module)

@@ -103,7 +103,19 @@ $quotedArgs=($runArgs | ForEach-Object {'"'+$_+'"'}) -join ' '
 $proc=Start-Process D:\UE_5.8\Engine\Binaries\Win64\UnrealEditor-Cmd.exe -ArgumentList $quotedArgs -WindowStyle Hidden -PassThru
 Write-Output "Ecological route PID $($proc.Id)"
 $deadline=[DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+$gpuTick=0
 while(-not $proc.WaitForExit(1000)){
+    # Foreign GPU load DURING the run; the start guard alone cannot tell a clean capture
+    # from a lucky one. Sampled every ~10th tick because reading the counter costs real
+    # time, and on the minimum of three reads so a spike does not void a good run.
+    $gpuTick++
+    if($gpuTick % 10 -eq 0){
+        $foreignNow=Get-ForeignGpuLoad -OwnPids @($proc.Id)
+        if($null -ne $foreignNow -and $foreignNow.Count){
+            $proc.Kill();$proc.WaitForExit()
+            throw ('Another process began using the GPU mid-route (' + (($foreignNow | ForEach-Object { "$($_.Name) $($_.Percent)%" }) -join ', ') + '); this capture is invalid')
+        }
+    }
     if([DateTime]::UtcNow -ge $deadline){
         $proc.Kill();$proc.WaitForExit()
         'Route timed out; no acceptance.' | Set-Content -LiteralPath "$outPath/timeout.txt"

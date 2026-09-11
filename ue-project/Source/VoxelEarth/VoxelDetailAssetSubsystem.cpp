@@ -1477,6 +1477,25 @@ UStaticMesh* VoxelBakePersistentDetailMesh(const vxc::AssetGrid& Grid,
     // simplified fallback mesh (see ue-project/Tools/capture_tree_appearance_pilot.py).
     static const bool bDetailNanite=FParse::Param(FCommandLine::Get(),TEXT("VoxelDetailNanite"));
     Mesh->NaniteSettings.bEnabled=bDetailNanite;
+    if(bDetailNanite){
+        // FallbackRelativeError defaults to 1.0, which lets Nanite decimate the fallback
+        // mesh until it reaches that error: the first arm produced 77,950 triangles from
+        // an authored 104,678, a 25% cut, and the authored-LOD guard refused the run.
+        //
+        // Set it to 0 so the fallback IS the authored geometry. That keeps the exact
+        // triangle guard below working unchanged for both arms, and it is the safer
+        // shape anyway: the fallback is what renders wherever Nanite cannot run, so an
+        // exact fallback degrades to precisely today's geometry instead of to a silently
+        // reduced mesh. It costs disk and memory for a second copy, which is acceptable
+        // for an experiment and is a real consideration before any of this ships.
+        // FallbackTarget defaults to Auto, "automatic heuristic based on project
+        // settings", and Auto IGNORES the two values below -- setting them alone left a
+        // 104,678-triangle mesh with a 77,950-triangle fallback, a 25% cut. Naming the
+        // target is what makes them take effect.
+        Mesh->NaniteSettings.FallbackTarget=ENaniteFallbackTarget::PercentTriangles;
+        Mesh->NaniteSettings.FallbackPercentTriangles=1.f;
+        Mesh->NaniteSettings.FallbackRelativeError=0.f;
+    }
     for(int32 L=0;L<Descs.Num();++L){
         auto& Source=Mesh->GetSourceModel(L);
         // SetNumSourceModels initializes missing descriptions with 50%^LOD
@@ -1501,17 +1520,47 @@ UStaticMesh* VoxelBakePersistentDetailMesh(const vxc::AssetGrid& Grid,
     if(!Built||Built->LODResources.Num()!=Descs.Num()){
         Error=TEXT("persistent mesh did not preserve authored LOD count");return nullptr;
     }
+    // UNDER NANITE THIS GUARD IS CHECKING THE WRONG ARTIFACT, so it is scoped.
+    //
+    // With Nanite off (the shipping path) LODResources IS the rendered geometry, and the
+    // exact-triangle check below is what caught the editor builder silently replacing
+    // authored distant LODs with generic 50%-per-level reductions. That check is
+    // unchanged and must stay exact.
+    //
+    // With -VoxelDetailNanite the rendered geometry is the Nanite cluster data and
+    // LODResources holds the fallback mesh, which is what renders wherever Nanite cannot
+    // run. The flag site asks Nanite for an EXACT fallback, so the triangle check stays
+    // exact for both arms; what is added here is that a run which asked for Nanite and
+    // did not get it fails loudly, rather than quietly measuring non-Nanite geometry.
+    const bool bNaniteBuilt=Built->HasValidNaniteData();
+    if(bDetailNanite&&!bNaniteBuilt){
+        Error=TEXT("-VoxelDetailNanite was requested but the built mesh has no Nanite data");return nullptr;
+    }
     FString AuthoredCounts;
     for(int32 L=0;L<Descs.Num();++L){
         const uint32 Expected=uint32(Descs[L]->Triangles().Num());
+        const uint32 Actual=Built->LODResources[L].GetNumTriangles();
+        // Exact with Nanite off: that is the shipping path and the check that caught the
+        // builder silently reducing authored LODs.
+        //
+        // With Nanite on, the fallback builder removes degenerate triangles no matter what
+        // the reduction settings say. Measured: 4704 -> 4702 with FallbackRelativeError=0
+        // and FallbackPercentTriangles=1, i.e. exactly one quad face on a mesh built from
+        // cube faces. So the bound has to separate CLEANUP from DECIMATION rather than
+        // demand equality. A near-absolute bound does that: a handful of triangles passes,
+        // and the 104678 -> 77950 (25%) decimation that an unconstrained fallback produced
+        // fails as loudly as it should. A percentage bound would scale with the mesh and
+        // wave that through on anything large.
+        const uint32 Slack=bNaniteBuilt?FMath::Max<uint32>(8,Expected/1000):0;
+        const bool bTrianglesOk=(Actual<=Expected+Slack)&&(Actual+Slack>=Expected);
         // Vertex welding/reordering is legitimate; source triangles here are
         // nondegenerate exposed voxel faces and must not be reduced or removed.
-        if(Built->LODResources[L].GetNumTriangles()!=Expected||Mesh->IsReductionActive(L)){
-            Error=FString::Printf(TEXT("persistent authored LOD%d changed: expected=%u triangles actual=%u reductionActive=%d"),L,Expected,Built->LODResources[L].GetNumTriangles(),int(Mesh->IsReductionActive(L)));return nullptr;
+        if(!bTrianglesOk||Mesh->IsReductionActive(L)){
+            Error=FString::Printf(TEXT("persistent authored LOD%d changed: expected=%u triangles actual=%u reductionActive=%d nanite=%d"),L,Expected,Actual,int(Mesh->IsReductionActive(L)),int(bNaniteBuilt));return nullptr;
         }
         AuthoredCounts+=FString::Printf(TEXT(" L%d=%u/%u"),L,Expected,Built->LODResources[L].GetNumTriangles());
     }
-    UE_LOG(LogVoxelEarth,Log,TEXT("DetailAuthoredLOD preserved mesh=%s lods=%d authored/builtTriangles:%s"),*Mesh->GetPathName(),Descs.Num(),*AuthoredCounts);
+    UE_LOG(LogVoxelEarth,Log,TEXT("DetailAuthoredLOD preserved mesh=%s lods=%d nanite=%d authored/builtTriangles:%s"),*Mesh->GetPathName(),Descs.Num(),int(bNaniteBuilt),*AuthoredCounts);
     Mesh->SetAutoComputeLODScreenSize(false);
     for(int32 L=0;L<Descs.Num();++L){
         const float Screen=L?Geometry.LodScreens[L-1]:1.f;
