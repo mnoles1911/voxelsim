@@ -59,6 +59,60 @@ Read together, facts 1 to 4 say the whole thing in one line each:
 256 m ring the binding constraint is the same 21–23 ms game thread, of which 8.3 ms is water
 simulation on dry land.
 
+
+## Ordered work queue as of 2026-09-11
+
+The measurement runs below all use the current binary and the current detail
+cache. **Nothing in phase 2 may start until phase 1 finishes**, because
+`VoxelDetailAssetSubsystem.cpp` and `M_VoxelDetailAsset` are both part of the
+detail cache identity: editing either refuses every existing cache, and a
+capture that starts after such an edit fails rather than silently measuring the
+wrong geometry.
+
+### Phase 1 — measurement, current binary, current cache
+
+1. **Size-cull screenshots.** Two route captures at the 256 m ring, size culling
+   off and on, on the *detour* route. (The survey route aborts at its last
+   waypoint — 6 of 7, 130.85 m of 135.47 — and does so at the 48 m ring too, so
+   it is a bad route, not a ring problem. That is why the detour exists.)
+   Produces 8 pose-matched checkpoint pairs plus a second timing confirmation.
+2. **Water sub-scopes.** One walk capture reading `OceanFollowMs` /
+   `OceanUnderwaterMs` and `RippleAutoWatchMs` / `RippleStepMs` /
+   `RipplePublishMs` / `RippleHealthMs`, to split the 8.26 ms in two.
+3. **Ripple falsifier.** One walk arm at
+   `-dpcvars=voxel.Water.Ripple.Enable=0`. If ~4 ms does not come off the game
+   thread, the scope is measuring something other than its name and the finding
+   in fact 4 is wrong.
+4. **Marcher resolution ladder.** Five walk arms at screen percentage
+   100/80/65/45/33. Settles whether the marcher has a real fixed term — a
+   two-point fit says 3.63 ms and the identical arithmetic was retracted once
+   already.
+5. **Height pyramid gates at this site.** `tools/voxel-heightpyramid-gates.ps1`,
+   zero code. Does the 21.64% engagement transfer off the 2026-08-27 site, and
+   does the 479-ray hole reproduce here? A null on the first kills the top
+   marcher lever for the cost of two legs.
+
+### Phase 2 — the re-bake cycle, batched because the toll is paid once
+
+Both changes invalidate every detail cache, so they go together.
+
+1. `create_detail_asset_material.py` already sets `used_with_nanite`; regenerate
+   the asset headless with `-run=pythonscript`.
+2. Add an opt-in flag to the understory component setup that sets
+   `bWorldPositionOffsetWritesVelocity = false` before `RegisterComponent()`.
+   It is a public bitfield with no setter. This drops the whole velocity
+   submission for the ground cover only, rather than for the renderer, which is
+   what `r.Velocity.EnableVertexDeformation` could not do.
+3. Rebuild, then re-bake. A full bake measured ~20 minutes on 2026-09-11.
+4. Three captures: a fresh control on the new cache, Nanite on, and
+   WPO-velocity off. The control is not optional — the material change moves the
+   cache identity, so no earlier capture is comparable.
+
+Neither phase-2 change sets a default. Both are visual trades and both are the
+owner's verdict under the settings-panel policy: Nanite puts these plants into
+the Lumen scene for the first time, and dropping wind motion vectors smears
+moving foliage under temporal upscaling.
+
 ## What the floor is made of, and what it is not
 
 Named game-thread work at the 48 m default ring, medians, with nesting resolved from the scope
