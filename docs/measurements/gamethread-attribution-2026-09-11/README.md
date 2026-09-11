@@ -81,6 +81,54 @@ added a correctness surface to the one pass in `VoxelMarchRenderer.cpp` that
 can produce a hole, to buy at most 0.05 ms. The bracket stays in the source as
 the record of why.
 
+
+## The capture has two regimes, and one median averages them together
+
+Frames 0-199 and 450-540 are settled; frames 200-449 are the walking and
+streaming phase. Reading them apart changes what every number above means.
+
+| counter | quiet median | quiet p95 | busy median | busy p95 |
+|---|---|---|---|---|
+| GameThreadTime | 21.55 | 25.01 | 35.01 | 120.69 |
+| GPUTime | 40.31 | 40.65 | 41.17 | 45.39 |
+| FrameTime | 41.56 | 41.95 | 42.34 | 125.38 |
+| PawnTick | 4.32 | 4.69 | 6.21 | 19.03 |
+| OceanTick | 4.12 | 4.55 | 4.41 | 12.33 |
+| RippleTick | 4.13 | 4.44 | 4.12 | 12.34 |
+| WorldSubsystemTick | 0.13 | 2.46 | 0.61 | **77.37** |
+| DispatchMs | 0.01 | 0.02 | 0.24 | **41.45** |
+| GPU/Basepass | 14.68 | 14.86 | 14.69 | 15.77 |
+| GPU/RenderVelocities | 14.91 | 15.01 | 14.86 | 15.31 |
+| GPU/VoxelMarch | 8.98 | 9.18 | 10.14 | 11.11 |
+
+Frames over 33.3 ms: **1 of 200** in the first quiet stretch, **134 of 250**
+while walking, **0 of 91** in the second.
+
+Three things follow.
+
+**The GPU floor is there whether or not anything is happening.** 40.3 ms
+standing still, 41.2 ms walking — a 42 ms frame, 24 fps, with the player
+motionless in a forest. That floor is the understory's 29.6 ms plus the
+marcher's 9.5 ms, and it is the reason the slice is slow. Every hitch is on top
+of it.
+
+**The hitches are the streaming dispatch, and they are now named.** In the busy
+stretch `WorldSubsystemTick` goes to 77.37 ms at p95 with `DispatchMs` at 41.45
+inside it, against quiet-stretch values of 2.46 and 0.02. Across the 135 frames
+that exceed 33.3 ms, 4,605 ms of game-thread time sits above that line, and
+`DispatchMs` alone accounts for 2,022 ms of it — 44%. The worst single frame is
+400.8 ms of game thread, 371.1 of it inside `WorldSubsystemTick` and 344.6
+inside the dispatch.
+
+This is *not* the raster-atlas fill that earlier work identified as the freeze
+mechanism: `RasterAtlasTick` reads 0.1 to 0.8 ms in every one of the twelve
+worst frames. A second hitch class shows separately at frame 356, where
+`DetailTick` alone takes 101.3 ms.
+
+**Ocean and Ripple do not care what the player is doing.** 4.12 and 4.13 ms
+standing still, 4.41 and 4.12 ms walking. They are a flat tax, which is what
+makes them the cleanest thing on this list to remove.
+
 ## A counter that lies, recorded so nobody else trusts it
 
 While reading this capture I took `RHI/PrimitivesDrawn` = 268,092 as the
