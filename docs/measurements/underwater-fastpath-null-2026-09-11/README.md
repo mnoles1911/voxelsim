@@ -55,13 +55,19 @@ names which of the pair it is.
 **Twelve calls a frame, not two.** The ocean asks once for the camera; the ripple
 field's auto-watcher asks for the pawn and for every watched actor.
 
-**The spread is by position, not by caller.** With the ripple feature off, the
-query total falls 8.103 → 4.140 while the call count only falls 12 → 11. So the
-ocean's single camera call is ~4.1 ms and the other eleven cost ~0.36 ms each.
-One call is eleven times dearer than the rest, and the cause is still open. The
-leading candidates: the amplifier's thread-local column memo being cold for
-whichever subsystem ticks first, or the implicit-field read depending on the Z
-the caller passes.
+**Two calls of the twelve carry the entire cost.** Turning the ripple feature
+off removes exactly **one** call and **3.963 ms** with it, so the auto-watcher's
+pawn call alone is ~3.96 ms. The eleven that remain cost 4.140 ms in total, and
+`OceanUnderwater` accounts for 4.132 of that — leaving **about 0.008 ms for the
+other ten calls put together.**
+
+So it is not a gradient. Two calls are each ~4 ms and ten are free, and the two
+expensive ones are the first call made inside their own subsystem's tick. That
+points at something warm-vs-cold rather than at the arithmetic of any one query:
+a memo or brick cache that the first caller in a tick misses and later callers
+in the same tick hit, invalidated somewhere between the two subsystems. The
+`WaterFillCaMs` / `WaterFillImplicitMs` split is the next thing to read, and if
+both look flat the instrument has to move to per-call-site.
 
 **Disabling the ripple feature takes the game thread from 21.60 to 17.00 ms.**
 That prices the auto-watcher at 4.6 ms and is **not a proposal** — it removes a

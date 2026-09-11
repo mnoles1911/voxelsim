@@ -78,10 +78,18 @@ for, so sub-scopes went inside the function in the same build:
 fast-out count. Whichever half holds the time, the next capture names it — which
 means a null on the fast path is still a result.
 
-The leading candidates, unranked because the measurement is cheap and in flight:
-the amplifier's thread-local column memo being warm for one caller and cold for
-the other, or the implicit-field read inside `GetWaterFillAtWorld` depending on
-the Z the caller passes.
+**Answered in part the same afternoon.** It is not a gradient across callers.
+Of twelve calls a frame, exactly **two** carry the cost — the ocean's camera call
+at ~4.13 ms and the ripple watcher's pawn call at ~3.96 ms — and the other ten
+cost about 0.008 ms *between them*. Both expensive ones are the first call made
+inside their own subsystem's tick. That points at a memo or brick cache the
+first caller in a tick misses and later callers hit, invalidated somewhere
+between the two subsystems, rather than at the arithmetic of any single query.
+
+It is also not the worldgen ground sample: `UnderwaterSurfaceMs` is 0.013 ms
+across all twelve calls. The whole of it is inside `GetWaterFillAtWorld`, which
+now carries its own `WaterFillCaMs` / `WaterFillImplicitMs` split. See
+`docs/measurements/underwater-fastpath-null-2026-09-11/`.
 
 ## Why this matters now
 
