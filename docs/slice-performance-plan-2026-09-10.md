@@ -59,6 +59,15 @@ Read together, facts 1 to 4 say the whole thing in one line each:
 256 m ring the binding constraint is the same 21–23 ms game thread, of which 8.3 ms is water
 simulation on dry land.
 
+**Confirmed on a route with pictures, 2026-09-11, and it settles the ordering.** A third
+independent pair — route 16 against route 17, same binary, 8 of 8 waypoints each, arrival positions
+1 to 19 cm apart — reads GPU 34.77 → 20.02 ms and frame 35.33 → 28.92, while the game thread does
+not move at all: 28.890 → 28.884. **With size culling on the frame is game-thread bound**, 28.88 ms
+of game thread against 20.02 ms of GPU. So the phase order below is now settled by measurement
+rather than by argument: the GPU lever is finished, and everything after it has to come off the
+game thread. Full record in `docs/measurements/size-cull-route-ab-2026-09-11/`; the pictures are
+published for the owner's verdict.
+
 *Provenance, because the three rows are not one sitting.* The 48 m row is walk-capture-21
 (2026-09-10 04:02 UTC, manifest predates module hashing); the 256 m rows are walk-capture-27
 (2026-09-10 13:58) and walk-capture-43 (2026-09-11 14:09), which are different binaries again. The
