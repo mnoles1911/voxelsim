@@ -36,10 +36,68 @@ data rather than Nanite data. Both are fixed, the identity string carries
 `nanite=%d`, and the bake now refuses to hand back a mesh without Nanite data
 when `-VoxelDetailNanite` was asked for.
 
-**Masked materials are not the disqualifier.** `GNaniteAllowMaskedMaterials`
-is 1 by default and this project sets no override. The reason proxies were not
-created is still open; a read of the engine's `ShouldCreateNaniteProxy` path is
-in flight and will be recorded here when it lands.
+### The cause, and it means this arm never measured Nanite
+
+**The plant material does not carry the `bUsedWithNanite` usage flag, so the
+engine's material audit fails and the component silently falls back to the
+traditional proxy.**
+
+The capture's own log says it, 253 times, once per baked material instance:
+
+    LogMaterial: Warning: Material /Game/Voxel/Generated/DetailPreview/
+    temperate-authored-lods-full-14/M_aa14d626... missing usage flag Nanite!
+    Default Material will be used in game.
+
+Zero such lines in the control arm, which is what you would expect — the
+control never asks for Nanite.
+
+The mechanism is a single engine function, `ShouldCreateNaniteProxy`
+(`NaniteResourcesHelper.h:155-194`), which has exactly six ways to return
+false. Five are ruled out here: the blend mode is masked and masked is allowed,
+the shading model is default-lit, it is not a sky material, `bDisallowNanite`
+is never set anywhere in this project, and the mesh demonstrably has valid
+Nanite data. The sixth is the material audit, and the audit fails on
+`MATUSAGE_Nanite` alone.
+
+Why it fails rather than fixing itself: in the editor, Unreal auto-sets a
+missing usage flag and recompiles. Under `-game` — which is how every capture
+in this archive runs — it takes the other branch, warns, and uses the default
+material (`Material.cpp:1889-1945`). `create_detail_asset_material.py:64` sets
+`used_with_instanced_static_meshes` and nothing else, and the baked material
+instances inherit their parent's usage flags wholesale, so none of the 253
+carry the bit.
+
+Everything the audit *records* but does not reject on: per-instance custom
+data, per-instance random, world position offset (the wind), vertex
+interpolators, customized UVs, pixel depth offset, tessellation. None of them
+were ever the problem.
+
+**So the +0.73 ms is not a verdict on Nanite.** It is the cost of registering
+Nanite resources and streaming 5.97 MB of pages while still drawing every plant
+through the old path. The comparison has not been run.
+
+### What running it properly costs
+
+One line in `create_detail_asset_material.py`, then a re-author and re-save of
+`M_VoxelDetailAsset`. The material asset is part of the detail cache identity,
+so that forces a **full re-bake** before any capture can use the cache, plus a
+cold shader-permutation compile on the first run.
+
+One structural limit is worth knowing before spending that. There are two mesh
+producers here. The baked/cached path (`bFastBuild=false`) goes through the
+normal derived-data build and honours `NaniteSettings` — that is why the bake
+guard passed. The runtime path (`CreateDetailStaticMesh`, `bFastBuild=true`)
+never allocates Nanite resources at all, and in a non-editor build
+`StaticMesh.cpp:8924` hard-asserts that fast build is the only option. **Any
+plant that comes from a cache miss or the geometry fallback can never be
+Nanite**, so a fully-Nanite understory needs 100% cache coverage; anything less
+is a permanently mixed population with the traditional proxy still drawing half
+of it.
+
+Against that, size culling is already measured at −21 ms, needs no re-bake and
+no shader compile, and is one flag. Nanite's case rests on the velocity pass
+disappearing structurally rather than getting cheaper, which is worth up to
+14.9 ms — real, but behind a re-bake and not yet demonstrated.
 
 **On destructibility, which is the question that was asked first:** the
 understory has no destruction path. Ground cover is not voxel-destructible. It
