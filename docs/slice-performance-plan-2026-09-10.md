@@ -239,14 +239,24 @@ Three items now, in value order, all paid every frame, none of them necessary wo
   exists as the place to put it and currently tests only `bArmed_` and the enable cvar. What the gate
   may NOT do is be wrong at a shoreline, so the predicate has to be conservative and the falsifier is
   a shore capture where ripples must still appear.
-- **Collision prepare, 3.83 ms.** Three quarters of the pawn tick. It prepares a voxel query region
-  per movement sweep. Worth checking whether consecutive sweeps in one frame re-prepare overlapping
-  regions, which is the same shape as the resolve duplication the R0 profile found last week.
-- **Roof probe, 2.84 ms.** Effectively the entire clipmap tick. It runs every frame regardless of
-  whether the camera moved enough to change the answer.
+- **Collision prepare, 3.79 ms. Diagnosed 2026-09-11, and the guess above was wrong.** Consecutive
+  sweeps do *not* re-prepare overlapping regions: the capture measures 1.00 preparations against
+  10.67 sweep calls, so the batch's 32-voxel containment cache already saves ten of eleven sweeps.
+  The cost is ONE prepare, and one prepare is 3.79 ms. The cache is defeated across frames by
+  construction — `BeginMovementCollisionQueries` builds a fresh batch at the top of every movement
+  tick and `EndMovementCollisionQueries` resets it at the bottom, and the header says so: *"Never
+  retained across ticks."* Edited voxels are not the obstacle to retaining it, because `materialAt`
+  consults `editedBricks()` live ahead of the shortlist. The only correctness question is when the
+  *asset* field can change under a retained batch.
+- **Roof probe, 2.83 ms.** Effectively the entire clipmap tick — 2.836 of 2.836 ms. Up to 128 column
+  samples to produce one boolean. Its caller already treats the answer as sticky (two solid samples
+  latch the veil on, zero latch it off, one holds the previous state); what is missing is any gate
+  on *asking*.
 
-Neither has been profiled below its own scope, so both numbers are what to attack, not yet a
-diagnosis of why.
+Both are now diagnosed, not just measured. Full write-up in
+`docs/measurements/gamethread-query-recompute-2026-09-11/`, which reads all four game-thread items
+together: **69% of the quiet game thread is expensive queries rebuilt every frame for answers that
+barely change**, and none of the four is a visual trade.
 
 **Gate:** each under 1 ms at median, with placement, collision behaviour and the clipmap image
 unchanged.
