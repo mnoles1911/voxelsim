@@ -7461,6 +7461,35 @@ struct FVoxelWorldImpl
 	vxc::World<VoxelCoords::BrickEdgeVoxels> Voxels;
 	TUniquePtr<vxc::WorldQueryBatch<VoxelCoords::BrickEdgeVoxels>> MovementCollisionQueries;
 
+	// THE SAME SHORTLIST, FOR EVERYONE ELSE IN THE FRAME.
+	//
+	// MovementCollisionQueries above exists only between Begin/End inside the
+	// movement tick, and IsSolidAtVoxel below takes the "exact standalone path"
+	// without it -- one full per-point asset resolve per call. Measured
+	// 2026-09-11 at the temperate forest site, that difference is most of the
+	// game thread:
+	//
+	//   CollisionPrepareMs      3.79 ms   the shortlist, built once per frame
+	//   OceanUnderwaterMs       4.12 ms   ONE standalone call, no shortlist
+	//   RippleAutoWatchMs       4.01 ms   ONE standalone call, no shortlist
+	//                          -------
+	//                          11.92 ms   of a 21.6 ms game thread
+	//
+	// while the twelve calls the movement component makes inside its own scope
+	// cost 0.021 ms BETWEEN THEM. Same function, same frame, same column: the
+	// only difference is whether a shortlist was prepared.
+	//
+	// This one is keyed by frame counter instead of by a Begin/End pair, so it
+	// cannot outlive a frame and carries exactly the staleness guarantee the
+	// movement scope already had -- edits stay live either way, because
+	// WorldQuery::materialAt consults the edited-brick overlay BEFORE it reaches
+	// the asset entries (voxel-core/include/voxelcore/worldquery.h:69-80). What
+	// the shortlist caches is which asset instances overlap the rect, and a
+	// felled tree reads as air from the overlay whatever the shortlist
+	// remembers.
+	TUniquePtr<vxc::WorldQueryBatch<VoxelCoords::BrickEdgeVoxels>> FrameQueries;
+	uint64 FrameQueriesFrame = 0;
+
 	// THE COARSE-TIER AMPLIFIER, for ring levels at or above
 	// VoxelTier::kFirstCoarseLevel.
 	//
@@ -35247,6 +35276,16 @@ double UVoxelWorldSubsystem::SampleTerrainHeightUU(double WorldXUU, double World
 	return FMath::Lerp(Hx0, Hx1, Fy);
 }
 
+// THE FRAME-SCOPED ASSET SHORTLIST. Default ON; 0 is the control arm and
+// restores the exact previous behaviour, where only the movement tick's
+// Begin/End pair got a shortlist and every other caller paid a full per-point
+// asset resolve. See FrameQueries' declaration for the measurement.
+static TAutoConsoleVariable<bool> CVarVoxelFrameAssetShortlist(
+	TEXT("voxel.Collision.FrameAssetShortlist"), true,
+	TEXT("Share one prepared asset shortlist across the whole frame instead of only inside the ")
+	TEXT("movement tick. 0 restores the previous per-call standalone path and is the control arm."),
+	ECVF_Default);
+
 bool UVoxelWorldSubsystem::IsSolidAtVoxel(int64 Vx, int64 Vy, int64 Vz) const
 {
 	if (!Impl)
@@ -35260,9 +35299,28 @@ bool UVoxelWorldSubsystem::IsSolidAtVoxel(int64 Vx, int64 Vy, int64 Vz) const
     // asset shortlist. Worker queries and calls outside that scope keep the
     // exact standalone path; overlay reads remain live in either case.
     const auto Material = [&]() {
-        if (!IsInGameThread() || !Impl->MovementCollisionQueries)
+        if (!IsInGameThread())
             return Impl->Voxels.materialAt(Vx,Vy,Vz);
-        auto& Queries=*Impl->MovementCollisionQueries;
+        auto* Batch = Impl->MovementCollisionQueries.Get();
+        if (Batch == nullptr && CVarVoxelFrameAssetShortlist.GetValueOnGameThread())
+        {
+            // See FrameQueries' declaration. Outside the movement scope this is
+            // the difference between one shortlist a frame and one full asset
+            // resolve per call, and the two callers that pay it -- the ocean's
+            // underwater test and the ripple field's watcher -- are 8.1 ms of a
+            // 21.6 ms game thread between them.
+            if (!Impl->FrameQueries || Impl->FrameQueriesFrame != GFrameCounter)
+            {
+                Impl->FrameQueries =
+                    MakeUnique<vxc::WorldQueryBatch<VoxelCoords::BrickEdgeVoxels>>(Impl->Voxels);
+                Impl->FrameQueriesFrame = GFrameCounter;
+            }
+            Batch = Impl->FrameQueries.Get();
+            CSV_CUSTOM_STAT(VoxelStream, FrameShortlistPointCalls, 1, ECsvCustomStatOp::Accumulate);
+        }
+        if (Batch == nullptr)
+            return Impl->Voxels.materialAt(Vx,Vy,Vz);
+        auto& Queries=*Batch;
         const auto Before=Queries.preparationCount();
         const double Start=FPlatformTime::Seconds();
         const auto& Query=Queries.prepare({Vx,Vy,Vx,Vy});
