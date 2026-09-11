@@ -16,6 +16,44 @@ param([Parameter(Mandatory=$true)][string]$AssetDirectory,[Parameter(Mandatory=$
     [ValidateRange(10,100)][int]$ScreenPercentage=0)
 $ErrorActionPreference='Stop'
 if(Get-Process UnrealEditor,UnrealEditor-Cmd,cl,link,MSBuild,UnrealBuildTool,dotnet -ErrorAction SilentlyContinue){throw 'UE or a build process is already running'}
+# FOREIGN GPU LOAD. Added 2026-09-11 after a capture was launched while a game
+# was running on the same GPU. The process guards below catch UE and build
+# tools; they cannot see an unrelated 3D application, and a GPU timing capture
+# taken next to one measures contention, not the renderer. The signature is
+# recognisable after the fact -- the run sat at 62 CPU seconds for 25 minutes --
+# but nothing refused it at the start, which is the half that matters.
+#
+# Returns $null if the counter is unavailable (then we warn rather than refuse,
+# because failing closed on a missing instrument would block every capture on a
+# machine that simply does not expose it).
+function Get-ForeignGpuLoad {
+    param([int[]]$OwnPids = @())
+    try { $samples = (Get-Counter '\GPU Engine(*)\Utilization Percentage' -ErrorAction Stop).CounterSamples }
+    catch { return $null }
+    $byProc = @{}
+    foreach ($c in $samples) {
+        if ($c.CookedValue -le 1) { continue }
+        if ($c.InstanceName -match 'pid_(\d+)') {
+            $procId = [int]$Matches[1]
+            if ($OwnPids -contains $procId) { continue }
+            $byProc[$procId] = $byProc[$procId] + $c.CookedValue
+        }
+    }
+    $busy = @()
+    foreach ($k in $byProc.Keys) {
+        if ($byProc[$k] -ge 10) {
+            $p = Get-Process -Id $k -ErrorAction SilentlyContinue
+            $busy += [pscustomobject]@{ ProcessId = $k; Name = $(if ($p) { $p.ProcessName } else { '(exited)' }); Percent = [math]::Round($byProc[$k], 1) }
+        }
+    }
+    return , $busy
+}
+$foreignGpu = Get-ForeignGpuLoad
+if ($null -eq $foreignGpu) { Write-Output 'WARNING: GPU utilisation counter unavailable; foreign GPU load was NOT checked' }
+elseif ($foreignGpu.Count) {
+    throw ('Another process is using the GPU (' + (($foreignGpu | ForEach-Object { "$($_.Name) $($_.Percent)%" }) -join ', ') + '); a timing capture taken beside it measures contention, not this renderer')
+}
+
 $outPath=[IO.Path]::GetFullPath($Output)
 if(Test-Path -LiteralPath $outPath){throw 'Use a fresh output directory'}
 $assetPath=[IO.Path]::GetFullPath($AssetDirectory)
