@@ -1854,9 +1854,60 @@ void UVoxelDetailAssetSubsystem::Tick(float DeltaTime)
 			Hism->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 			Hism->SetCanEverAffectNavigation(false);
 			Hism->SetCastShadow(Impl->bCastShadow);
+			// THE VELOCITY PASS, PER COMPONENT RATHER THAN PER RENDERER.
+			//
+			// These components are positioned once and never moved, so the
+			// velocity pass would reject them every frame on the
+			// local-to-world-equals-previous test. The only reason they are in
+			// it is the wind: bHasWorldPositionOffsetVelocity is set when the
+			// component supports WPO velocity, vertex deformation outputs
+			// velocity, and any material has world position offset. Clearing
+			// the first of those three drops the whole second geometry
+			// submission for the ground cover and nothing else.
+			//
+			// r.Velocity.EnableVertexDeformation 0 measured -5.19 ms of GPU at
+			// the unculled 256 m ring and about -4.4 ms stacked on size
+			// culling, but it does that for the WHOLE renderer. This is the
+			// same effect scoped to these components.
+			//
+			// IT IS A VISUAL TRADE AND THE DEFAULT IS THE OWNER'S. Without
+			// motion vectors, wind-blown foliage smears under temporal
+			// upscaling, and a still frame cannot show that -- judging it needs
+			// a moving capture. Opt-in until it has one.
+			//
+			// NOT in the cache identity settings string, deliberately: it
+			// changes the component, not the mesh, so both arms share one bake.
+			static const bool bNoWpoVelocity =
+				FParse::Param(FCommandLine::Get(), TEXT("VoxelDetailNoWpoVelocity"));
+			if (bNoWpoVelocity)
+			{
+				Hism->bWorldPositionOffsetWritesVelocity = false;
+			}
             // Presentation distance stays inside the configured residency
             // ring. Start/end values alone do not establish material fading.
-            const bool SizeCull=FParse::Param(FCommandLine::Get(),TEXT("VoxelDetailSizeCull"));
+            //
+            // DEFAULT ON SINCE 2026-09-11, ON THE OWNER'S VERDICT. The pictures
+            // were shot as two walks of the same authored route stopping at the
+            // same eight stands, arrival positions 1-19 cm apart, and the owner
+            // read them as "pretty much identical, no visual issues at all".
+            // The cost side, third independent pair and the first on a route:
+            // GPU 34.77 -> 20.02 ms, the ground cover's two passes 23.26 ->
+            // 8.63, the marcher and the game thread unmoved. It is by a wide
+            // margin the largest lever measured in this work, and it had been
+            // sitting behind an opt-in flag.
+            //
+            // -VoxelNoDetailSizeCull is the off switch and restores the
+            // previous behaviour exactly; it is the control arm for any future
+            // A/B and the Settings row this becomes (voxelsim settings panel
+            // policy: every visual-trade toggle is a row, owner verdicts set
+            // defaults).
+            //
+            // WHAT THE VERDICT DOES NOT COVER, because still frames cannot show
+            // it: popping, when an instance crosses its draw distance while the
+            // player walks. Not captured, and out of scope by the owner's own
+            // instruction. If popping is ever reported, this default is the
+            // first thing to question.
+            const bool SizeCull=!FParse::Param(FCommandLine::Get(),TEXT("VoxelNoDetailSizeCull"));
             // Every current detail transform has the same unit scale; keep the
             // source of that contract shared instead of assuming mesh units.
             const FVector Scale=DetailInstanceTransform(FDetailInstanceRec{},FVector3d::ZeroVector).GetScale3D();

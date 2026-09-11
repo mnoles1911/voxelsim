@@ -3,7 +3,7 @@ param(
     [Parameter(Mandatory=$true)][string]$RouteFile,
     [Parameter(Mandatory=$true)][string]$Output,
     [ValidateRange(60,7200)][int]$TimeoutSeconds=3900,
-    [switch]$ProfileFrames,[switch]$DiagnoseStalls,[switch]$DetailMeshLOD,[switch]$DetailSizeCull,[switch]$DetailRetireUnused,[string]$DetailMeshCache='',
+    [switch]$ProfileFrames,[switch]$DiagnoseStalls,[switch]$DetailMeshLOD,[switch]$DetailSizeCull,[switch]$NoDetailSizeCull,[switch]$DetailRetireUnused,[string]$DetailMeshCache='',
     [switch]$AllowPreviewDetailCache,[ValidateRange(16,512)][double]$DetailRingMeters=48
 )
 $ErrorActionPreference='Stop'
@@ -85,7 +85,10 @@ $runArgs=@('D:\voxelsim\ue-project\VoxelEarth.uproject','/Engine/Maps/Entry','-g
 if($ProfileFrames){$runArgs+='-VoxelEcologyRouteProfile'}
 if($DiagnoseStalls){$runArgs+='-VoxelEcologyRouteDiagnoseStalls'}
 if($DetailMeshLOD){$runArgs+='-VoxelDetailMeshLOD'}
-if($DetailSizeCull){$runArgs+='-VoxelDetailSizeCull'}
+# Size culling is DEFAULT ON since 2026-09-11 (owner's verdict on the route 16/17
+# pictures). -DetailSizeCull is now a no-op kept so older call sites still parse;
+# -NoDetailSizeCull is the control arm.
+if($NoDetailSizeCull){$runArgs+='-VoxelNoDetailSizeCull'}
 if($DetailRetireUnused){$runArgs+='-VoxelDetailRetireUnused'}
 if($cachePath){$runArgs+="-VoxelDetailMeshCache=$cachePath"}
 if($AllowPreviewDetailCache){$runArgs+='-VoxelDetailMeshCachePreview'}
@@ -124,7 +127,7 @@ while(-not $proc.WaitForExit(1000)){
 }
 if($proc.ExitCode -ne 0){throw "Route process exited $($proc.ExitCode)"}
 $log=Get-Content -LiteralPath "$outPath/unreal.log" -Raw
-if($DetailSizeCull -and $log -notmatch 'DetailSizeCull key=') {throw 'Requested size culling was not exercised'}
+if(-not $NoDetailSizeCull -and $log -notmatch 'DetailSizeCull key=') {throw 'Size culling is on by default but was not exercised'}
 if($log -notmatch 'VoxelRoute COMPLETE PASS' -or $log -match 'FINE TIER GATE LEAK|Fatal error:|Assertion failed:|Terrain appearance upload refused:'){throw 'Route completion/stability check failed'}
 if($ProfileFrames){
     $frames=Join-Path $outPath 'results/route-frames.csv'

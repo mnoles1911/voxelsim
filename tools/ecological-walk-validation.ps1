@@ -1,6 +1,6 @@
 param([Parameter(Mandatory=$true)][string]$AssetDirectory,[Parameter(Mandatory=$true)][string]$Output,
     [string]$SpawnAt='-156260,-82356',[ValidateRange(60,7200)][int]$TimeoutSeconds=900,
-    [switch]$DetailMeshLOD,[switch]$DetailSizeCull,[switch]$DetailRetireUnused,[string]$DetailMeshCache='',
+    [switch]$DetailMeshLOD,[switch]$DetailSizeCull,[switch]$NoDetailSizeCull,[switch]$DetailRetireUnused,[string]$DetailMeshCache='',
     [switch]$PredictiveAssetResolve,[switch]$NoPredictiveAssetResolve,[switch]$MarchDispatchIdentity,
     [switch]$AllowPreviewDetailCache,[ValidateRange(16,512)][double]$DetailRingMeters=48,
     [string[]]$ExtraArgs=@(),
@@ -83,7 +83,10 @@ $runArgs=@('D:\voxelsim\ue-project\VoxelEarth.uproject','/Engine/Maps/Entry','-g
     '-VoxelWalkTest=1','-VoxelWalkWaitForEcology',"-VoxelDetailRingMeters=$($DetailRingMeters.ToString([Globalization.CultureInfo]::InvariantCulture))","-VoxelSpawnAt=$SpawnAt",'-VoxelSpawnAltM=5',
     '-VoxelTimeOfDay=10:00','-VoxelDate=2026-05-15','-VoxelTimeScale=0',"-UserDir=$outPath/session","-abslog=$outPath/game.log")
 if($DetailMeshLOD){$runArgs+='-VoxelDetailMeshLOD'}
-if($DetailSizeCull){$runArgs+='-VoxelDetailSizeCull'}
+# Size culling is DEFAULT ON since 2026-09-11 (owner's verdict on the route 16/17
+# pictures). -DetailSizeCull is now a no-op kept so older call sites still parse;
+# -NoDetailSizeCull is the control arm.
+if($NoDetailSizeCull){$runArgs+='-VoxelNoDetailSizeCull'}
 if($DetailRetireUnused){$runArgs+='-VoxelDetailRetireUnused'}
 if($PredictiveAssetResolve){$runArgs+='-VoxelPredictiveAssetResolve'}
 if($NoPredictiveAssetResolve){$runArgs+='-VoxelNoPredictiveAssetResolve'}
@@ -158,7 +161,7 @@ while(-not $proc.WaitForExit(1000)){
     }
 }
 $log=Get-Content -LiteralPath "$outPath/game.log" -Raw
-if($DetailSizeCull -and $log -notmatch 'DetailSizeCull key=') {throw 'Requested size culling was not exercised'}
+if(-not $NoDetailSizeCull -and $log -notmatch 'DetailSizeCull key=') {throw 'Size culling is on by default but was not exercised'}
 $csvMatches=[regex]::Matches($log,'Writing CSV to file : (.+\.csv)')
 if($csvMatches.Count -eq 1){Copy-Item -LiteralPath $csvMatches[0].Groups[1].Value.Trim() -Destination "$outPath/frames.csv"}
 if($proc.ExitCode -ne 0){throw "Walking test exited $($proc.ExitCode)"}
