@@ -35301,14 +35301,25 @@ bool UVoxelWorldSubsystem::IsSolidAtVoxel(int64 Vx, int64 Vy, int64 Vz) const
     const auto Material = [&]() {
         if (!IsInGameThread())
             return Impl->Voxels.materialAt(Vx,Vy,Vz);
+        // ONE BATCH FOR THE WHOLE FRAME, INCLUDING THE MOVEMENT TICK.
+        //
+        // The first cut kept the movement tick on its own Begin/End batch and
+        // gave only the outside callers a shared one. That measured -5.16 ms of
+        // game thread -- the ripple watcher went 3.976 -> 0.019 ms -- but it left
+        // TWO shortlists being prepared per frame instead of one, and the
+        // counters said so plainly: CollisionPreparations 1 -> 2 and
+        // CollisionPrepareMs 3.742 -> 7.091. The ocean's call stopped being a
+        // standalone resolve and became the second prepare, which costs about
+        // the same, so its 4.226 ms only fell to 3.306.
+        //
+        // Two batch OBJECTS cannot share a prepare however close their rects
+        // are, so the movement tick has to come onto the same one. Its own
+        // scope is a strict subset of the frame, and the containment check in
+        // WorldQueryBatch::prepare handles the rest: whoever asks for the widest
+        // rect pays once and everyone inside it is free.
         auto* Batch = Impl->MovementCollisionQueries.Get();
-        if (Batch == nullptr && CVarVoxelFrameAssetShortlist.GetValueOnGameThread())
+        if (CVarVoxelFrameAssetShortlist.GetValueOnGameThread())
         {
-            // See FrameQueries' declaration. Outside the movement scope this is
-            // the difference between one shortlist a frame and one full asset
-            // resolve per call, and the two callers that pay it -- the ocean's
-            // underwater test and the ripple field's watcher -- are 8.1 ms of a
-            // 21.6 ms game thread between them.
             if (!Impl->FrameQueries || Impl->FrameQueriesFrame != GFrameCounter)
             {
                 Impl->FrameQueries =
@@ -35438,7 +35449,24 @@ bool UVoxelWorldSubsystem::FindFirstSolidVoxelSlice(const int64 (&Min)[3], const
     for (int32 I=0; I<3; ++I) if (Min[I] > Max[I]) return false;
     const double PrepareStart=FPlatformTime::Seconds();
     vxc::WorldQueryBatch<VoxelCoords::BrickEdgeVoxels> LocalQueries(Impl->Voxels);
-    auto& Queries=Impl->MovementCollisionQueries ? *Impl->MovementCollisionQueries : LocalQueries;
+    // The frame batch, for the same reason as IsSolidAtVoxel above: two batch
+    // OBJECTS cannot share a prepare however close their rects are. This is the
+    // caller that asks for the WIDEST rect -- a whole sweep slab rather than a
+    // point -- so putting it on the shared batch is what makes everyone else's
+    // query fall inside an already-covered region.
+    if (IsInGameThread() && CVarVoxelFrameAssetShortlist.GetValueOnGameThread())
+    {
+        if (!Impl->FrameQueries || Impl->FrameQueriesFrame != GFrameCounter)
+        {
+            Impl->FrameQueries =
+                MakeUnique<vxc::WorldQueryBatch<VoxelCoords::BrickEdgeVoxels>>(Impl->Voxels);
+            Impl->FrameQueriesFrame = GFrameCounter;
+        }
+    }
+    auto& Queries =
+        (IsInGameThread() && CVarVoxelFrameAssetShortlist.GetValueOnGameThread() && Impl->FrameQueries)
+            ? *Impl->FrameQueries
+            : (Impl->MovementCollisionQueries ? *Impl->MovementCollisionQueries : LocalQueries);
     const auto PreviousPreparations=Queries.preparationCount();
     const auto& Query=Queries.prepare({Min[0],Min[1],Max[0],Max[1]});
     CSV_CUSTOM_STAT(VoxelStream, CollisionPrepareMs, (FPlatformTime::Seconds()-PrepareStart)*1000., ECsvCustomStatOp::Accumulate);

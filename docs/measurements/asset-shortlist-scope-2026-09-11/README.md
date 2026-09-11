@@ -72,6 +72,48 @@ and is the control arm.
 thread does not move, the shortlist is not reaching the callers that pay, and
 `FrameShortlistPointCalls` will say so.
 
+## The result: −5.16 ms, and the counters say where the rest went
+
+Walk 50 against walk 51, one binary, a cvar apart, both receipts passed.
+
+| scope (median ms) | shortlist OFF | shortlist ON | change |
+|---|---|---|---|
+| **GameThreadTime** | **21.497** | **16.334** | **−5.163** |
+| UnderwaterQuery | 8.232 | 3.330 | −4.902 |
+| └ WaterFillImplicit | 8.214 | 3.312 | −4.903 |
+| **RippleAutoWatch** | **3.976** | **0.019** | **−3.957** |
+| OceanUnderwater | 4.226 | 3.306 | −0.920 |
+| CollisionPrepare | 3.742 | **7.091** | **+3.349** |
+| CollisionPreparations | **1** | **2** | **+1** |
+| FrameShortlistPointCalls | — | 2 | |
+| GPUTime | 40.452 | 40.410 | −0.042 |
+| PawnTick | 4.316 | 4.361 | +0.045 |
+
+**A quarter of the game thread, and the prediction held in direction if not in
+size.** Nothing on the GPU or the render thread moved, which is what a pure
+game-thread change should look like.
+
+**The ripple watcher went to nothing** — 3.976 to 0.019 ms. It now finds a
+shortlist already prepared and its call is free.
+
+**The ocean only fell by 0.92 ms**, and the reason is in the two counters at the
+bottom: `CollisionPreparations` went from 1 per frame to **2**, and
+`CollisionPrepareMs` from 3.742 to 7.091. The ocean's call stopped being a
+standalone resolve and became *the second prepare*, which costs about the same
+thing. The first cut left the movement tick on its own `Begin`/`End` batch, and
+**two batch objects cannot share a prepare however close their rectangles are.**
+
+## The second cut: put the movement tick on the same batch
+
+`FindFirstSolidVoxelSlice` is the caller that asks for the **widest** rectangle —
+a whole sweep slab rather than a point — so moving it onto the shared batch is
+what makes every other query of the frame fall inside an already-covered region.
+With one batch object the containment check does the rest: whoever asks widest
+pays once, everyone inside is free.
+
+Expected: one preparation per frame instead of two, and the ocean's remaining
+3.3 ms collapsing with it. Arms 52 and 53 are the same A/B on the same cvar.
+
 ## Why this is the right target now
 
 Size culling took the GPU from 34.8 to 20.0 ms and left the game thread
