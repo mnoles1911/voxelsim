@@ -8479,6 +8479,14 @@ uint8 UVoxelWaterSubsystem::GetImplicitFillAtWorld(const FVector& WorldUU) const
 	                                 int64(FMath::FloorToDouble(WorldUU.Z / VoxelCoords::VoxelSizeUU)));
 }
 
+// Diagnostic only, and it doubles the cost of the query it measures. See the
+// block at its use site below for the question it settles.
+static TAutoConsoleVariable<bool> CVarVoxelWaterFillMemoProbe(
+	TEXT("voxel.Water.FillMemoProbe"), false,
+	TEXT("Repeat each implicit water-fill query once and time the repeat separately, to tell a ")
+	TEXT("cold amplifier column memo from an expensive query. Diagnostic; doubles the cost."),
+	ECVF_Default);
+
 uint8 UVoxelWaterSubsystem::GetWaterFillAtWorld(const FVector& WorldUU) const
 {
 	if (!Impl)
@@ -8508,8 +8516,44 @@ uint8 UVoxelWaterSubsystem::GetWaterFillAtWorld(const FVector& WorldUU) const
 	{
 		return CaFill;
 	}
-	CSV_SCOPED_TIMING_STAT(VoxelStream, WaterFillImplicitMs);
-	return Impl->Mob.implicitFillAt(Vx, Vy, Vz);
+	uint8 Fill;
+	{
+		CSV_SCOPED_TIMING_STAT(VoxelStream, WaterFillImplicitMs);
+		Fill = Impl->Mob.implicitFillAt(Vx, Vy, Vz);
+	}
+
+	// THE MEMO PROBE. Off by default; it doubles the cost of the query it
+	// measures, which is the point.
+	//
+	// THE QUESTION IT ANSWERS. Of twelve IsUnderwaterAtWorld calls a frame,
+	// exactly two cost anything: the ocean's camera call at ~4.13 ms and the
+	// ripple watcher's pawn call at ~3.96 ms. The other ten cost about 0.008 ms
+	// BETWEEN THEM. The two dear ones are each the FIRST call made inside their
+	// own subsystem's tick, which is the signature of a cache that the first
+	// caller misses and later callers in the same tick hit.
+	//
+	// The chain under this line ends at a world material query --
+	// implicitFillAt -> sourceFillAt -> terrain_(vx,vy,vz) (waterca.cpp:1991) --
+	// and the amplifier keeps a THREAD-LOCAL COLUMN MEMO. Between the ocean's
+	// tick and the ripple field's, the streaming tick asks for thousands of
+	// other columns, which would evict a single-entry memo and make each
+	// subsystem pay a cold amplification for the same column.
+	//
+	// So: repeat the identical call immediately and time it separately. A
+	// near-zero repeat proves the memo works and the problem is EVICTION
+	// BETWEEN TICKS, which a small per-frame cache fixes. A repeat that costs
+	// the same as the first proves there is no memo to warm and the cost is the
+	// query itself, which is a different and much larger piece of work. One
+	// capture, and the two outcomes are not close together.
+	if (CVarVoxelWaterFillMemoProbe.GetValueOnGameThread())
+	{
+		CSV_SCOPED_TIMING_STAT(VoxelStream, WaterFillImplicitRepeatMs);
+		const uint8 Again = Impl->Mob.implicitFillAt(Vx, Vy, Vz);
+		// Read the result so no compiler can delete the call being measured.
+		CSV_CUSTOM_STAT(VoxelStream, WaterFillRepeatAgreed, Again == Fill ? 1 : 0,
+		                ECsvCustomStatOp::Accumulate);
+	}
+	return Fill;
 }
 
 double UVoxelWaterSubsystem::SeaLevelZUU()
