@@ -1,4 +1,5 @@
 #include "VoxelBoat.h"
+#include "VoxelFrameProfiling.h"
 #include "VoxelGameplayActors.h"
 #include "VoxelPlayerRecords.h"
 #include "VoxelEarthPlayerController.h"
@@ -625,6 +626,7 @@ void AVoxelBoat::AdoptHullFromBody()
 
 void AVoxelBoat::Tick(float DeltaSeconds)
 {
+	CSV_SCOPED_TIMING_STAT(VoxelStream, BoatTickMs);
 	VoxelGameplayActors::FinishRestore(this);
 	if(!HasAuthority() || !VoxelSessionCheckpoint::Ready(GetWorld())) return;
 	Super::Tick(DeltaSeconds);

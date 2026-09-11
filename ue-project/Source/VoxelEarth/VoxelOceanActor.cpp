@@ -1,4 +1,5 @@
 #include "VoxelOceanActor.h"
+#include "VoxelFrameProfiling.h"
 
 #include "VoxelClipmapActor.h" // NumLevels, for the plane-extent static_assert
 
@@ -286,6 +287,7 @@ void AVoxelOceanActor::BeginPlay()
 
 void AVoxelOceanActor::Tick(float DeltaTime)
 {
+	CSV_SCOPED_TIMING_STAT(VoxelStream, OceanTickMs);
 	Super::Tick(DeltaTime);
 
 	// menu tick gate 2026-09-07 (docs/backlog.md §0.0o-adjacent): BuildOceanGrid

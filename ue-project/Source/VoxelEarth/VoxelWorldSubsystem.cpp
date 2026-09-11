@@ -1,4 +1,5 @@
 #include "VoxelWorldSubsystem.h"
+#include "VoxelFrameProfiling.h"
 #include "voxelcore/foundationquery.h"
 #include "VoxelAppearanceBankBinding.h"
 #include "VoxelEcologicalPlacement.h"
@@ -34291,6 +34292,7 @@ bool UVoxelWorldSubsystem::IsFineRingSettled(int32& OutSettledTiles, int32& OutR
 
 void UVoxelWorldSubsystem::Tick(float DeltaTime)
 {
+    CSV_SCOPED_TIMING_STAT(VoxelStream, WorldSubsystemTickMs);
     if(Impl&&Impl->VisualBoundary)return;
 	if (!Impl || !ChunkOwner || !ChunkRoot)
 	{

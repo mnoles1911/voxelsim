@@ -1,4 +1,5 @@
 #include "VoxelEcologicalRoute.h"
+#include "VoxelFrameProfiling.h"
 #include "VoxelEarthFlyPawn.h"
 #include "VoxelCharacterMovement.h"
 #include "VoxelWorldSubsystem.h"
@@ -223,6 +224,7 @@ bool FVoxelEcologicalRoute::ExportFoundation(UWorld* W){
     return Known&&Saved&&PinsMatch();
 }
 void FVoxelEcologicalRoute::Tick(UWorld* W,float Dt){
+    CSV_SCOPED_TIMING_STAT(VoxelStream, EcoRouteTickMs);
     if(Stage==EStage::Done)return;
     if(Stage==EStage::Flushing){
         // Continue ticking until asynchronous file writing completes. A hung

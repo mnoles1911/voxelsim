@@ -1,4 +1,5 @@
 #include "VoxelEnvironmentLODPrototype.h"
+#include "VoxelFrameProfiling.h"
 #include "ProfilingDebugging/CpuProfilerTrace.h"
 #include "VoxelAssetAppearance.h"
 #include "VoxelAppearanceForest.h"
@@ -941,6 +942,7 @@ void AVoxelEnvironmentLODPrototype::RebuildSections(int32 L,const FIntVector& Mi
 }
 
 void AVoxelEnvironmentLODPrototype::Tick(float DeltaSeconds) {
+    CSV_SCOPED_TIMING_STAT(VoxelStream, EnvPrototypeTickMs);
     Super::Tick(DeltaSeconds);if(Levels.IsEmpty())return;
     APlayerController* PC=GetWorld()->GetFirstPlayerController();if(!PC)return;
     FVector Eye;FRotator Rotation;PC->GetPlayerViewPoint(Eye,Rotation);

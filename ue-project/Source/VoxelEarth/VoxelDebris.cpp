@@ -1,4 +1,5 @@
 #include "VoxelDebris.h"
+#include "VoxelFrameProfiling.h"
 #include "VoxelDebrisLifecycle.h"
 #include "VoxelDetachedPersistence.h"
 #include "Serialization/MemoryReader.h"
@@ -315,6 +316,7 @@ bool AVoxelDebris::PersistentState(FArchive& Ar)
 
 void AVoxelDebris::Tick(float DeltaSeconds)
 {
+	CSV_SCOPED_TIMING_STAT(VoxelStream, DebrisTickMs);
 	Super::Tick(DeltaSeconds);
 	if (bSettled)
 	{

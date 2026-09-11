@@ -1,4 +1,5 @@
 #include "VoxelTreeFellingPrototype.h"
+#include "VoxelFrameProfiling.h"
 #include "VoxelEnvironmentLODPrototype.h"
 #include "Async/Async.h"
 #include "VoxelDebrisLifecycle.h"
@@ -166,6 +167,7 @@ void AVoxelFallingTimber::PauseForGroundSupport(){
     GroundWasAwake=Body->IsAnyRigidBodyAwake();GroundPaused=true;Body->SetSimulatePhysics(false);
 }
 void AVoxelFallingTimber::Tick(float Dt){
+    CSV_SCOPED_TIMING_STAT(VoxelStream, FallingTimberTickMs);
     Super::Tick(Dt);
     if(GetNetMode()!=NM_Client){
         if(!VoxelTreeFelling::AdvanceRestoreGround(GetWorld(),GetGroundSupportBounds())){
@@ -400,6 +402,7 @@ AVoxelStoneAxePrototype::AVoxelStoneAxePrototype(){
 }
 bool AVoxelStoneAxePrototype::Swing(){if(!Equipped)return false;if(SwingAge>=.65){SwingAge=0;Struck=false;}return true;}
 void AVoxelStoneAxePrototype::Tick(float Dt){
+    CSV_SCOPED_TIMING_STAT(VoxelStream, StoneAxeTickMs);
     Super::Tick(Dt);auto PC=GetWorld()->GetFirstPlayerController();if(!PC)return;
     Mesh->SetVisibility(Equipped&&!PC->bShowMouseCursor);
     FVector Eye;FRotator Aim;PC->GetPlayerViewPoint(Eye,Aim);

@@ -1,4 +1,5 @@
 #include "VoxelRippleField.h"
+#include "VoxelFrameProfiling.h"
 #include "VoxelWorldSubsystem.h"
 #include "VoxelFineTileStreamer.h"
 
@@ -1619,6 +1620,7 @@ void UVoxelRippleFieldSubsystem::FireCaptureWake()
 
 void UVoxelRippleFieldSubsystem::Tick(float DeltaTime)
 {
+	CSV_SCOPED_TIMING_STAT(VoxelStream, RippleTickMs);
 	Super::Tick(DeltaTime);
 	if (!bArmed_)
 	{

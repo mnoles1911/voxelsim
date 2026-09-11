@@ -1,4 +1,5 @@
 #include "VoxelPerfRunSubsystem.h"
+#include "VoxelFrameProfiling.h"
 
 #include "VoxelDebug.h"
 // P7: the GI arm this run was measured on. VoxelGI.h for the three switches and
@@ -526,6 +527,7 @@ TStatId UVoxelPerfRunSubsystem::GetStatId() const
 
 void UVoxelPerfRunSubsystem::Tick(float DeltaTime)
 {
+	CSV_SCOPED_TIMING_STAT(VoxelStream, PerfRunTickMs);
 	if (!bRequested || bFinished)
 	{
 		return;

@@ -5,6 +5,7 @@
 // the per-page cost breakdown, and the stats window.
 
 #include "VoxelRasterAtlas.h"
+#include "VoxelFrameProfiling.h"
 
 #include "VoxelGpuWorldGen.h"
 
@@ -1667,6 +1668,7 @@ void FVoxelRasterAtlasCpu::WaitForAsyncSlots()
 
 void FVoxelRasterAtlasCpu::Tick(vxc::ITileSampler& Tiles, int64 AnchorXMm, int64 AnchorYMm)
 {
+	CSV_SCOPED_TIMING_STAT(VoxelStream, RasterAtlasTickMs);
 	check(IsInGameThread());
 	check(IsInitialized());
 

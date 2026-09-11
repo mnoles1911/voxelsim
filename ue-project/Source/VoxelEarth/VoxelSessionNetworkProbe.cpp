@@ -1,4 +1,5 @@
 #include "VoxelSessionNetworkProbe.h"
+#include "VoxelFrameProfiling.h"
 #include "VoxelPlayerRecords.h"
 #include "VoxelEarthPlayerController.h"
 #include "VoxelEarthFlyPawn.h"
@@ -28,6 +29,7 @@ void UVoxelSessionNetworkProbe::Initialize(FSubsystemCollectionBase& Collection)
 }
 void UVoxelSessionNetworkProbe::Tick(float DeltaSeconds)
 {
+    CSV_SCOPED_TIMING_STAT(VoxelStream, NetProbeTickMs);
     Elapsed+=DeltaSeconds;
     if(Elapsed<NextPoll) return;
     NextPoll=Elapsed+0.25;

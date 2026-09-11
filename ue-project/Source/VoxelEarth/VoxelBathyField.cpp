@@ -1,4 +1,5 @@
 #include "VoxelBathyField.h"
+#include "VoxelFrameProfiling.h"
 
 #include "VoxelSkySubsystem.h" // VoxelSky::kSkyCollectionPath
 
@@ -182,6 +183,7 @@ bool UVoxelBathyFieldSubsystem::GetCameraXY(double& OutX, double& OutY) const
 
 void UVoxelBathyFieldSubsystem::Tick(float DeltaTime)
 {
+	CSV_SCOPED_TIMING_STAT(VoxelStream, BathyTickMs);
 	Super::Tick(DeltaTime);
 	if (!bArmed_)
 	{

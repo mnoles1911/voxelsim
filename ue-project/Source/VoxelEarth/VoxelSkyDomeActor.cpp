@@ -1,4 +1,5 @@
 #include "VoxelSkyDomeActor.h"
+#include "VoxelFrameProfiling.h"
 
 #include "VoxelClipmapActor.h" // AVoxelClipmapActor::OuterHalfExtentUU -- the radius check
 #include "VoxelEarth.h"
@@ -254,6 +255,7 @@ void AVoxelSkyDomeActor::BeginPlay()
 
 void AVoxelSkyDomeActor::Tick(float DeltaTime)
 {
+	CSV_SCOPED_TIMING_STAT(VoxelStream, SkyDomeTickMs);
 	Super::Tick(DeltaTime);
 
 	ApplyDomeCvars();

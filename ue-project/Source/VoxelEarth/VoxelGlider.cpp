@@ -1,4 +1,5 @@
 #include "VoxelGlider.h"
+#include "VoxelFrameProfiling.h"
 #include "VoxelGameplayActors.h"
 #include "VoxelPlayerRecords.h"
 #include "VoxelEarthPlayerController.h"
@@ -183,6 +184,7 @@ void AVoxelGlider::EndPlay(const EEndPlayReason::Type Reason)
 
 void AVoxelGlider::Tick(float DeltaSeconds)
 {
+	CSV_SCOPED_TIMING_STAT(VoxelStream, GliderTickMs);
 	VoxelGameplayActors::FinishRestore(this);
 	if(!HasAuthority() || !VoxelSessionCheckpoint::Ready(GetWorld())) return;
 	Super::Tick(DeltaSeconds);

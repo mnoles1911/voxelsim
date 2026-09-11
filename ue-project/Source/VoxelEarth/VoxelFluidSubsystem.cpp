@@ -4,6 +4,7 @@
 // verify gate.
 
 #include "VoxelFluidSubsystem.h"
+#include "VoxelFrameProfiling.h"
 
 #include "VoxelFluidSim.h"       // VoxelEarthShaders -- the render-thread solver
 #include "VoxelFluidOccupancy.h" // VoxelEarthShaders -- the collision volume
@@ -1713,6 +1714,7 @@ void UVoxelFluidSubsystem::ReleaseSimState()
 
 void UVoxelFluidSubsystem::Tick(float DeltaTime)
 {
+	CSV_SCOPED_TIMING_STAT(VoxelStream, FluidTickMs);
 	Super::Tick(DeltaTime);
 
 	UWorld* World = GetWorld();

@@ -1,4 +1,5 @@
 #include "VoxelWeatherSubsystem.h"
+#include "VoxelFrameProfiling.h"
 
 #include "VoxelFrontEndPolicy.h" // IsWorldHeldForMenu -- backlog 0.0k
 #include "VoxelSkySubsystem.h"   // the clock. There is no other clock; see the header.
@@ -781,6 +782,7 @@ bool UVoxelWeatherSubsystem::GetCameraXY(double& OutX, double& OutY) const
 
 void UVoxelWeatherSubsystem::Tick(float DeltaTime)
 {
+	CSV_SCOPED_TIMING_STAT(VoxelStream, WeatherTickMs);
 	Super::Tick(DeltaTime);
 	if (!Impl)
 	{
