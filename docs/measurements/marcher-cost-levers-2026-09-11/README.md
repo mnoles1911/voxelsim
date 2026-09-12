@@ -1,5 +1,17 @@
 # The marcher: what it costs, what is already built and switched off, and what to do
 
+> **CORRECTION, 2026-09-12.** Text below that calls 48 m "the shipping default"
+> or "the default ring" is WRONG. `kDefaultRingMeters` is **256.0** in
+> `VoxelDetailAssetSubsystem.cpp:512`, with no config override, and its own
+> comment records that it was raised deliberately after the owner reported the
+> slopes looking bare from the vista. 48 m was the *validation harness*
+> parameter default, which every capture then passed on the command line — so
+> runs at 48 m were measuring a configuration the game does not use. The
+> harnesses now default to 256 to match. What this changes: the 256 m figures
+> throughout are the SHIPPING configuration, not an experiment.
+
+
+
 `GPU/VoxelMarch` reads **9.47 ms** of a 40.48 ms GPU frame at the temperate
 forest site, 1280×720 at 65% screen percentage. At the shipping 48 m ring it is
 9.14 ms of a 12.68 ms frame — **72% of the GPU**, and once size culling lands at

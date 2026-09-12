@@ -2,7 +2,7 @@ param([Parameter(Mandatory=$true)][string]$AssetDirectory,[Parameter(Mandatory=$
     [string]$SpawnAt='-156260,-82356',[ValidateRange(60,7200)][int]$TimeoutSeconds=900,
     [switch]$DetailMeshLOD,[switch]$DetailSizeCull,[switch]$NoDetailSizeCull,[switch]$DetailRetireUnused,[string]$DetailMeshCache='',
     [switch]$PredictiveAssetResolve,[switch]$NoPredictiveAssetResolve,[switch]$MarchDispatchIdentity,
-    [switch]$AllowPreviewDetailCache,[ValidateRange(16,512)][double]$DetailRingMeters=48,
+    [switch]$AllowPreviewDetailCache,[ValidateRange(16,512)][double]$DetailRingMeters=256,
     [string[]]$ExtraArgs=@(),
     # Output resolution. The engine renders at a screen percentage of this and TSR
     # upscales; the log's "px of a WxH view" line is the real internal size. Default

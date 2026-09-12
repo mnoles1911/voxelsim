@@ -4,7 +4,7 @@ param(
     [Parameter(Mandatory=$true)][string]$Output,
     [ValidateRange(60,7200)][int]$TimeoutSeconds=3900,
     [switch]$ProfileFrames,[switch]$DiagnoseStalls,[switch]$DetailMeshLOD,[switch]$DetailSizeCull,[switch]$NoDetailSizeCull,[switch]$DetailRetireUnused,[string]$DetailMeshCache='',
-    [switch]$AllowPreviewDetailCache,[ValidateRange(16,512)][double]$DetailRingMeters=48,
+    [switch]$AllowPreviewDetailCache,[ValidateRange(16,512)][double]$DetailRingMeters=256,
     # Opt-in flags the route needs but has no switch for -- e.g. -VoxelDetailNanite,
     # which MUST ride alongside a nanite=1 cache or the identity guard refuses the
     # run. Same validation as the walk harness, and recorded in the manifest's

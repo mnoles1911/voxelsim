@@ -1,5 +1,17 @@
 # Understory size-cull A/B, full 256 m ring, 2026-09-10 (captures 26 OFF / 27 ON)
 
+> **CORRECTION, 2026-09-12.** Text below that calls 48 m "the shipping default"
+> or "the default ring" is WRONG. `kDefaultRingMeters` is **256.0** in
+> `VoxelDetailAssetSubsystem.cpp:512`, with no config override, and its own
+> comment records that it was raised deliberately after the owner reported the
+> slopes looking bare from the vista. 48 m was the *validation harness*
+> parameter default, which every capture then passed on the command line — so
+> runs at 48 m were measuring a configuration the game does not use. The
+> harnesses now default to 256 to match. What this changes: the 256 m figures
+> throughout are the SHIPPING configuration, not an experiment.
+
+
+
 Replaces the invalidated 24/25 pair (runtime module changed during the ON run). Both
 captures here carry passing fail-closed receipts (`run-validation.json`): same three
 module hashes at start and end, same detail cache manifest, no competing UE/compiler
