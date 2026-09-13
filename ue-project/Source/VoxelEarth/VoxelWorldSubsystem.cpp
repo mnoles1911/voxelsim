@@ -3603,6 +3603,72 @@ bool AsyncAssetResolveEnabled()
 //
 // The earlier "predictive prewarm gave mixed results" verdict (walks 22/23) predates
 // the authored-LOD understory payload and is superseded, not contradicted.
+
+// THE PREWARM'S FOUR CAPS. They were the pilot's values (2048/256/8/32) until
+// 2026-09-13, when the set below was measured to take frame p99 from 146.90 to
+// 109.92 ms over two runs each with throughput unchanged. The pilot values are
+// still reachable as the control arm.
+// See WarmPredictiveAssetResolves for what measured them into existence: the
+// submit path's cold misses cost ~4.6 ms each on the game thread and the
+// prewarm was capped at eight launches a tick.
+static TAutoConsoleVariable<int32> CVarVoxelPredictiveQueueCap(
+	TEXT("voxel.Stream.PredictiveQueueCap"), 16384,
+	TEXT("Predictive asset-resolve keys retained in the queue."), ECVF_Default);
+static TAutoConsoleVariable<int32> CVarVoxelPredictiveProbeCap(
+	TEXT("voxel.Stream.PredictiveProbeCap"), 1024,
+	TEXT("Predictive asset-resolve queue entries probed per tick."), ECVF_Default);
+static TAutoConsoleVariable<int32> CVarVoxelPredictiveLaunchCap(
+	TEXT("voxel.Stream.PredictiveLaunchCap"), 64,
+	TEXT("Predictive asset resolves launched per tick. The gate on raising it is GpuSubmit "
+	     "coldMisses falling, NOT launched= rising -- launching more and landing the same is a "
+	     "knob that did nothing."), ECVF_Default);
+// HOW MANY LEVELS THE PREWARM COVERS. 0 = level 0 only, which is what it did
+// before 2026-09-13; that is now the CONTROL ARM, not the default. The misses
+// that matter are COARSE: 6,716 of 7,563 of them, carrying 98.4% of the resolve
+// milliseconds at 28.91 ms each against level 0's 3.77.
+static TAutoConsoleVariable<int32> CVarVoxelPredictiveCoarseLevels(
+	TEXT("voxel.Stream.PredictiveCoarseLevels"), 7,
+	TEXT("Highest ring level the predictive asset resolve warms. 0 warms level 0 only and is the "
+	     "control arm; the cost it is aimed at is the coarse cold miss, which no cap could ever "
+	     "reach because nothing queued it."), ECVF_Default);
+
+// The site cap used when deciding whether a footprint MAY be warmed. 8192 was
+// the historical bound and is the control arm. The inline path has no such bound,
+// so anything between this and the real footprint size is work the game thread
+// does instead of a worker.
+// THE RESOLVE CACHE'S LIMITS. `Pending` is the one that bound everything at its
+// old value of eight outstanding warm tokens, which no launch cap could exceed;
+// it now defaults to 256. THE TWO MEMORY KNOBS ARE DELIBERATELY UNCHANGED: an
+// arm that also raised them to 512 MiB total and 32 MiB per entry measured p99
+// 113.91 against this configuration's 109.92, i.e. the extra 448 MiB bought
+// nothing and is not being spent.
+static TAutoConsoleVariable<int32> CVarVoxelResolveCachePending(
+	TEXT("voxel.Stream.ResolveCachePending"), 256,
+	TEXT("Outstanding predictive warm tokens the footprint resolve cache will issue. Eight is the "
+	     "historical default and it outranks voxel.Stream.PredictiveLaunchCap silently."), ECVF_Default);
+static TAutoConsoleVariable<int32> CVarVoxelResolveCacheEntries(
+	TEXT("voxel.Stream.ResolveCacheEntries"), 8192,
+	TEXT("Footprint resolve cache entries (and history length)."), ECVF_Default);
+static TAutoConsoleVariable<int32> CVarVoxelResolveCacheMB(
+	TEXT("voxel.Stream.ResolveCacheMB"), 64,
+	TEXT("Footprint resolve cache total budget in MiB."), ECVF_Default);
+static TAutoConsoleVariable<int32> CVarVoxelResolveCacheEntryMB(
+	TEXT("voxel.Stream.ResolveCacheEntryMB"), 2,
+	TEXT("Largest single cached footprint in MiB. A coarse footprint resolves far more instances "
+	     "than a level-0 one, and an entry over this size is refused -- so it is resolved again, "
+	     "inline, every time it is asked for."), ECVF_Default);
+
+static TAutoConsoleVariable<int32> CVarVoxelPredictiveSiteCap(
+	TEXT("voxel.Stream.PredictiveSiteCap"), 1048576,
+	TEXT("Candidate-site ceiling for warming a footprint speculatively. Raising it lets COARSE "
+	     "footprints be warmed; they are refused today and then resolved inline on the game "
+	     "thread anyway, at 28.91 ms each."), ECVF_Default);
+
+static TAutoConsoleVariable<int32> CVarVoxelPredictiveInFlightCap(
+	TEXT("voxel.Stream.PredictiveInFlightCap"), 256,
+	TEXT("Predictive asset resolve tasks outstanding at once. They run at BackgroundLow so they "
+	     "cannot take a worker slot from a chunk somebody is waiting for."), ECVF_Default);
+
 bool PredictiveAssetResolveEnabled()
 {
 	static const bool Enabled = []
@@ -9788,11 +9854,23 @@ struct FVoxelWorldImpl
     enum class EAssetResolveCaller : uint8 {Admission,GpuSubmit,EditedPage};
     struct FAssetResolveCallerStats {
         uint64 Calls=0,Hits=0,ColdMisses=0,ForcedInline=0,Level0Calls=0,CoarseCalls=0;
+        // THE MISSES SPLIT BY LEVEL, added 2026-09-13. Calls were already split
+        // and misses were not, which is the half that decides whether the
+        // predictive prewarm can ever help: it enqueues Key{0,...} and nothing
+        // else, so a COARSE footprint can never be warm however high its caps
+        // are raised -- measured, after raising all four caps moved coldMisses
+        // 7903 -> 8247, i.e. not at all.
+        uint64 ColdMissLevel0=0,ColdMissCoarse=0;
+        double RawResolveLevel0Ms=0,RawResolveCoarseMs=0;
         double TotalMs=0,InlineMs=0,RawResolveMs=0,MaxCallMs=0,MaxRawResolveMs=0;
     };
     // Mutable only because admission queries are logically const. All three
     // callers and the window report/reset execute on the game thread.
     mutable FAssetResolveCallerStats AssetResolveCallerStats[3];
+	// The four launch refusals plus the token one, so probes-minus-launches is
+	// attributable instead of merely large. Reset with the other window counters.
+	uint64 PredictiveRefusedAdmission = 0, PredictiveRefusedCached = 0;
+	uint64 PredictiveRefusedNotResident = 0, PredictiveRefusedUnbound = 0, PredictiveRefusedNoToken = 0;
 	double AccumGpuSubmitMgrMs = 0.0;     // Manager->Submit + GpuJobsPending insert
 	double AccumGpuSubmitTotalMs = 0.0;   // whole SubmitGpuMeshJob wall
 	int64 GpuSubmitCallsSinceLog = 0;     // calls entered (success, decline, speculative)
@@ -12606,6 +12684,31 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 		CSV_CUSTOM_STAT(VoxelStream, TickMs,        double(TickMsSoFar),               ECsvCustomStatOp::Set);
 		CSV_CUSTOM_STAT(VoxelStream, DispatchMs,    double(ThisFrameDispatchMs),       ECsvCustomStatOp::Set);
 		CSV_CUSTOM_STAT(VoxelStream, SubmitMs,      double(ThisFrameDispatchSubmitMs), ECsvCustomStatOp::Set);
+		// THE SUBMIT SIX, PER FRAME. They already existed on FFrameSample, and
+		// that sample is only ever printed as BUCKET MEANS in the census -- which
+		// is the same bar the split was invented to get past, one level down: a
+		// mean over a bucket cannot isolate the worst 1% of frames, and in
+		// attribution mode 1 the buckets pool cold fill with settled play, so
+		// the absolute milliseconds describe LOADING.
+		//
+		// 2026-09-13 is what made this worth the six stores. The census said
+		// assets is 96.5% of the submit bracket (SLOW subTotal 1316.270 of which
+		// assets 1270.527; raster 3.383), which refuted the standing raster-atlas
+		// hypothesis outright -- but it said it over a population that includes
+		// the cold fill, and the hitch that matters is a p99 frame during
+		// settled play. These columns are what let the same question be asked of
+		// that population, with percentiles, from the CSV.
+		//
+		// Mode 2 cannot serve instead: it selects on VoxelFramePhase's settled
+		// flag, which reads settled=0 on every window of a walk capture, so the
+		// report never prints at all in this harness.
+		CSV_CUSTOM_STAT(VoxelStream, SubReqHdrMs,   double(ThisFrameSubReqHdrMs),      ECsvCustomStatOp::Set);
+		CSV_CUSTOM_STAT(VoxelStream, SubBandMs,     double(ThisFrameSubBandMs),        ECsvCustomStatOp::Set);
+		CSV_CUSTOM_STAT(VoxelStream, SubRasterMs,   double(ThisFrameSubRasterMs),      ECsvCustomStatOp::Set);
+		CSV_CUSTOM_STAT(VoxelStream, SubAssetsMs,   double(ThisFrameSubAssetsMs),      ECsvCustomStatOp::Set);
+		CSV_CUSTOM_STAT(VoxelStream, SubPoolMs,     double(ThisFrameSubPoolMs),        ECsvCustomStatOp::Set);
+		CSV_CUSTOM_STAT(VoxelStream, SubMgrMs,      double(ThisFrameSubMgrMs),         ECsvCustomStatOp::Set);
+		CSV_CUSTOM_STAT(VoxelStream, SubTotalMs,    double(ThisFrameSubTotalMs),       ECsvCustomStatOp::Set);
 		CSV_CUSTOM_STAT(VoxelStream, ApplyMs,       double(ThisFrameApplyMs),          ECsvCustomStatOp::Set);
 		CSV_CUSTOM_STAT(VoxelStream, DispAirProofMs, double(ThisFrameDispatchAirProofMs), ECsvCustomStatOp::Set);
 		CSV_CUSTOM_STAT(VoxelStream, DispBandMs,    double(ThisFrameDispatchBandMs),   ECsvCustomStatOp::Set);
@@ -14681,9 +14784,19 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
     // request ever reaches the GPU submit path. These are nested CPU timings,
     // not additive to the existing submission/tick totals.
     if (VoxelStreamAdmission::PredictiveAssetResolveEnabled())
-        UE_LOG(LogVoxelPerf,Log,TEXT("Voxel predictive asset resolve (window): probes=%llu launched=%llu landed=%llu raced=%llu nonresident=%llu rejected=%llu epochRejected=%llu pending=%d queueRemaining=%d tickMs=%.3f maxTickMs=%.3f queueBuilds=%llu queueCells=%llu queueBuildMs=%.3f maxQueueBuildMs=%.3f launchCap=8 inFlightCap=32 probeCap=256 queueCap=2048"),
+        UE_LOG(LogVoxelPerf,Log,TEXT("Voxel predictive asset resolve (window): probes=%llu launched=%llu landed=%llu raced=%llu nonresident=%llu rejected=%llu epochRejected=%llu pending=%d queueRemaining=%d tickMs=%.3f maxTickMs=%.3f queueBuilds=%llu queueCells=%llu queueBuildMs=%.3f maxQueueBuildMs=%.3f launchCap=%d inFlightCap=%d probeCap=%d queueCap=%d refusedAdmission=%llu refusedCached=%llu refusedNotResident=%llu refusedUnbound=%llu refusedNoToken=%llu"),
             PredictiveAssetProbes,PredictiveAssetLaunched,PredictiveAssetLanded,PredictiveAssetRaced,PredictiveAssetNotResident,PredictiveAssetRejected,PredictiveAssetEpochRejected,
-            PredictiveAssetInFlight.Num(),PredictiveAssetQueue.Num()-PredictiveAssetCursor,PredictiveAssetTickMs,PredictiveAssetMaxTickMs,PredictiveAssetQueueBuilds,PredictiveAssetQueueCells,PredictiveAssetQueueBuildMs,PredictiveAssetMaxQueueBuildMs);
+            PredictiveAssetInFlight.Num(),PredictiveAssetQueue.Num()-PredictiveAssetCursor,PredictiveAssetTickMs,PredictiveAssetMaxTickMs,PredictiveAssetQueueBuilds,PredictiveAssetQueueCells,PredictiveAssetQueueBuildMs,PredictiveAssetMaxQueueBuildMs,
+            // THE CAPS AS USED, not as once written. They were literals in this
+            // format string, so a changed cap went on printing the pilot's
+            // numbers -- a counter that lies about the configuration it describes
+            // is worse than no counter, because every reader believes it.
+            VoxelStreamAdmission::CVarVoxelPredictiveLaunchCap.GetValueOnGameThread(),
+            VoxelStreamAdmission::CVarVoxelPredictiveInFlightCap.GetValueOnGameThread(),
+            VoxelStreamAdmission::CVarVoxelPredictiveProbeCap.GetValueOnGameThread(),
+            VoxelStreamAdmission::CVarVoxelPredictiveQueueCap.GetValueOnGameThread(),
+            PredictiveRefusedAdmission,PredictiveRefusedCached,PredictiveRefusedNotResident,
+            PredictiveRefusedUnbound,PredictiveRefusedNoToken);
     for(int L=0;L<8;++L){const auto& W=AppearanceStageWindows[L];if(!W.Calls)continue;
         UE_LOG(LogVoxelPerf,Log,TEXT("Voxel appearance stages (window, nested): level=%d calls=%llu input=%llu filtered=%llu cells=%llu words=%llu filterMs=%.3f resourceMs=%.3f canonicalMs=%.3f winnerMs=%.3f packMs=%.3f uploadMs=%.3f maxFilterMs=%.3f maxResourceMs=%.3f maxCanonicalMs=%.3f maxWinnerMs=%.3f maxPackMs=%.3f maxUploadMs=%.3f"),
             L,W.Calls,W.Total.Input,W.Total.Filtered,W.Total.Cells,W.Total.Words,W.Total.FilterMs,W.Total.ResourceMs,W.Total.CanonicalMs,W.Total.WinnerMs,W.Total.PackMs,W.Total.UploadMs,
@@ -14691,8 +14804,9 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
     }
     const TCHAR* ResolveCallerNames[]={TEXT("Admission"),TEXT("GpuSubmit"),TEXT("EditedPage")};
     for(int32 I=0;I<3;++I){const auto& R=AssetResolveCallerStats[I];if(!R.Calls)continue;
-        UE_LOG(LogVoxelPerf,Log,TEXT("Voxel asset resolve caller (window): caller=%s calls=%llu hits=%llu coldMisses=%llu forcedInline=%llu level0=%llu coarse=%llu totalMs=%.3f inlineMs=%.3f rawResolveMs=%.3f maxCallMs=%.3f maxRawResolveMs=%.3f"),
-            ResolveCallerNames[I],R.Calls,R.Hits,R.ColdMisses,R.ForcedInline,R.Level0Calls,R.CoarseCalls,R.TotalMs,R.InlineMs,R.RawResolveMs,R.MaxCallMs,R.MaxRawResolveMs);
+        UE_LOG(LogVoxelPerf,Log,TEXT("Voxel asset resolve caller (window): caller=%s calls=%llu hits=%llu coldMisses=%llu forcedInline=%llu level0=%llu coarse=%llu totalMs=%.3f inlineMs=%.3f rawResolveMs=%.3f maxCallMs=%.3f maxRawResolveMs=%.3f missLevel0=%llu missCoarse=%llu rawLevel0Ms=%.3f rawCoarseMs=%.3f"),
+            ResolveCallerNames[I],R.Calls,R.Hits,R.ColdMisses,R.ForcedInline,R.Level0Calls,R.CoarseCalls,R.TotalMs,R.InlineMs,R.RawResolveMs,R.MaxCallMs,R.MaxRawResolveMs,
+            R.ColdMissLevel0,R.ColdMissCoarse,R.RawResolveLevel0Ms,R.RawResolveCoarseMs);
     }
 	// S0-2: apply throughput for THIS window, alongside the leg-long mean
 	// TotalChunksLoaded already gives on the "Voxel streaming" line above.
@@ -17362,6 +17476,8 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
     for(auto& W:AppearanceStageWindows)W={};
     for(auto& R:AssetResolveCallerStats)R={};
     PredictiveAssetProbes=PredictiveAssetLaunched=PredictiveAssetLanded=0;
+    PredictiveRefusedAdmission=PredictiveRefusedCached=PredictiveRefusedNotResident=
+        PredictiveRefusedUnbound=PredictiveRefusedNoToken=0;
     PredictiveAssetRaced=PredictiveAssetNotResident=PredictiveAssetRejected=PredictiveAssetEpochRejected=0;
     PredictiveAssetTickMs=PredictiveAssetMaxTickMs=0;
     PredictiveAssetQueueBuilds=PredictiveAssetQueueCells=0;
@@ -20176,6 +20292,8 @@ const std::vector<vxc::AssetField::ResolvedAssetInstance>* FVoxelWorldImpl::Reso
     OutScratch=VoxelResolveTerrainInstances(Voxels.generated(),VoxelAssetRectForFootprint(Level,ChunkX,ChunkY));
     const double RawResolveMs=(FPlatformTime::Seconds()-Started)*1000.0;
     CallerStats.RawResolveMs+=RawResolveMs;CallerStats.MaxRawResolveMs=FMath::Max(CallerStats.MaxRawResolveMs,RawResolveMs);
+    if(Level==0){++CallerStats.ColdMissLevel0;CallerStats.RawResolveLevel0Ms+=RawResolveMs;}
+    else{++CallerStats.ColdMissCoarse;CallerStats.RawResolveCoarseMs+=RawResolveMs;}
     VoxelStreamAdmission::GAssetResolveInline.fetch_add(1,std::memory_order_relaxed);
     VoxelStreamAdmission::GAssetResolveGameThreadUs.fetch_add(int64((FPlatformTime::Seconds()-Started)*1e6),std::memory_order_relaxed);
     if(VoxelStreamAdmission::AsyncAssetResolveEnabled()){
@@ -20214,17 +20332,33 @@ void FVoxelWorldImpl::DrainAssetResolveResults()
 bool FVoxelWorldImpl::LaunchAssetResolveWarm(const VoxelCoords::FVoxelLevelChunkKey& CacheKey)
 {
 	check(IsInGameThread());
-    if(!CpuAdmission.isOpen())return false;
+    // WHY A PROBE DID NOT LAUNCH, counted at each refusal.
+    //
+    // The loop counted probes and launches and nothing between them, so a run
+    // reading probes=200,025 launched=109 said only that something refused
+    // 99.9% of candidates -- not which predicate, and there are four. That is
+    // the same silence as a counter that cannot fail: every hypothesis about the
+    // prewarm survives it. 2026-09-13, after extending the queue to coarse
+    // levels bought nothing.
+    if(!CpuAdmission.isOpen()){++PredictiveRefusedAdmission;return false;}
     SyncAssetResolveCache();
-	if (AssetResolveCache.contains(ResolveKeyOf(CacheKey)) ||
-	    !AssetResolveFootprintResident(CacheKey.Level, CacheKey.Key.X, CacheKey.Key.Y)) return false;
+	if (AssetResolveCache.contains(ResolveKeyOf(CacheKey))){++PredictiveRefusedCached;return false;}
+	if (!AssetResolveFootprintResident(CacheKey.Level, CacheKey.Key.X, CacheKey.Key.Y)){++PredictiveRefusedNotResident;return false;}
 	const vxc::GeneratedWorld<VoxelCoords::BrickEdgeVoxels>* GenPtr = &Voxels.generated();
 	TQueue<FAssetResolveResult, EQueueMode::Mpsc>* QueuePtr = &AssetResolveQueue;
     const auto* Field=Voxels.assetField();
-    if(!Field||!vxc::footprintResolveSitesBound(VoxelAssetRectForFootprint(CacheKey.Level,CacheKey.Key.X,CacheKey.Key.Y),Field->layers()))return false;
+    // THE SITE CAP FOR SPECULATIVE WARMING. Default 8192 is the historical
+    // value, so an arm that leaves it alone behaves exactly as before. It is the
+    // line that refused 175% of probes (a probe can be retried across ticks) and
+    // it refused them for being COARSE -- the footprints that cost 28.91 ms each
+    // inline, against level 0's 3.77. Raising it moves that work off the game
+    // thread; it does not create it.
+    const uint64 WarmSiteCap = uint64(FMath::Clamp(
+        VoxelStreamAdmission::CVarVoxelPredictiveSiteCap.GetValueOnGameThread(), 1, 1 << 20));
+    if(!Field||!vxc::footprintResolveSitesBound(VoxelAssetRectForFootprint(CacheKey.Level,CacheKey.Key.X,CacheKey.Key.Y),Field->layers(),WarmSiteCap)){++PredictiveRefusedUnbound;return false;}
     SyncAssetResolveCache();
     const auto WarmToken=AssetResolveCache.beginWarm(ResolveKeyOf(CacheKey));
-    if(!WarmToken)return false;
+    if(!WarmToken){++PredictiveRefusedNoToken;return false;}
 	VoxelStreamAdmission::GAssetResolveWarmLaunched.fetch_add(1, std::memory_order_relaxed);
 	const vxc::AssetVoxelRect Rect = VoxelAssetRectForFootprint(CacheKey.Level, CacheKey.Key.X, CacheKey.Key.Y);
 	// GenPtr and QueuePtr are raw pointers into Impl-owned data, exactly
@@ -20260,9 +20394,39 @@ void FVoxelWorldImpl::WarmPredictiveAssetResolves(const FVector& Anchor, float D
 	const double Start = FPlatformTime::Seconds();
 	const vxc::AssetField* Field = Voxels.assetField();
 	if (!Field || Field->empty()) return;
-	// Fixed pilot limits: retain 2,048 queued keys, 256 probes/tick, eight
-	// launches/tick and 32 predictive tasks outstanding. No residency loads.
-	constexpr int32 QueueCap = 2048, ProbeCap = 256, LaunchCap = 8, InFlightCap = 32;
+	// THE PILOT LIMITS, NOW TUNABLE, AND WHY THAT BECAME WORTH DOING.
+	//
+	// They were fixed at the pilot's values: 2,048 queued keys, 256 probes/tick,
+	// eight launches/tick, 32 tasks outstanding. On 2026-09-13 the submit path
+	// was measured against them for the first time:
+	//
+	//   caller=GpuSubmit calls=6286 hits=5950 coldMisses=336
+	//                    totalMs=1555.830 inlineMs=1553.786
+	//   predictive       probes=842 launched=154 landed=152
+	//
+	// The cache is doing its job -- 5,950 hits cost 2.0 ms BETWEEN THEM -- and
+	// every one of those 1,553.8 ms is a cold miss paid inline on the game
+	// thread, about 4.6 ms each, with a worst single call of 29.9 ms. Sixty of
+	// them in one frame is the 277 ms hitch that p99 is made of. The prewarm
+	// exists to stop exactly this and landed 152 against 336 misses, while its
+	// launch cap let it start only eight a tick.
+	//
+	// So the caps are now readable from cvars, with the pilot values as the
+	// DEFAULTS -- a control arm is byte-identical -- and the window line prints
+	// what it actually used rather than the literals it used to hard-code, which
+	// would have gone on printing "launchCap=8" whatever the cap became.
+	//
+	// THIS IS A THROUGHPUT KNOB ON SPECULATIVE WORK AND IT CAN LOSE. The tasks
+	// run at BackgroundLow precisely so a predictive resolve never takes a slot
+	// from a chunk somebody is waiting for; raising the caps spends more worker
+	// time on work that may be thrown away, and this project has already
+	// measured a case where releasing a cap made throughput FALL. The gate is
+	// GpuSubmit coldMisses, not launched= -- launching more and landing the same
+	// is the shape of a knob that did nothing.
+	const int32 QueueCap = FMath::Clamp(VoxelStreamAdmission::CVarVoxelPredictiveQueueCap.GetValueOnGameThread(), 0, 1 << 20);
+	const int32 ProbeCap = FMath::Clamp(VoxelStreamAdmission::CVarVoxelPredictiveProbeCap.GetValueOnGameThread(), 0, 1 << 16);
+	const int32 LaunchCap = FMath::Clamp(VoxelStreamAdmission::CVarVoxelPredictiveLaunchCap.GetValueOnGameThread(), 0, 1 << 12);
+	const int32 InFlightCap = FMath::Clamp(VoxelStreamAdmission::CVarVoxelPredictiveInFlightCap.GetValueOnGameThread(), 0, 1 << 12);
 	const double Edge = VoxelCoords::ChunkEdgeUUForLevel(0);
 	FVector Lead = FVector::ZeroVector;
 	if (bPredictiveAssetHasAnchor && DeltaTime > 0.f)
@@ -20291,24 +20455,76 @@ void FVoxelWorldImpl::WarmPredictiveAssetResolves(const FVector& Anchor, float D
 		// Bound construction scratch to 129 squared keys (under 267 KB at
 		// 16 bytes/key before allocator slack); sort then truncate to
 		// nearest-first. Only XY keys are retained, never candidate/source copies.
-		const int32 Span = FMath::Min(64, FMath::CeilToInt32(Radius / Edge));
-		for (int32 DY = -Span; DY <= Span; ++DY)
-		for (int32 DX = -Span; DX <= Span; ++DX)
+		// THE LEVELS THIS WARMS, AND WHY IT USED TO BE ONE.
+		//
+		// Every key enqueued here was `Key{0, ...}` -- level 0 and nothing else.
+		// On 2026-09-13 the submit path's cold misses were split by level for the
+		// first time, over 31 windows of a forest walk:
+		//
+		//   level 0    847 misses    3,195 ms     3.77 ms each     1.6% of miss time
+		//   coarse   6,716 misses  194,162 ms    28.91 ms each    98.4% of miss time
+		//
+		// A coarse footprint resolves over a rect 2^L times wider per side, so it
+		// finds far more instances and costs 7.7x what a level-0 one does, with a
+		// worst single call of 526 ms -- one call, one visible freeze. And it
+		// could never be warm, whatever the caps were: nothing ever queued it.
+		// That is why raising all four caps moved coldMisses 7903 -> 8247, which
+		// is to say not at all.
+		//
+		// Each level is enumerated over ITS OWN admit radius, so a level with a
+		// wider ring does not get a level-0-sized window, and the chunk count per
+		// level stays modest because the edge grows with the radius.
+		//
+		// Ordering is by distance in CHUNKS OF THAT LEVEL rather than in world
+		// units, deliberately: a coarse chunk is enormous, so ranking by world
+		// distance would put every coarse key behind every level-0 key and
+		// reinstate exactly the starvation this is meant to remove.
+		const int32 WarmMaxLevel = FMath::Clamp(
+			VoxelStreamAdmission::CVarVoxelPredictiveCoarseLevels.GetValueOnGameThread(),
+			0, UVoxelWorldSubsystem::GetMaxRingLevel());
+		for (int32 Level = 0; Level <= WarmMaxLevel; ++Level)
 		{
-			++PredictiveAssetQueueCells;
-			const int64 X = int64(Center.X) + DX, Y = int64(Center.Y) + DY;
-			if (X < MIN_int32 || X > MAX_int32 || Y < MIN_int32 || Y > MAX_int32) continue;
-			const double CX = (double(X) + 0.5) * Edge, CY = (double(Y) + 0.5) * Edge;
-			if (FMath::Square(CX - Anchor.X) + FMath::Square(CY - Anchor.Y) > FMath::Square(Radius)) continue;
-			const VoxelCoords::FVoxelLevelChunkKey Key{0, {int32(X), int32(Y), 0}};
-			if (!AssetResolveCache.contains(ResolveKeyOf(Key))) PredictiveAssetQueue.Add(Key);
+			const double LevelEdge = VoxelCoords::ChunkEdgeUUForLevel(Level);
+			const double LevelRadius = FMath::Min(VoxelStreamAdmission::AdmitOuterUU(Level) + 2.0 * LevelEdge,
+			                                      64.0 * LevelEdge);
+			// A level-L chunk spans ChunkEdgeUUForLevel(L) of world, so the key
+			// containing a point is that division -- there is no
+			// ChunkKeyForLevel helper, and ChunkKeyForVoxel would answer in
+			// LEVEL-0 chunks, which is the mistake HoldsGeometry-vs-HoldsTerrain
+			// is made of.
+			const FVector LevelProbe = Anchor + Lead;
+			const int64 LevelCenterX = int64(FMath::FloorToDouble(LevelProbe.X / LevelEdge));
+			const int64 LevelCenterY = int64(FMath::FloorToDouble(LevelProbe.Y / LevelEdge));
+			const int32 Span = FMath::Min(64, FMath::CeilToInt32(LevelRadius / LevelEdge));
+			for (int32 DY = -Span; DY <= Span; ++DY)
+			for (int32 DX = -Span; DX <= Span; ++DX)
+			{
+				++PredictiveAssetQueueCells;
+				const int64 X = LevelCenterX + DX, Y = LevelCenterY + DY;
+				if (X < MIN_int32 || X > MAX_int32 || Y < MIN_int32 || Y > MAX_int32) continue;
+				const double CX = (double(X) + 0.5) * LevelEdge, CY = (double(Y) + 0.5) * LevelEdge;
+				if (FMath::Square(CX - Anchor.X) + FMath::Square(CY - Anchor.Y) > FMath::Square(LevelRadius)) continue;
+				const VoxelCoords::FVoxelLevelChunkKey Key{Level, {int32(X), int32(Y), 0}};
+				if (!AssetResolveCache.contains(ResolveKeyOf(Key))) PredictiveAssetQueue.Add(Key);
+			}
 		}
-		PredictiveAssetQueue.Sort([Center](const auto& A, const auto& B)
+		PredictiveAssetQueue.Sort([&Anchor, &Lead](const auto& A, const auto& B)
 		{
-			const int64 AX = int64(A.Key.X) - Center.X, AY = int64(A.Key.Y) - Center.Y;
-			const int64 BX = int64(B.Key.X) - Center.X, BY = int64(B.Key.Y) - Center.Y;
-			const int64 DA = AX * AX + AY * AY, DB = BX * BX + BY * BY;
-			return DA != DB ? DA < DB : (A.Key.X != B.Key.X ? A.Key.X < B.Key.X : A.Key.Y < B.Key.Y);
+			// Distance measured in each key's OWN chunks, so levels interleave
+			// instead of the coarse ones queueing behind every fine one.
+			const auto Rank = [&Anchor, &Lead](const VoxelCoords::FVoxelLevelChunkKey& K)
+			{
+				const double Edge = VoxelCoords::ChunkEdgeUUForLevel(K.Level);
+				const FVector P = Anchor + Lead;
+				const int64 CX = int64(FMath::FloorToDouble(P.X / Edge));
+				const int64 CY = int64(FMath::FloorToDouble(P.Y / Edge));
+				const int64 DX = int64(K.Key.X) - CX, DY = int64(K.Key.Y) - CY;
+				return DX * DX + DY * DY;
+			};
+			const int64 DA = Rank(A), DB = Rank(B);
+			if (DA != DB) return DA < DB;
+			if (A.Level != B.Level) return A.Level < B.Level;
+			return A.Key.X != B.Key.X ? A.Key.X < B.Key.X : A.Key.Y < B.Key.Y;
 		});
 		if (PredictiveAssetQueue.Num() > QueueCap) PredictiveAssetQueue.SetNum(QueueCap);
 		const double QueueMs = (FPlatformTime::Seconds() - QueueStart) * 1000.0;
@@ -33708,6 +33924,18 @@ void UVoxelWorldSubsystem::Initialize(FSubsystemCollectionBase& Collection)
     }
 	Impl = MakeUnique<FVoxelWorldImpl>(Seed, TileDir, TileScale, FineTileDir, FineProviderId, FineBudgetBytes,
 	                                   FineRingRadius);
+	// THE RESOLVE CACHE'S OWN LIMITS, and the only one that has ever bound
+	// anything here is `pending`. Its default is EIGHT outstanding warm tokens,
+	// which silently outranks every launch and in-flight cap above it: a
+	// 2026-09-13 run at launchCap=64 / inFlightCap=256 refused 4,906,442
+	// launches for want of a token. Defaults below reproduce the constructor's
+	// own values exactly, so an arm that passes nothing is unchanged.
+	Impl->AssetResolveCache.setLimits(
+		size_t(FMath::Max(1, VoxelStreamAdmission::CVarVoxelResolveCacheEntries.GetValueOnGameThread())),
+		uint64(FMath::Max(1, VoxelStreamAdmission::CVarVoxelResolveCacheMB.GetValueOnGameThread())) * 1024ull * 1024ull,
+		uint64(FMath::Max(1, VoxelStreamAdmission::CVarVoxelResolveCacheEntryMB.GetValueOnGameThread())) * 1024ull * 1024ull,
+		size_t(FMath::Max(1, VoxelStreamAdmission::CVarVoxelResolveCacheEntries.GetValueOnGameThread())),
+		size_t(FMath::Max(1, VoxelStreamAdmission::CVarVoxelResolveCachePending.GetValueOnGameThread())));
 	Impl->EnvironmentObjectWorld=GetWorld();
 }
 
