@@ -84,8 +84,37 @@ Caps 4 and 8 are single runs; the max column especially should be repeated befor
 anyone quotes it, since cap 2's own two runs disagreed by 400 ms on exactly that
 statistic.
 
+## The pictures, and why the pixel statistic cannot judge them
+
+Three route captures at the eight authored stands: cap off, cap off AGAIN, and
+cap 8. The second control is the whole point — without it the armed numbers mean
+nothing.
+
+| stand | floor (off vs off) | arm (off vs cap 8) |
+|---|---|---|
+| 00 | 17.65% | 60.18% |
+| 01 | 16.70% | 47.28% |
+| 02 | 19.13% | 31.27% |
+| 03 | 42.57% | 72.03% |
+| 04 | 45.36% | 61.67% |
+| 05 | 40.68% | 54.32% |
+| 06 | 43.11% | 49.45% |
+| 07 | 29.84% | 45.15% |
+
+**The floor is 17–45% of pixels between two runs of the SAME configuration.** A
+route capture stops at a waypoint after a settle, and arrival position, streaming
+order and temporal accumulation all differ between runs; this is the large floor
+that moving captures on this project are known to have. The armed pair is higher
+at every stand, but at stand 06 it is 49.45% against a 43.11% floor, which is not
+a difference anyone can read as a defect.
+
+**So the pixel statistic detects that something differs and cannot say what.**
+The artifact for this decision is the pictures themselves, judged by the owner,
+with the two controls shown alongside so the floor is visible rather than
+described. Sent 2026-09-13.
+
 ## What would settle it
 
-A route capture pair — default against cap=2 — at the eight authored stands, plus
-a cap sweep at 2/4/8 read against the >300 ms rate and p95 together. The
-mechanism is built, instrumented on both sides, and off.
+The owner's verdict on those stands, and a repeat of the cap 4/8 runs — the max
+column especially, since cap 2's two runs disagreed by 400 ms on it. The
+mechanism is built, instrumented on both sides, swept, and off.
