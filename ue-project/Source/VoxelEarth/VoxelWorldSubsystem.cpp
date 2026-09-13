@@ -3687,6 +3687,15 @@ static TAutoConsoleVariable<int32> CVarVoxelStreamColdResolveCapPerTick(
 	     "resolve costs ~28.91 ms inline on the game thread, so this is the bound on the tail that "
 	     "prediction cannot reach."), ECVF_Default);
 
+// Serve the ring whose head nothing else draws before serving nearest-first.
+// See the pick loop for the measurement that motivated it. 0 = off, byte-identical.
+static TAutoConsoleVariable<int32> CVarVoxelStreamCoverageFirstPick(
+	TEXT("voxel.Stream.CoverageFirstPick"), 0,
+	TEXT("Before the ring-floor and nearest-first passes, pick the coarsest ring whose queue head "
+	     "is not covered by a resident coarser ancestor. Trades refinement for coverage while "
+	     "moving fast: no ring may starve while its ground is a hole. Gate: 'Voxel coverage "
+	     "(window): holes=' on a fast flight."), ECVF_Default);
+
 static TAutoConsoleVariable<int32> CVarVoxelResolveCachePending(
 	TEXT("voxel.Stream.ResolveCachePending"), 256,
 	TEXT("Outstanding predictive warm tokens the footprint resolve cache will issue. Eight is the "
@@ -10125,6 +10134,10 @@ struct FVoxelWorldImpl
 	// since-log ones, so a run's total per-ring dispatch is readable from the
 	// final log line alone.
 	int64 LevelJobsDispatchedSinceLog[VoxelCoords::kNumLevels] = {};
+	// Coverage-first picks per ring this window (see the pick loop). Printed on
+	// the ring dispatch line as coverageFirst= so a run can prove the pass
+	// engaged and say which ring it served.
+	int64 CoverageFirstPicksSinceLog[VoxelCoords::kNumLevels] = {};
 	int64 LevelJobsDispatchedTotal[VoxelCoords::kNumLevels] = {};
 	// --- Cold-start settle probe state (see VoxelStreamAdmission::
 	// ColdSettleEnabled for the design and the two traps it dodges). All of
@@ -14092,9 +14105,9 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	// 5s window, total= and load= are cumulative over the whole run.
 	UE_LOG(LogVoxelPerf, Log, TEXT("Voxel ring dispatch: %s"), *JoinPerLevel([&](int32 L)
 	       {
-		       return FString::Printf(TEXT("R%d disp=%lld total=%lld load=%lld zq=%lld"), L,
+		       return FString::Printf(TEXT("R%d disp=%lld total=%lld load=%lld zq=%lld coverageFirst=%lld"), L,
 		                              (long long)LevelJobsDispatchedSinceLog[L], (long long)LevelJobsDispatchedTotal[L],
-		                              (long long)LevelChunksLoadedTotal[L], (long long)LevelZeroQuadTotal[L]);
+		                              (long long)LevelChunksLoadedTotal[L], (long long)LevelZeroQuadTotal[L], (long long)CoverageFirstPicksSinceLog[L]);
 	       }));
 
 	// The disp= number above, split by ARM, plus each arm's in-flight count at
@@ -14196,6 +14209,10 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	for (int64& V : LevelJobsDispatchedSinceLog)
 	{
 		V = 0;
+	}
+	for (int64& C : CoverageFirstPicksSinceLog)
+	{
+		C = 0;
 	}
 	// The split-arm dispatch counters reset with the blended one above so all
 	// three always describe the same window (GpuMeshDispatchedByLevel could
@@ -26909,6 +26926,7 @@ void FVoxelWorldImpl::DispatchJobs()
 	// comment for the 24-vs-96 readout that fix removed).
 	const int32 MaxJobsInFlight = MaxJobsInFlightCap();
 	const bool bRingQuota = VoxelStreamAdmission::GetRingQuotaEnabled();
+	const bool bCoverageFirst = VoxelStreamAdmission::CVarVoxelStreamCoverageFirstPick.GetValueOnGameThread() != 0;
 	// voxel.Stream.RingFloorCpuOnly (default 0 = the blended behaviour below).
 	// Read once per call like every other gate in this loop; see the cvar's
 	// comment in VoxelDebug.cpp for the starvation mechanism and the paired
@@ -27162,7 +27180,57 @@ void FVoxelWorldImpl::DispatchJobs()
 		const double PickStart = FPlatformTime::Seconds();
 		TRACE_CPUPROFILER_EVENT_SCOPE(VoxelDispatch_Pick);
 		int32 PickLevel = INDEX_NONE;
-		if (bRingQuota)
+		// COVERAGE-FIRST PICK (voxel.Stream.CoverageFirstPick, default 0 = off).
+		//
+		// WHAT IT ANSWERS. At 20 m/s on a terrain-only flight the coverage
+		// probe read holes=1,000-2,900 of ~10,050 scanned columns per window --
+		// 10-29% of the ground uncovered -- while dispatch ran flat out at ~4,000
+		// chunks/s and the queues read R0-R3 at ZERO with R4-R7 at 1,000-3,500
+		// each. Nearest-first hands the fine rings the whole of a capped budget,
+		// and the ring that starves is the one whose chunks are the ONLY thing
+		// drawing their ground: a missing R7 chunk is a 410 m black square, a
+		// missing R0 chunk is 3.2 m of mip-pop. Refinement was being bought
+		// with holes.
+		//
+		// THE RULE: before the floor and nearest-first passes, scan the rings
+		// COARSEST first and take the first whose queue head is NOT already
+		// drawn by a resident coarser ancestor. That is the same predicate the
+		// cold-shading and cold-resolve caps use to decide a submit may WAIT --
+		// inverted: a chunk nothing else covers may not wait. For the coarsest
+		// active ring it is always true, which is the point: that ring is the
+		// floor of the whole cascade and it is cheap in count (a 20 m/s flight
+		// needs about one new R7 chunk a second once caught up).
+		//
+		// WHAT IT DOES NOT ASK, on purpose: whether resident FINER descendants
+		// draw the ground -- that walk is 4^k lookups and this runs per dispatch.
+		// So the coarsest ring is over-served by at most its own queue depth,
+		// which is bounded and measured (coverageFirst= on the ring line).
+		//
+		// COST: at most one TMap walk per ring per dispatch, short-circuiting on
+		// the first uncovered head, in the pick bracket where it will be seen.
+		//
+		// THE GATE that can fail: `Voxel coverage (window): holes=` on a 20 m/s
+		// terrain-only flight. It must fall from the 1,000-2,900 above toward
+		// zero; if it does not, the starvation was not the mechanism.
+		bool bCoveragePick = false;
+		if (bCoverageFirst)
+		{
+			for (int32 Level = VoxelCoords::kNumLevels - 1; Level >= 0; --Level)
+			{
+				if (PendingJobKeysByLevel[Level].Num() == 0 || Level == SplitHeldLevel)
+				{
+					continue;
+				}
+				if (!ColdShadingCoveredByCoarserAncestor(ChunkRecords, PendingJobKeysByLevel[Level].Last().Key))
+				{
+					PickLevel = Level;
+					bCoveragePick = true;
+					++CoverageFirstPicksSinceLog[Level];
+					break;
+				}
+			}
+		}
+		if (bRingQuota && !bCoveragePick)
 		{
 			const int32* const Floors = VoxelStreamAdmission::GetRingSlotFloors();
 			int32 BestDeficit = 0;
@@ -27195,7 +27263,7 @@ void FVoxelWorldImpl::DispatchJobs()
 		// Whether the ring-quota pass chose this pick. Latched here, before the
 		// nearest-first pass can overwrite PickLevel, because the CPU-only mode
 		// pins floor-deficit picks to the CPU arm at the fork below.
-		const bool bFloorDeficitPick = (PickLevel != INDEX_NONE);
+		const bool bFloorDeficitPick = (PickLevel != INDEX_NONE) && !bCoveragePick;
 		if (PickLevel == INDEX_NONE)
 		{
 			double BestDistSq = 0.0;
