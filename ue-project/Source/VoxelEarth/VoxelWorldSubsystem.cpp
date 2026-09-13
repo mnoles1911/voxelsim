@@ -3642,6 +3642,17 @@ static TAutoConsoleVariable<int32> CVarVoxelPredictiveCoarseLevels(
 // arm that also raised them to 512 MiB total and 32 MiB per entry measured p99
 // 113.91 against this configuration's 109.92, i.e. the extra 448 MiB bought
 // nothing and is not being spent.
+// THE COLD RESOLVE CAP. Default 0 = off: a control arm is byte-identical, and
+// this is a TRADE (refinement delayed for a bounded tick) rather than a free
+// win, so it does not get a default until its two sides have been measured
+// against each other. See the decision site in the dispatch loop.
+static TAutoConsoleVariable<int32> CVarVoxelStreamColdResolveCapPerTick(
+	TEXT("voxel.Stream.ColdResolveCapPerTick"), 0,
+	TEXT("At most N cold asset-resolve submits per streaming tick; the excess WAITS a tick, but "
+	     "only where a coarser ancestor is resident and holds terrain. 0 = off. A cold coarse "
+	     "resolve costs ~28.91 ms inline on the game thread, so this is the bound on the tail that "
+	     "prediction cannot reach."), ECVF_Default);
+
 static TAutoConsoleVariable<int32> CVarVoxelResolveCachePending(
 	TEXT("voxel.Stream.ResolveCachePending"), 256,
 	TEXT("Outstanding predictive warm tokens the footprint resolve cache will issue. Eight is the "
@@ -9901,6 +9912,10 @@ struct FVoxelWorldImpl
 	// tick. NOT reset at the window edge (MaybeLogCounters can run mid-tick and
 	// zeroing it there would silently drop a burst in progress).
 	int32 ColdShadingsThisTick = 0;
+	// The cold-resolve cap's twin of the above: resolves this tick WILL pay,
+	// counted where they are paid rather than where they are decided.
+	int32 ColdResolvesThisTick = 0;
+	uint64 ColdResolveDeferredSinceLog = 0, ColdResolveExemptSinceLog = 0;
 	// Window totals. ColdTotalSinceLog is counted at the ++ site, not summed
 	// from the fold, so it stays honest even if a submit ever happens outside
 	// the folded block -- and coverable + holeRisk is incremented at that SAME
@@ -12456,6 +12471,7 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 		}
 		ColdCapDeferredThisTick = 0;
 		ColdShadingsThisTick = 0;
+		ColdResolvesThisTick = 0;
 
 		++AccumTicks;
 	}
@@ -15609,6 +15625,19 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       (long long)ColdByLevelSinceLog[2], (long long)ColdByLevelSinceLog[3],
 	       (long long)ColdByLevelSinceLog[4], (long long)ColdByLevelSinceLog[5],
 	       (long long)ColdByLevelSinceLog[6], (long long)ColdByLevelSinceLog[7]);
+	// ITS OWN LINE rather than four more fields on the census above, because the
+	// two caps are independent and a reader must be able to tell which one
+	// deferred a chunk. Prints whenever the cap is armed OR anything was
+	// deferred, so an arm that silently stopped engaging is visible as a line
+	// that keeps printing zeros rather than as no line at all.
+	if (VoxelStreamAdmission::CVarVoxelStreamColdResolveCapPerTick.GetValueOnGameThread() > 0 ||
+	    ColdResolveDeferredSinceLog > 0 || ColdResolveExemptSinceLog > 0)
+	{
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("Voxel cold resolve cap (window): cap=%d deferred=%llu exempt=%llu"),
+		       VoxelStreamAdmission::CVarVoxelStreamColdResolveCapPerTick.GetValueOnGameThread(),
+		       (long long)ColdResolveDeferredSinceLog, (long long)ColdResolveExemptSinceLog);
+	}
 	static_assert(VoxelCoords::kNumLevels == 8,
 	              "the coldByLevel print spells 8 slots; respell it with the level count");
 
@@ -17512,6 +17541,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	// ColdShadingsThisTick is not: it is per-tick working state cleared at the
 	// fold, and this function can run part-way through a tick.
 	ColdCapDeferredSinceLog = ColdCapDeferredTicksSinceLog = ColdCapExemptSinceLog = 0;
+	ColdResolveDeferredSinceLog = ColdResolveExemptSinceLog = 0;
 	AccumBrickFlushMs = 0.0;
 	AccumSpecDispatchMs = AccumSpecEnumerateMs = AccumSpecParkMs = 0.0;
 	AccumTicks = 0;
@@ -26845,6 +26875,21 @@ void FVoxelWorldImpl::DispatchJobs()
 	// priority argument are after the pop loop.
 	TArray<FSortEntry> DeferredColdShadingCap[VoxelCoords::kNumLevels];
 
+	// THE SAME HOLD, FOR A COLD ASSET RESOLVE RATHER THAN A COLD SHADING, and
+	// it exists because the resolve is the larger of the two by an order of
+	// magnitude. Measured 2026-09-13: a cold COARSE footprint resolve costs
+	// 28.91 ms on the game thread, worst single call 526 ms, and sixty of them
+	// in one frame is the 277 ms p99 hitch. Prewarming now covers coarse levels
+	// and halved the count, but the extreme tail did not move -- a resolve
+	// demanded in the frame it is needed cannot be predicted, only bounded.
+	//
+	// Same hold, same requeue, same hole-safety argument, and the argument is
+	// the load-bearing part: a fine submit may wait ONLY while a coarser
+	// ancestor is resident and holds terrain, because that ancestor is what the
+	// marcher falls through to and draws meanwhile. A chunk with nothing coarser
+	// over it is never deferred; it pays and is counted as exempt.
+	TArray<FSortEntry> DeferredColdResolveCap[VoxelCoords::kNumLevels];
+
 	// -VoxelColdBandDeferPark: release parked column-mates whose seeding mark
 	// has cleared or aged out, BEFORE the pop loop so they are dispatchable in
 	// this same tick -- the same latency the default re-queue path has (its
@@ -27689,6 +27734,55 @@ void FVoxelWorldImpl::DispatchJobs()
 				// cap or no cap; counting it here is what makes the exemption
 				// visible instead of an assumption about the census's 0-5%.
 				++ColdCapExemptSinceLog;
+			}
+		}
+
+		// THE COLD *RESOLVE* CAP. voxel.Stream.ColdResolveCapPerTick, default 0
+		// = off, so a control arm is byte-identical.
+		//
+		// WHAT IT IS FOR. The asset resolve behind a GPU submit costs 3.77 ms
+		// cold at level 0 and 28.91 ms cold at a coarse level, worst single call
+		// 526 ms, all of it inline on the game thread
+		// (docs/measurements/submit-cold-resolve-2026-09-13/). Warming ahead now
+		// covers coarse footprints and halved the count, but frames over 300 ms
+		// did not move: a resolve first asked for in the frame it is needed
+		// cannot be predicted. It can only be BOUNDED, and this is the bound --
+		// at a cap of 2, a tick pays at most about 58 ms of resolve instead of
+		// the 277 ms a p99 frame was measured paying.
+		//
+		// THE TEST IS A HASH LOOKUP, NOT A RESOLVE. `contains` asks whether the
+		// answer is already cached; it never computes one. Getting that wrong
+		// would make the instrument into the cost it is measuring, which is a
+		// recorded failure on this exact path.
+		//
+		// HOLE SAFETY IS BY CONSTRUCTION, exactly as it is for cold shading
+		// above: a submit may wait only while a COARSER ancestor is resident and
+		// holds terrain right now, which is what the marcher falls through to
+		// and draws while the fine one waits. The visible cost is a bounded
+		// mip-pop. A cold submit with nothing coarser over it is never deferred.
+		//
+		// AND IT IS A TRADE, NOT A WIN, which is why both sides are counted:
+		// deferred= is refinement delayed, and a cap set too low trades a hitch
+		// for visible coarse ground. Read deferred= against the tail it bought.
+		const int32 ColdResolveCap = VoxelStreamAdmission::CVarVoxelStreamColdResolveCapPerTick.GetValueOnGameThread();
+		if (ColdResolveCap > 0 && bUseGpuMesh)
+		{
+			SyncAssetResolveCache();
+			if (!AssetResolveCache.contains(ResolveKeyOf(LevelKey)))
+			{
+				if (ColdResolvesThisTick >= ColdResolveCap)
+				{
+					if (ColdShadingCoveredByCoarserAncestor(ChunkRecords, LevelKey))
+					{
+						DeferredColdResolveCap[PickLevel].Add(PoppedEntry);
+						++ColdResolveDeferredSinceLog;
+						continue;
+					}
+					++ColdResolveExemptSinceLog;
+				}
+				// Counted where it is PAID, whether under the cap or exempt from
+				// it, so the counter keeps meaning "resolves this tick will do".
+				++ColdResolvesThisTick;
 			}
 		}
 
@@ -28832,6 +28926,10 @@ void FVoxelWorldImpl::DispatchJobs()
 		if (DeferredColdShadingCap[Level].Num() > 0)
 		{
 			PendingJobKeysByLevel[Level].Append(DeferredColdShadingCap[Level]);
+		}
+		if (DeferredColdResolveCap[Level].Num() > 0)
+		{
+			PendingJobKeysByLevel[Level].Append(DeferredColdResolveCap[Level]);
 		}
 	}
 
