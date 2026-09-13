@@ -3646,6 +3646,15 @@ static TAutoConsoleVariable<int32> CVarVoxelPredictiveCoarseLevels(
 // this is a TRADE (refinement delayed for a bounded tick) rather than a free
 // win, so it does not get a default until its two sides have been measured
 // against each other. See the decision site in the dispatch loop.
+// THE BUDGET, in whole milliseconds, and it is the better bound of the two: a
+// count cannot bind a frame when the things it counts differ 7.7x in cost.
+// Default 0 = off.
+static TAutoConsoleVariable<int32> CVarVoxelStreamColdResolveBudgetMsPerTick(
+	TEXT("voxel.Stream.ColdResolveBudgetMsPerTick"), 0,
+	TEXT("Millisecond budget for cold asset resolves in one streaming tick; past it, submits wait "
+	     "a tick where a coarser ancestor covers. Bounds the tick at roughly budget + one resolve, "
+	     "because the first resolve of a tick always goes through. 0 = off."), ECVF_Default);
+
 static TAutoConsoleVariable<int32> CVarVoxelStreamColdResolveCapPerTick(
 	TEXT("voxel.Stream.ColdResolveCapPerTick"), 0,
 	TEXT("At most N cold asset-resolve submits per streaming tick; the excess WAITS a tick, but "
@@ -9915,7 +9924,19 @@ struct FVoxelWorldImpl
 	// The cold-resolve cap's twin of the above: resolves this tick WILL pay,
 	// counted where they are paid rather than where they are decided.
 	int32 ColdResolvesThisTick = 0;
+	// THE SAME BUDGET IN MILLISECONDS, because a COUNT is a poor proxy for the
+	// cost it is meant to bound. A cold coarse resolve is 28.91 ms and a cold
+	// level-0 one 3.77, so "8 per tick" is anything from 30 to 231 ms -- and at
+	// 9.5 m/s with the count cap at 8 the 100-300 ms game-thread band still
+	// reads SubAssetsMs 87.12 of 144.23, which is the count cap failing to bind.
+	// Accumulated where the resolve is PAID, in ResolvedAssetsForFootprint, and
+	// only for the submit caller.
+	// mutable for the same reason AssetResolveCallerStats is: the resolve that
+	// pays is reached through a const query path, and a meter that cannot be
+	// written from where the cost happens is a meter about somewhere else.
+	mutable double ColdResolveMsThisTick = 0.0;
 	uint64 ColdResolveDeferredSinceLog = 0, ColdResolveExemptSinceLog = 0;
+	uint64 ColdResolveBudgetDeferredSinceLog = 0;
 	// Window totals. ColdTotalSinceLog is counted at the ++ site, not summed
 	// from the fold, so it stays honest even if a submit ever happens outside
 	// the folded block -- and coverable + holeRisk is incremented at that SAME
@@ -12472,6 +12493,7 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 		ColdCapDeferredThisTick = 0;
 		ColdShadingsThisTick = 0;
 		ColdResolvesThisTick = 0;
+		ColdResolveMsThisTick = 0.0;
 
 		++AccumTicks;
 	}
@@ -15631,12 +15653,15 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	// deferred, so an arm that silently stopped engaging is visible as a line
 	// that keeps printing zeros rather than as no line at all.
 	if (VoxelStreamAdmission::CVarVoxelStreamColdResolveCapPerTick.GetValueOnGameThread() > 0 ||
+	    VoxelStreamAdmission::CVarVoxelStreamColdResolveBudgetMsPerTick.GetValueOnGameThread() > 0 ||
 	    ColdResolveDeferredSinceLog > 0 || ColdResolveExemptSinceLog > 0)
 	{
 		UE_LOG(LogVoxelPerf, Log,
-		       TEXT("Voxel cold resolve cap (window): cap=%d deferred=%llu exempt=%llu"),
+		       TEXT("Voxel cold resolve cap (window): cap=%d budgetMs=%d deferred=%llu ofWhichBudget=%llu exempt=%llu"),
 		       VoxelStreamAdmission::CVarVoxelStreamColdResolveCapPerTick.GetValueOnGameThread(),
-		       (long long)ColdResolveDeferredSinceLog, (long long)ColdResolveExemptSinceLog);
+		       VoxelStreamAdmission::CVarVoxelStreamColdResolveBudgetMsPerTick.GetValueOnGameThread(),
+		       (long long)ColdResolveDeferredSinceLog, (long long)ColdResolveBudgetDeferredSinceLog,
+		       (long long)ColdResolveExemptSinceLog);
 	}
 	static_assert(VoxelCoords::kNumLevels == 8,
 	              "the coldByLevel print spells 8 slots; respell it with the level count");
@@ -17541,7 +17566,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	// ColdShadingsThisTick is not: it is per-tick working state cleared at the
 	// fold, and this function can run part-way through a tick.
 	ColdCapDeferredSinceLog = ColdCapDeferredTicksSinceLog = ColdCapExemptSinceLog = 0;
-	ColdResolveDeferredSinceLog = ColdResolveExemptSinceLog = 0;
+	ColdResolveDeferredSinceLog = ColdResolveExemptSinceLog = ColdResolveBudgetDeferredSinceLog = 0;
 	AccumBrickFlushMs = 0.0;
 	AccumSpecDispatchMs = AccumSpecEnumerateMs = AccumSpecParkMs = 0.0;
 	AccumTicks = 0;
@@ -20324,6 +20349,11 @@ const std::vector<vxc::AssetField::ResolvedAssetInstance>* FVoxelWorldImpl::Reso
     CallerStats.RawResolveMs+=RawResolveMs;CallerStats.MaxRawResolveMs=FMath::Max(CallerStats.MaxRawResolveMs,RawResolveMs);
     if(Level==0){++CallerStats.ColdMissLevel0;CallerStats.RawResolveLevel0Ms+=RawResolveMs;}
     else{++CallerStats.ColdMissCoarse;CallerStats.RawResolveCoarseMs+=RawResolveMs;}
+    // The millisecond budget's meter. Only the submit caller, because that is
+    // the one the cap defers; admission and the edited-page path are not
+    // deferrable and charging them would spend a budget on work the cap cannot
+    // decline.
+    if(Caller==EAssetResolveCaller::GpuSubmit)ColdResolveMsThisTick+=RawResolveMs;
     VoxelStreamAdmission::GAssetResolveInline.fetch_add(1,std::memory_order_relaxed);
     VoxelStreamAdmission::GAssetResolveGameThreadUs.fetch_add(int64((FPlatformTime::Seconds()-Started)*1e6),std::memory_order_relaxed);
     if(VoxelStreamAdmission::AsyncAssetResolveEnabled()){
@@ -27765,12 +27795,33 @@ void FVoxelWorldImpl::DispatchJobs()
 		// deferred= is refinement delayed, and a cap set too low trades a hitch
 		// for visible coarse ground. Read deferred= against the tail it bought.
 		const int32 ColdResolveCap = VoxelStreamAdmission::CVarVoxelStreamColdResolveCapPerTick.GetValueOnGameThread();
-		if (ColdResolveCap > 0 && bUseGpuMesh)
+		const int32 ColdResolveBudget = VoxelStreamAdmission::CVarVoxelStreamColdResolveBudgetMsPerTick.GetValueOnGameThread();
+		if ((ColdResolveCap > 0 || ColdResolveBudget > 0) && bUseGpuMesh)
 		{
 			SyncAssetResolveCache();
 			if (!AssetResolveCache.contains(ResolveKeyOf(LevelKey)))
 			{
-				if (ColdResolvesThisTick >= ColdResolveCap)
+				// The budget binds FIRST when it is armed, because it is the
+				// one that bounds the frame rather than the call count. The
+				// first cold resolve of a tick always goes through -- nothing
+				// has been spent yet -- so the tick is bounded by roughly
+				// budget + one resolve, which is the honest guarantee and is
+				// what the counter below should be read against.
+				const double ColdResolveBudgetMs =
+					double(VoxelStreamAdmission::CVarVoxelStreamColdResolveBudgetMsPerTick.GetValueOnGameThread());
+				const bool bOverBudget = ColdResolveBudgetMs > 0.0 && ColdResolveMsThisTick >= ColdResolveBudgetMs;
+				if (bOverBudget)
+				{
+					if (ColdShadingCoveredByCoarserAncestor(ChunkRecords, LevelKey))
+					{
+						DeferredColdResolveCap[PickLevel].Add(PoppedEntry);
+						++ColdResolveDeferredSinceLog;
+						++ColdResolveBudgetDeferredSinceLog;
+						continue;
+					}
+					++ColdResolveExemptSinceLog;
+				}
+				if (ColdResolveCap > 0 && ColdResolvesThisTick >= ColdResolveCap)
 				{
 					if (ColdShadingCoveredByCoarserAncestor(ChunkRecords, LevelKey))
 					{

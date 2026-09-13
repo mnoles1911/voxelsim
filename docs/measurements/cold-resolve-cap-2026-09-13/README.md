@@ -139,6 +139,38 @@ is the one being bought.
 That matters for the decision: this cap is worth most exactly where the slice is
 furthest from its target, and worth least standing still.
 
+## A count is the wrong bound, and a millisecond budget is better but not sufficient
+
+With the count cap at 8 and the pawn at 9.5 m/s, the 100–300 ms GAME-THREAD band
+still reads `SubAssetsMs` **87.12 ms** of a 144.23 ms game thread. That is the
+count cap failing to bind: a cold coarse resolve is 28.91 ms and a level-0 one
+3.77, so "8 per tick" is anything between 30 and 231 ms.
+
+`voxel.Stream.ColdResolveBudgetMsPerTick` bounds the same thing in milliseconds.
+At 9.5 m/s, all three arms on the same route:
+
+| | cap off | count cap 8 | **budget 20 ms** |
+|---|---|---|---|
+| frame p50 | 20.61 | 18.33 | 20.22 |
+| frame p95 | 168.73 | 160.67 | **148.82** |
+| frame p99 | 392.42 | 284.69 | **261.00** |
+| frame max | 1655.40 | 1626.57 | 1742.37 |
+| over 33.3 ms | 20.95% | 20.31% | **24.35%** |
+| over 100 ms | 7.98% | **10.33%** | 8.24% |
+| over 300 ms | 2.12% | **0.67%** | 0.98% |
+| SubAssetsMs in the 100–300 ms band | 89.21 | 87.12 | **79.94** |
+
+**The budget wins p95, p99 and the over-100 ms rate; the count cap wins over-300
+ms.** They bound different things, which is what the sweep already suggested.
+
+**And neither bounds the band to its nominal figure.** A 20 ms budget should give
+roughly "budget + one resolve" — about 49 ms — and the band still reads 79.94.
+The most likely reason is that the budget resets per streaming TICK while these
+figures are per FRAME, so a frame containing more than one tick pays the budget
+more than once. That is a check, not a conclusion: count ticks per frame before
+believing it, and if it holds, the budget belongs on the frame rather than the
+tick.
+
 ## What would settle it
 
 The owner's verdict on those stands, and a repeat of the cap 4/8 runs — the max
