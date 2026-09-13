@@ -102,9 +102,24 @@ template<int B, int CraftRefinement = 3>
 class WorldQueryBatch {
 public:
     explicit WorldQueryBatch(const World<B,CraftRefinement>& world):world_(world) {}
+    // THE ONE THING A RETAINED SHORTLIST CAN GET WRONG. What a prepared query
+    // caches is which asset INSTANCES overlap the rect -- nothing else. Edits
+    // stay live (materialAt consults editedBricks before it reaches the
+    // entries) and the amplifier is a pure function of the column, so the only
+    // way a kept query can answer from a world that no longer exists is if the
+    // asset field itself is reconfigured underneath it. That has a signal
+    // already: AssetField::configurationRevision, bumped by changed() on every
+    // mutating setter. Capturing it here is what lets a caller hold a batch
+    // across frames instead of rebuilding one per frame to be safe.
+    uint64_t fieldRevision() const {
+        const auto* field=world_.assetField();
+        return field?field->configurationRevision():0;
+    }
     const WorldQuery<B,CraftRefinement>& prepare(AssetVoxelRect rect) {
-        if(query_ && rect.valid() && rect.vx0>=covered_.vx0 && rect.vy0>=covered_.vy0 &&
+        if(query_ && revision_==fieldRevision() && rect.valid() &&
+            rect.vx0>=covered_.vx0 && rect.vy0>=covered_.vy0 &&
             rect.vx1<=covered_.vx1 && rect.vy1<=covered_.vy1) return *query_;
+        revision_=fieldRevision();
         covered_=rect;
         constexpr int64_t margin=32;
         constexpr int64_t limit=std::numeric_limits<int64_t>::max()/kVoxelSizeMm-INT32_MAX;
@@ -122,5 +137,6 @@ private:
     AssetVoxelRect covered_{1,1,0,0};
     std::unique_ptr<WorldQuery<B,CraftRefinement>> query_;
     size_t preparations_=0;
+    uint64_t revision_=0;
 };
 } // namespace vxc

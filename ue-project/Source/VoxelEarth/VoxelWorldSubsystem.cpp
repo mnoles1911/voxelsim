@@ -35286,6 +35286,59 @@ static TAutoConsoleVariable<bool> CVarVoxelFrameAssetShortlist(
 	TEXT("movement tick. 0 restores the previous per-call standalone path and is the control arm."),
 	ECVF_Default);
 
+// The clipmap's underground-roof probe on the same shared shortlist. Separate
+// from the cvar above so the two can be A/B'd apart: this one changes WHICH
+// callers share, not whether sharing exists, and it is the only game-thread
+// query left that still built its own. Requires the frame shortlist to be on.
+static TAutoConsoleVariable<bool> CVarVoxelRoofProbeShortlist(
+	TEXT("voxel.Collision.RoofProbeShortlist"), true,
+	TEXT("Let the underground-roof probe use the frame's prepared asset shortlist instead of ")
+	TEXT("building its own for a one-voxel column. 0 restores the standalone query and is the ")
+	TEXT("control arm. Read VoxelStream/CollisionPreparations with it: the change is only a win ")
+	TEXT("if preparations stay at 1 per frame."),
+	ECVF_Default);
+
+// THE SHORTLIST KEPT ACROSS FRAMES, not rebuilt once per frame.
+//
+// After the frame shortlist landed, ONE prepare a frame serves the movement
+// sweep, the ocean's camera test and the ripple watcher together -- and that
+// single prepare is now the largest item on the game thread at 3.69 ms
+// (walk 52/53, 2026-09-11). It is rebuilt every frame only because the batch is
+// keyed by frame counter, which was the conservative choice while nothing had
+// established what a kept batch could get wrong.
+//
+// What it can get wrong is exactly one thing: the set of asset instances
+// overlapping the rect. Edits are live (the overlay is consulted before the
+// entries), the amplifier is a pure function of the column, and the asset field
+// carries configurationRevision, bumped by every mutating setter. So the guard
+// lives in WorldQueryBatch::prepare -- a kept query is reused only while the
+// revision is unchanged AND the asked rect is inside the covered one, which
+// carries a 32-voxel margin. At 2.2 m/s that margin is crossed about every 1.5 s
+// rather than every frame.
+//
+// 0 restores per-frame rebuilds and is the control arm.
+static TAutoConsoleVariable<bool> CVarVoxelShortlistAcrossFrames(
+	TEXT("voxel.Collision.ShortlistAcrossFrames"), true,
+	TEXT("Keep the frame asset shortlist between frames, rebuilding only when the camera leaves ")
+	TEXT("the covered rect or the asset field's configuration revision changes. 0 rebuilds once ")
+	TEXT("per frame and is the control arm."),
+	ECVF_Default);
+
+// One place where the frame batch is created, so the three callers that share it
+// cannot drift apart on the retention rule.
+static vxc::WorldQueryBatch<VoxelCoords::BrickEdgeVoxels>& EnsureFrameQueryBatch(FVoxelWorldImpl& WorldImpl)
+{
+	if (!WorldImpl.FrameQueries ||
+	    (!CVarVoxelShortlistAcrossFrames.GetValueOnGameThread() &&
+	     WorldImpl.FrameQueriesFrame != GFrameCounter))
+	{
+		WorldImpl.FrameQueries =
+			MakeUnique<vxc::WorldQueryBatch<VoxelCoords::BrickEdgeVoxels>>(WorldImpl.Voxels);
+	}
+	WorldImpl.FrameQueriesFrame = GFrameCounter;
+	return *WorldImpl.FrameQueries;
+}
+
 bool UVoxelWorldSubsystem::IsSolidAtVoxel(int64 Vx, int64 Vy, int64 Vz) const
 {
 	if (!Impl)
@@ -35320,13 +35373,7 @@ bool UVoxelWorldSubsystem::IsSolidAtVoxel(int64 Vx, int64 Vy, int64 Vz) const
         auto* Batch = Impl->MovementCollisionQueries.Get();
         if (CVarVoxelFrameAssetShortlist.GetValueOnGameThread())
         {
-            if (!Impl->FrameQueries || Impl->FrameQueriesFrame != GFrameCounter)
-            {
-                Impl->FrameQueries =
-                    MakeUnique<vxc::WorldQueryBatch<VoxelCoords::BrickEdgeVoxels>>(Impl->Voxels);
-                Impl->FrameQueriesFrame = GFrameCounter;
-            }
-            Batch = Impl->FrameQueries.Get();
+            Batch = &EnsureFrameQueryBatch(*Impl);
             CSV_CUSTOM_STAT(VoxelStream, FrameShortlistPointCalls, 1, ECsvCustomStatOp::Accumulate);
         }
         if (Batch == nullptr)
@@ -35456,12 +35503,7 @@ bool UVoxelWorldSubsystem::FindFirstSolidVoxelSlice(const int64 (&Min)[3], const
     // query fall inside an already-covered region.
     if (IsInGameThread() && CVarVoxelFrameAssetShortlist.GetValueOnGameThread())
     {
-        if (!Impl->FrameQueries || Impl->FrameQueriesFrame != GFrameCounter)
-        {
-            Impl->FrameQueries =
-                MakeUnique<vxc::WorldQueryBatch<VoxelCoords::BrickEdgeVoxels>>(Impl->Voxels);
-            Impl->FrameQueriesFrame = GFrameCounter;
-        }
+        EnsureFrameQueryBatch(*Impl);
     }
     auto& Queries =
         (IsInGameThread() && CVarVoxelFrameAssetShortlist.GetValueOnGameThread() && Impl->FrameQueries)
@@ -35502,8 +35544,48 @@ int32 UVoxelWorldSubsystem::CountUndergroundRoofSamples(const FVector& CameraUU,
 	if (!Impl || StepUU <= 0 || MaxUU < StepUU || MaxUU / StepUU > 128 || StopAfter <= 0) return 0;
 	const int64 X = FMath::FloorToInt64(CameraUU.X / VoxelCoords::VoxelSizeUU);
 	const int64 Y = FMath::FloorToInt64(CameraUU.Y / VoxelCoords::VoxelSizeUU);
-	const vxc::WorldQuery<VoxelCoords::BrickEdgeVoxels> Query(Impl->Voxels, {X,Y,X,Y});
+	// THE SHORTLIST, NOT A FRESH ONE PER FRAME. This probe walks up to 128
+	// column samples, and until now it built its own `WorldQuery` to do it --
+	// which means an `instancesForRect` plus a `resolveForCompose` per instance
+	// every frame, for a rect one voxel wide. That is the same standalone asset
+	// resolve that cost the ocean and the ripple watcher about 4 ms each until
+	// 2026-09-11, measured then at ~4 ms for ONE point query; this one is the
+	// last game-thread caller that still paid it.
+	//
+	// The frame batch is prepared by whoever asks widest -- the movement sweep's
+	// slab -- and `WorldQueryBatch::prepare` hands back that shortlist free for
+	// any rect contained in it. The camera column is contained in the pawn's
+	// sweep slab whenever the camera sits on the pawn.
+	//
+	// WHAT MUST BE CHECKED, not assumed: if the camera column falls OUTSIDE the
+	// prepared rect, prepare rebuilds, and a second rebuild per frame costs what
+	// the first one does -- that is exactly how the first cut of the shared
+	// shortlist turned an 8 ms saving into 5 (CollisionPreparations 1 -> 2). So
+	// the gate on this change is `VoxelStream/CollisionPreparations` staying at
+	// 1 per frame, and the counter below says which path was taken.
+	//
+	// 0 restores the standalone query and is the control arm.
 	int32 Count = 0;
+	const bool bShared = IsInGameThread() && CVarVoxelRoofProbeShortlist.GetValueOnGameThread()
+	                   && CVarVoxelFrameAssetShortlist.GetValueOnGameThread();
+	if (bShared)
+	{
+		auto& Batch = EnsureFrameQueryBatch(*Impl);
+		const auto PreviousPreparations = Batch.preparationCount();
+		const auto& Query = Batch.prepare({X,Y,X,Y});
+		CSV_CUSTOM_STAT(VoxelStream, CollisionPreparations,
+		                int32(Batch.preparationCount()-PreviousPreparations),
+		                ECsvCustomStatOp::Accumulate);
+		CSV_CUSTOM_STAT(VoxelStream, RoofProbeSharedCalls, 1, ECsvCustomStatOp::Accumulate);
+		for (double Up = StepUU; Up <= MaxUU; Up += StepUU)
+		{
+			const int64 Z = FMath::FloorToInt64((CameraUU.Z + Up) / VoxelCoords::VoxelSizeUU);
+			if (Query.undergroundRoofAt(X,Y,Z) && ++Count >= StopAfter) break;
+		}
+		return Count;
+	}
+	CSV_CUSTOM_STAT(VoxelStream, RoofProbeStandaloneCalls, 1, ECsvCustomStatOp::Accumulate);
+	const vxc::WorldQuery<VoxelCoords::BrickEdgeVoxels> Query(Impl->Voxels, {X,Y,X,Y});
 	for (double Up = StepUU; Up <= MaxUU; Up += StepUU)
 	{
 		const int64 Z = FMath::FloorToInt64((CameraUU.Z + Up) / VoxelCoords::VoxelSizeUU);
