@@ -27842,7 +27842,24 @@ void FVoxelWorldImpl::DispatchJobs()
 		// for visible coarse ground. Read deferred= against the tail it bought.
 		const int32 ColdResolveCap = VoxelStreamAdmission::CVarVoxelStreamColdResolveCapPerTick.GetValueOnGameThread();
 		const int32 ColdResolveBudget = VoxelStreamAdmission::CVarVoxelStreamColdResolveBudgetMsPerTick.GetValueOnGameThread();
-		if ((ColdResolveCap > 0 || ColdResolveBudget > 0) && bUseGpuMesh)
+		// A CHUNK IS COLD ONLY IF A RESOLVE WOULD ACTUALLY BE PAID, and that is
+		// the bug this guard closes. The first version asked the cache alone:
+		// "is this footprint cached?" In a world with NO asset field the submit
+		// never resolves anything, the cache never holds anything, and so every
+		// chunk read as cold -- after eight per tick the whole queue was popped,
+		// deferred and requeued, every tick. Measured 2026-09-13 on a terrain-only
+		// flight at 20 m/s: deferred=552,861 in ONE window, dispatch pinned at
+		// exactly 8.00 per tick for seventeen windows, per-dispatch cost 0.085 ->
+		// 0.8 ms of churn, and a kilometre-wide crater around the player where
+		// the near field was never built. The same leg with the cap off: 3,999.9
+		// chunks/s and an intact world. The predicate below is the one the
+		// submit path itself uses before it resolves (AField && !AField->empty()),
+		// plus the cache being enabled at all -- a disabled cache also misses
+		// forever, for the same reason.
+		const vxc::AssetField* CapField = Voxels.assetField();
+		const bool bResolveWouldBePaid = CapField && !CapField->empty() &&
+			AssetResolveCache.epoch() != UINT64_MAX;
+		if ((ColdResolveCap > 0 || ColdResolveBudget > 0) && bUseGpuMesh && bResolveWouldBePaid)
 		{
 			SyncAssetResolveCache();
 			if (!AssetResolveCache.contains(ResolveKeyOf(LevelKey)))

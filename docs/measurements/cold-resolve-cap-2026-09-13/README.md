@@ -1,5 +1,24 @@
 # Capping cold resolves per tick halves the worst frames' FREQUENCY, and costs the middle
 
+> **REGRESSION AND FIX, 2026-09-13 (evening). The cap as first shipped put a
+> crater around the player in any world WITHOUT an asset field.** It asked the
+> cache alone — "is this footprint cached?" — and in a terrain-only world the
+> submit never resolves anything, the cache never holds anything, and so every
+> chunk read as cold. After eight per tick the entire queue was popped, deferred
+> and requeued, every tick: `deferred=552,861` in one 2-second window, dispatch
+> pinned at **exactly 8.00 per tick** for seventeen windows, per-dispatch cost
+> 0.085 → 0.8 ms of churn, and a kilometre-wide hole in the near field at 20 m/s.
+> The owner found it in a moving capture. The same leg with the cap off:
+> 3,999.9 chunks/s and an intact world.
+>
+> The guard mirrors the submit path's own predicate — a chunk is cold only if
+> `assetField() && !empty()` and the cache is enabled. With it, the same leg at
+> the shipped default reads `deferred=0` every window, 3,861 chunks/s, 56 fps,
+> `cutoffM=-1`, and the owner's live spot-check: "mostly no longer any holes as
+> the player flies forward". The ecology world was never affected by this
+> particular fault (its cache is real), which is why reverting the cap there
+> changed nothing — the ecology collapse is a separate, pre-existing problem.
+
 Built tonight after the cold-resolve diagnosis
 (`docs/measurements/submit-cold-resolve-2026-09-13/`) showed that halving cold
 misses by warming ahead left frames over 300 ms untouched — a resolve first asked
