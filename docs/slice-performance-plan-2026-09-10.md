@@ -267,16 +267,36 @@ work that is plain waste rather than a trade, and it is now the highest-value ga
 Sub-scopes are in the source to split each of the two into its parts; the capture that reads them
 is running.
 
-### Phase 2 — kill the submit hitches
+### Phase 2 — kill the submit hitches — **DIAGNOSED 2026-09-12, from captures already on disk**
 
 p99 is 350.90 ms and the worst frame is 1.65 s, all of it game-thread time inside GPU submit while
 the GPU sits idle. This is the worst thing a player would feel, and it is worth more to the
 experience than several milliseconds of median.
 
-Start from the two existing documents on this failure class rather than from scratch. The specific
-question to answer first is why a submit blocks the game thread for over a second when the same
-counter reads 0.086 ms at median: what is being uploaded, how large it is, and whether it can be
-split across frames or moved off the game thread.
+**It is `VoxelStream/SubmitMs`, and it is still there on the current binary.** Full record in
+`docs/measurements/hitch-submit-attribution-2026-09-12/`. Two things had to be got right:
+
+- **`FrameTime` is stamped one row AFTER the stall.** Ranked by `FrameTime`, every thread timer on
+  the hitch row looks innocent and the hitch reads as unattributable — the first pass of this
+  analysis said exactly that and it was an artefact. Rank by `GameThreadTime`: row 1836 reads
+  `GameThreadTime` **1651 ms** and the render thread's `EventWait` **1642 ms** on the same row, while
+  the 1650 ms `FrameTime` is stamped on 1837.
+- **The nesting is unambiguous.** `Tickables > VoxelStream/TickMs > DispatchMs > SubmitMs`, each
+  within a few ms of the one inside it. Route capture 10: SubmitMs 1554 / 769 / 687 / 670 / 654 ms on
+  the five worst rows. Walk capture 57, current binary: 394 / 316 / 280 ms.
+
+The appearance sub-counters are a passenger, not the cause: they cover ~200-380 ms of a 1,550 ms
+bracket on the route capture and read **zero** on every stall row of walk 57 while SubmitMs still
+reads 394.
+
+**The next step needs no code.** `SubmitMs` is already subdivided six ways on the per-frame sample
+(`SubReqHdrMs`, `SubBandMs`, `SubRasterMs`, `SubAssetsMs`, `SubPoolMs`, `SubMgrMs`, plus the
+function-side `SubTotalMs`), printed as `Voxel frame attribution SUBMIT-SPLIT` behind
+`voxel.Stream.FrameAttribution` (mode 2 = settled-moving only). No log at this site has ever carried
+that line. One walk capture with `-dpcvars=voxel.Stream.FrameAttribution=2` settles which of the six
+carries the second. Standing hypothesis: `SubRasterMs`, because the raster-atlas page fill is
+synchronous on the game thread and lands inside this bracket — but the point of running it first is
+that the hypothesis can lose.
 
 **Gate:** frame p99 under 33.3 ms at the default ring over a capture of at least 5,000 frames, with
 the worst frame under 100 ms.
@@ -313,6 +333,26 @@ barely change**, and none of the four is a visual trade.
 
 **Gate:** each under 1 ms at median, with placement, collision behaviour and the clipmap image
 unchanged.
+
+**Written and built 2026-09-12, both unmeasured, both behind a cvar with a control arm.**
+
+- **The roof probe built its own shortlist.** `CountUndergroundRoofSamples` constructed a fresh
+  `WorldQuery` for a one-voxel column every frame — an `instancesForRect` plus a `resolveForCompose`
+  per instance, which is precisely the standalone asset resolve that cost the ocean and the ripple
+  watcher ~4 ms each until 2026-09-11. It now takes the frame's prepared shortlist.
+  `voxel.Collision.RoofProbeShortlist 0` is the control arm. **Gate: `CollisionPreparations` stays at
+  1 per frame** — if the camera column falls outside the movement sweep's rect it will read 2, and a
+  second prepare costs what the first one does. That is how the first cut of the shared shortlist
+  turned an 8 ms saving into 5, and the counter is in the capture precisely so it cannot happen
+  quietly again.
+- **The shortlist is now kept across frames.** The single prepare is the largest item on the quiet
+  game thread at 3.69 ms, and it was rebuilt every frame only because the batch was keyed by frame
+  counter. The guard moved into `WorldQueryBatch::prepare`: a kept query is reused while the asset
+  field's `configurationRevision` is unchanged and the asked rect is inside the covered one, whose
+  margin is 32 voxels. `voxel.Collision.ShortlistAcrossFrames 0` is the control arm.
+  `vxc_worldquery_tests` covers both halves, and **the test was shown to fail** with the revision
+  line removed — it stops rebuilding when the field changes, which is the only way this can be
+  wrong.
 
 ### Phase 4 — the GPU, which is a geometry problem and not a pixel problem
 
@@ -453,12 +493,28 @@ renderer problem or a site-coverage problem. The harness for all three already e
 
 ### Phase 5 — measure at the speed the target is written for
 
-Every slice number in this document is from walking at 2.2 m/s. The target is written for 20 m/s.
-Streaming cost scales with how fast new ground arrives, so the slice has never been measured under
-the condition it is supposed to pass. This needs a flight or sprint leg through the ecology fixture.
+Every slice number in this document is from a walking pawn, and the headline ones are from its
+STANDING stretch. The target is written for 20 m/s. Streaming cost scales with how fast new ground
+arrives, so the slice has never been measured under the condition it is supposed to pass.
 
-**Gate:** a capture at 20 m/s through the fixture, with the same receipt discipline, so the plan's
-own target is measured rather than assumed.
+**On foot, 20 m/s does not exist.** The speed dial's top tier is 9.5 m/s — `kSpeedTiersUU` in
+`VoxelMovementTuning.h`, "Mad dash", the Shift override target. So a 20 m/s number is necessarily a
+FLY-pawn measurement and a different pawn from every number above it, which has to be said whenever
+the two are put beside each other.
+
+**What the existing legs actually ran at, checked 2026-09-12 rather than assumed.** The route driver
+pinned tier 2 (2.2 m/s) in code; the walk harness pinned *nothing* and sat at the dial default, tier
+4 (4.5 m/s), with its own sprint phase touching 9.51 m/s. Median speed over moving frames is 2.58
+m/s on walk 57 and 2.28 on walk 58 — so "2.2 m/s" was close enough for the walk legs by accident,
+not by configuration.
+
+Both drivers now take the tier as a parameter — `-VoxelEcologyRouteSpeedTier=` and
+`-VoxelWalkSpeedTier=`, each clamped to the dial's range and each logging the tier it actually used
+beside the dial's m/s. Absent, both behave exactly as before, so no existing capture is disturbed.
+
+**Gate:** the fixture measured at tier 7 (9.5 m/s, the fastest a player can cross this ground) AND a
+20 m/s fly leg, with the same receipt discipline, so the plan's own target is measured rather than
+assumed — and with the pawn named on every row, because they are not the same experiment.
 
 ## Research addendum, 2026-09-11: the candidate levers
 

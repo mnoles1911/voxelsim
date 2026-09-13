@@ -21,6 +21,21 @@ private:
     FVector LastPosition=FVector::ZeroVector,LastSamplePosition=FVector::ZeroVector;
     int32 Point=0;
     bool bMovementStarted=false,bOutputStarted=false,bFoundationRequested=false;
+    // THE PACE THE ROUTE WALKS AT, and why it is a parameter now.
+    //
+    // Every slice number this project has is from tier 2 (Stride, 2.2 m/s),
+    // because this driver hard-coded that tier. The standing target is written
+    // for 20 m/s, so the slice has never once been measured under the condition
+    // it must pass, and streaming cost scales with how fast new ground arrives.
+    //
+    // ON FOOT 20 m/s DOES NOT EXIST: the dial's top tier is 9.5 m/s
+    // (VoxelMovementTuning::kSpeedTiersUU, "Mad dash"), which is the fastest a
+    // player can cross this ground. A 20 m/s leg is therefore a FLY-pawn
+    // measurement and a different pawn; this knob is what makes the on-foot
+    // half of that comparison possible at all.
+    //
+    // Default 2 keeps every existing capture byte-comparable.
+    int32 SpeedTier=2;
     int64 FoundationMinX=0,FoundationMinY=0,FoundationPlaneZ=0;
     bool bProfileFrames=false,bProfileRequested=false,bProfileActive=false,bFinishSuccess=false;
     double ProfileRequestedAt=0,ProfileOrigin=0;
