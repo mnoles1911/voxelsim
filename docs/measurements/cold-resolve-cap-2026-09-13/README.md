@@ -165,11 +165,24 @@ ms.** They bound different things, which is what the sweep already suggested.
 
 **And neither bounds the band to its nominal figure.** A 20 ms budget should give
 roughly "budget + one resolve" — about 49 ms — and the band still reads 79.94.
-The most likely reason is that the budget resets per streaming TICK while these
-figures are per FRAME, so a frame containing more than one tick pays the budget
-more than once. That is a check, not a conclusion: count ticks per frame before
-believing it, and if it holds, the budget belongs on the frame rather than the
-tick.
+
+My first explanation was that the budget resets per streaming TICK while the band
+is per FRAME, so a frame with several ticks pays it several times. **That is
+refuted by the counters**: the tick-budget window reads `ticks=121` where the same
+window holds roughly 250 frames, so the streaming tick runs about once every two
+frames. No frame pays the budget twice.
+
+**The real reason is the "+ one resolve" term, and it is unbounded.** The budget
+can only defer a resolve it has not done yet; the first cold resolve of a tick
+always goes through, and a single coarse resolve was measured at up to 526 ms.
+20 ms of budget plus one large resolve is exactly the ~80 ms the band shows.
+
+So bounding the tail properly needs the cost charged **before** the work, from
+something knowable in advance. The level is a usable proxy — coarse resolves
+measured 28.91 ms against level 0's 3.77 — so a submit whose ESTIMATED cost
+exceeds the remaining budget can be deferred without first paying it. That is the
+next version of this mechanism, and it is the one that could actually bound a
+frame.
 
 ## What would settle it
 
