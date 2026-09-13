@@ -42,7 +42,7 @@ TSharedPtr<const FVoxelDetailMeshCacheIndex,ESPMode::ThreadSafe> LoadDetailCache
     if(!DetailCacheHashFile(FPackageName::LongPackageNameToFilename(TEXT("/Game/Voxel/M_VoxelDetailAsset"),TEXT(".uasset")),E.MaterialSourceSHA256))return nullptr;
     float Tolerance=.015f,Saving=.20f;FParse::Value(FCommandLine::Get(),TEXT("VoxelDetailLodColorTolerance="),Tolerance);FParse::Value(FCommandLine::Get(),TEXT("VoxelDetailLodMinSaving="),Saving);
     if(!FMath::IsFinite(Tolerance)||!FMath::IsFinite(Saving))return nullptr;
-    E.Settings=FString::Printf(TEXT("schema=2;lod=%d;tolerance=%.9g;minSaving=%.9g;screens=1,.10,.025;patches=2,4;bounds=windXY-v1-allLOD-margin0.01UU-unitScale-quarterYaw-Z0-missing30-rejectNonFinite;collision=0;nanite=%d;cpuAccess=1;fingerprint=1;authoredLOD=1"),FParse::Param(FCommandLine::Get(),TEXT("VoxelDetailMeshLOD"))?1:0,FMath::Clamp(Tolerance,0.f,.05f),FMath::Clamp(Saving,0.f,1.f),FParse::Param(FCommandLine::Get(),TEXT("VoxelDetailNanite"))?1:0);
+    E.Settings=FString::Printf(TEXT("schema=2;lod=%d;tolerance=%.9g;minSaving=%.9g;screens=1,.10,.025;patches=2,4;bounds=windXY-v1-allLOD-margin0.01UU-unitScale-quarterYaw-Z0-missing30-rejectNonFinite;collision=0;nanite=%d;cpuAccess=1;fingerprint=1;authoredLOD=1"),FParse::Param(FCommandLine::Get(),TEXT("VoxelDetailMeshLOD"))?1:0,FMath::Clamp(Tolerance,0.f,.05f),FMath::Clamp(Saving,0.f,1.f),(!FParse::Param(FCommandLine::Get(),TEXT("VoxelNoDetailNanite")))?1:0);
     return FVoxelDetailMeshCacheIndex::ParseEditorSource(Text,Publication,Binding->SourceSnapshot(),E,Error);
 #else
     return nullptr;
@@ -1452,7 +1452,44 @@ UStaticMesh* VoxelBakePersistentDetailMesh(const vxc::AssetGrid& Grid,
     auto Add=[&](const FVoxelDetailLodMesh& G){auto D=MakeUnique<FMeshDescription>();FillDetailMeshDescription(G,*D);Descs.Add(D.Get());Owned.Add(MoveTemp(D));};
     Add(Geometry);for(const auto& Lod:Geometry.Lods)Add(Lod);
     Mesh->SetNumSourceModels(Descs.Num());Mesh->SetAutoComputeLODScreenSize(false);
-    // OPT-IN EXPERIMENT, default off: -VoxelDetailNanite.
+    // DEFAULT ON SINCE 2026-09-12, ON THE OWNER'S VERDICT. -VoxelNoDetailNanite is off.
+    //
+    // The pictures were shot as two walks of the same authored route stopping at the
+    // same eight stands on two bakes differing only by this flag, arrival positions
+    // 0-35 cm apart. The owner could not tell them apart and chose the faster one. The
+    // lighting question below was the reason to ask -- these plants enter the Lumen
+    // scene for the first time -- and it is answered.
+    //
+    // The cost side, control against Nanite on equivalent bakes, quiet stretch:
+    //   GPUTime              19.310 -> 12.632 ms   -34.6%   (49 fps -> 72)
+    //   GPU/Basepass          4.402 ->  0.029 ms   -99.3%
+    //   GPU/RenderVelocities  4.399 ->  0.006 ms   -99.9%
+    //   DrawCall/Basepass       131 ->      4
+    //   DrawCall/RenderVelocities 127 ->    0
+    //   GPU/VoxelMarch        8.879 ->  8.917 ms            unmoved, the control
+    // Ground cover's two passes 8.801 -> 0.035, plus 1.165 of Nanite's own: 8.80 -> 1.20.
+    //
+    // THE VELOCITY PASS DOES NOT GET CHEAPER, IT STOPS EXISTING -- zero draw calls,
+    // because Nanite vertex factories are excluded from velocity shader compilation
+    // (VelocityRendering.cpp:201-202) and velocity is exported from the visibility
+    // buffer. That is why -VoxelDetailNoWpoVelocity was deleted rather than kept: it
+    // bought similar time by DISCARDING wind motion vectors, which smears foliage under
+    // temporal upscaling. Nanite keeps the motion vectors and removes the pass.
+    //
+    // THE COVERAGE CONDITION, which the owner's verdict does not cover and which is the
+    // real risk here. Only the BAKED path produces Nanite meshes: CreateDetailStaticMesh
+    // uses bFastBuild=true, which never allocates Nanite resources, and in a non-editor
+    // build StaticMesh.cpp:8924 asserts fast build is the only option. So any plant from
+    // a cache miss or the geometry fallback keeps the traditional proxy, and partial
+    // coverage means a population drawn both ways at once. Measured on the deciding
+    // runs: cache fallbacks ZERO in both walk-capture-55 and route-capture-19, so the
+    // risk did not materialise at this site with this bake. It is a claim about BAKE
+    // COVERAGE, not about this code, and it wants re-checking whenever the species set
+    // or the bake scope changes.
+    //
+    // Trees are untouched and keep the destructibility constraint.
+    //
+    // Historic note on why it was off, kept because it explains the shape of the code:
     //
     // Nanite is disabled here as a side effect of a decision taken for TREES, whose
     // editable procedural-mesh path must support arbitrary voxel destruction
@@ -1475,7 +1512,7 @@ UStaticMesh* VoxelBakePersistentDetailMesh(const vxc::AssetGrid& Grid,
     // The flag is in the cache identity below, so one arm cannot silently reuse the
     // other arm's bake. Note also that r.Nanite 0/1 is NOT a valid A/B: it measures the
     // simplified fallback mesh (see ue-project/Tools/capture_tree_appearance_pilot.py).
-    static const bool bDetailNanite=FParse::Param(FCommandLine::Get(),TEXT("VoxelDetailNanite"));
+    static const bool bDetailNanite=!FParse::Param(FCommandLine::Get(),TEXT("VoxelNoDetailNanite"));
     Mesh->NaniteSettings.bEnabled=bDetailNanite;
     if(bDetailNanite){
         // FallbackRelativeError defaults to 1.0, which lets Nanite decimate the fallback
@@ -1534,7 +1571,7 @@ UStaticMesh* VoxelBakePersistentDetailMesh(const vxc::AssetGrid& Grid,
     // did not get it fails loudly, rather than quietly measuring non-Nanite geometry.
     const bool bNaniteBuilt=Built->HasValidNaniteData();
     if(bDetailNanite&&!bNaniteBuilt){
-        Error=TEXT("-VoxelDetailNanite was requested but the built mesh has no Nanite data");return nullptr;
+        Error=TEXT("Nanite is on (default; -VoxelNoDetailNanite disables it) but the built mesh has no Nanite data");return nullptr;
     }
     FString AuthoredCounts;
     for(int32 L=0;L<Descs.Num();++L){
@@ -1854,35 +1891,6 @@ void UVoxelDetailAssetSubsystem::Tick(float DeltaTime)
 			Hism->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 			Hism->SetCanEverAffectNavigation(false);
 			Hism->SetCastShadow(Impl->bCastShadow);
-			// THE VELOCITY PASS, PER COMPONENT RATHER THAN PER RENDERER.
-			//
-			// These components are positioned once and never moved, so the
-			// velocity pass would reject them every frame on the
-			// local-to-world-equals-previous test. The only reason they are in
-			// it is the wind: bHasWorldPositionOffsetVelocity is set when the
-			// component supports WPO velocity, vertex deformation outputs
-			// velocity, and any material has world position offset. Clearing
-			// the first of those three drops the whole second geometry
-			// submission for the ground cover and nothing else.
-			//
-			// r.Velocity.EnableVertexDeformation 0 measured -5.19 ms of GPU at
-			// the unculled 256 m ring and about -4.4 ms stacked on size
-			// culling, but it does that for the WHOLE renderer. This is the
-			// same effect scoped to these components.
-			//
-			// IT IS A VISUAL TRADE AND THE DEFAULT IS THE OWNER'S. Without
-			// motion vectors, wind-blown foliage smears under temporal
-			// upscaling, and a still frame cannot show that -- judging it needs
-			// a moving capture. Opt-in until it has one.
-			//
-			// NOT in the cache identity settings string, deliberately: it
-			// changes the component, not the mesh, so both arms share one bake.
-			static const bool bNoWpoVelocity =
-				FParse::Param(FCommandLine::Get(), TEXT("VoxelDetailNoWpoVelocity"));
-			if (bNoWpoVelocity)
-			{
-				Hism->bWorldPositionOffsetWritesVelocity = false;
-			}
             // Presentation distance stays inside the configured residency
             // ring. Start/end values alone do not establish material fading.
             //
