@@ -38,7 +38,25 @@ improve** — the two armed runs read max 528.68 and 924.69 against the defaults
 repeat. And the middle band pays: p95 rises 2.3 ms and frames over 33 ms go from
 2.47% to 2.92%, which is deferred work arriving later rather than never.
 
-## THE OWNER'S VERDICT, 2026-09-13: shipped at cap 8
+## THE VERDICT THAT COUNTS: a MOVING pair, and the owner sees no difference
+
+The settled route pictures below were **not a real gate and should not be cited
+as one**. The route harness stops the pawn at each stand and waits 2 seconds
+before the shutter; deferred work catches up in a frame or two, so every arm had
+converged on the same image long before the picture was taken. That test could
+not have failed.
+
+The gate is a capture taken **while moving**, which this project's own limitation
+note said it could not take. `tools/voxel-moving-capture.ps1` does, and the pair
+is: 20 m/s, forest spawn, no settle, same ground to **0.28 m**, same pose, one arm
+cap off and one at cap 8.
+
+**The owner's words, on the moving pair: "Both images look identical."**
+
+So the trade this mechanism makes is invisible under the condition designed to
+expose it, and the shipped default stands on evidence that could have failed.
+
+## The owner's earlier verdict on the settled pictures (kept for the record)
 
 Three route captures at stand 00 of the authored detour — the same cap-off
 configuration **twice**, so the harness's own 17.65%-of-pixels noise was visible
