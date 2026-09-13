@@ -3642,10 +3642,25 @@ static TAutoConsoleVariable<int32> CVarVoxelPredictiveCoarseLevels(
 // arm that also raised them to 512 MiB total and 32 MiB per entry measured p99
 // 113.91 against this configuration's 109.92, i.e. the extra 448 MiB bought
 // nothing and is not being spent.
-// THE COLD RESOLVE CAP. Default 0 = off: a control arm is byte-identical, and
-// this is a TRADE (refinement delayed for a bounded tick) rather than a free
-// win, so it does not get a default until its two sides have been measured
-// against each other. See the decision site in the dispatch loop.
+// THE COLD RESOLVE CAP. DEFAULT 8 SINCE 2026-09-13, ON THE OWNER'S VERDICT.
+//
+// It is a visual trade -- coarser ground held longer -- so under the
+// settings-panel policy the pictures decide it, not the milliseconds. Three
+// route captures at the same authored stand were put side by side: the same
+// cap-off configuration TWICE, so the harness's own 17.65%-of-pixels noise was
+// visible rather than described, and then this arm at cap 8. The owner's words:
+// "3 looks no worse than 1 or 2".
+//
+// What it buys, at 9.5 m/s where the slice is furthest from its target:
+//   frames over 300 ms   2.12% -> 0.67%
+//   frame p99           392.42 -> 284.69 ms
+//   frame p50            20.61 -> 18.33 ms
+// At a walk it is closer to even -- p99 better, the 33-100 ms band slightly
+// worse -- so the value is concentrated where the player is moving fast.
+//
+// 0 restores the old behaviour and is the control arm. A budget in milliseconds
+// (ColdResolveBudgetMsPerTick) measured better on p50/p95/over-100 ms but was NOT
+// in the pictures the owner judged, so it stays off until its own pair is shot.
 // THE BUDGET, in whole milliseconds, and it is the better bound of the two: a
 // count cannot bind a frame when the things it counts differ 7.7x in cost.
 // Default 0 = off.
@@ -3666,7 +3681,7 @@ static TAutoConsoleVariable<int32> CVarVoxelStreamColdResolveBudgetMsPerTick(
 	     "because the first resolve of a tick always goes through. 0 = off."), ECVF_Default);
 
 static TAutoConsoleVariable<int32> CVarVoxelStreamColdResolveCapPerTick(
-	TEXT("voxel.Stream.ColdResolveCapPerTick"), 0,
+	TEXT("voxel.Stream.ColdResolveCapPerTick"), 8,
 	TEXT("At most N cold asset-resolve submits per streaming tick; the excess WAITS a tick, but "
 	     "only where a coarser ancestor is resident and holds terrain. 0 = off. A cold coarse "
 	     "resolve costs ~28.91 ms inline on the game thread, so this is the bound on the tail that "

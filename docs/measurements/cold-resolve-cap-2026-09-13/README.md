@@ -38,7 +38,22 @@ improve** — the two armed runs read max 528.68 and 924.69 against the defaults
 repeat. And the middle band pays: p95 rises 2.3 ms and frames over 33 ms go from
 2.47% to 2.92%, which is deferred work arriving later rather than never.
 
-## Why it is not on by default
+## THE OWNER'S VERDICT, 2026-09-13: shipped at cap 8
+
+Three route captures at stand 00 of the authored detour — the same cap-off
+configuration **twice**, so the harness's own 17.65%-of-pixels noise was visible
+rather than described, then the arm at cap 8. The owner's words: **"3 looks no
+worse than 1 or 2"**.
+
+`voxel.Stream.ColdResolveCapPerTick` therefore defaults to **8**. What the verdict
+covers is exactly the configuration in those pictures; the millisecond-budget
+variant defers more (4,908 against 3,125 deferrals in a window) and was shot
+separately for its own verdict rather than assumed to be covered.
+
+The section below is kept as written, because it is the reasoning that stood
+before the pictures existed and it is what the verdict answered.
+
+## Why it was not on by default
 
 Two reasons, and neither is timing:
 
