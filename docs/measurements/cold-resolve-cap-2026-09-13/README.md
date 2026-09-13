@@ -113,6 +113,32 @@ The artifact for this decision is the pictures themselves, judged by the owner,
 with the two controls shown alongside so the floor is visible rather than
 described. Sent 2026-09-13.
 
+## At speed, which is the condition the target names, the trade is better
+
+Same authored route at tier 7 (9.5 m/s sustained), cap off against cap 8:
+
+| | cap off | cap 8 |
+|---|---|---|
+| frame p50 | 20.61 | **18.33** |
+| frame p95 | 168.73 | 160.67 |
+| frame p99 | 392.42 | **284.69** |
+| frame max | 1655.40 | 1626.57 |
+| over 33.3 ms | 20.95% | 20.31% |
+| over 100 ms | 7.98% | **10.33%** |
+| **over 300 ms** | 2.12% | **0.67%** |
+
+`deferred=31366 exempt=1794` — 5.4% of deferrals had no coarser ancestor and were
+pushed through, the hole guarantee spending itself.
+
+**The same shape as at a walk, but larger in both directions.** Frames over 300 ms
+fall by 68% and p99 by 27%, and even the median improves 11%; frames over 100 ms
+rise from 7.98% to 10.33%. The faster the player moves the more cold resolves
+arrive per second, so both sides of the trade grow — and the side that grows more
+is the one being bought.
+
+That matters for the decision: this cap is worth most exactly where the slice is
+furthest from its target, and worth least standing still.
+
 ## What would settle it
 
 The owner's verdict on those stands, and a repeat of the cap 4/8 runs — the max
