@@ -9907,6 +9907,15 @@ struct FVoxelWorldImpl
         // 7903 -> 8247, i.e. not at all.
         uint64 ColdMissLevel0=0,ColdMissCoarse=0;
         double RawResolveLevel0Ms=0,RawResolveCoarseMs=0;
+        // PER LEVEL, because "coarse" is one bucket averaging levels 1-7 and the
+        // cost cannot be flat across them: a level-L footprint is 2^L wider per
+        // side, so its rect covers 4^L the area and finds that many more
+        // instances. The 28.91 ms average is therefore a number about the MIX
+        // that happened to be asked for, and an estimate built on it is too low
+        // at the top levels and too high at the bottom -- which is exactly where
+        // the shipped cap's bound is loosest. Measure before estimating.
+        uint64 ColdMissByLevel[VoxelCoords::kNumLevels]={};
+        double RawResolveByLevelMs[VoxelCoords::kNumLevels]={};
         double TotalMs=0,InlineMs=0,RawResolveMs=0,MaxCallMs=0,MaxRawResolveMs=0;
     };
     // Mutable only because admission queries are logically const. All three
@@ -14870,6 +14879,16 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
         UE_LOG(LogVoxelPerf,Log,TEXT("Voxel asset resolve caller (window): caller=%s calls=%llu hits=%llu coldMisses=%llu forcedInline=%llu level0=%llu coarse=%llu totalMs=%.3f inlineMs=%.3f rawResolveMs=%.3f maxCallMs=%.3f maxRawResolveMs=%.3f missLevel0=%llu missCoarse=%llu rawLevel0Ms=%.3f rawCoarseMs=%.3f"),
             ResolveCallerNames[I],R.Calls,R.Hits,R.ColdMisses,R.ForcedInline,R.Level0Calls,R.CoarseCalls,R.TotalMs,R.InlineMs,R.RawResolveMs,R.MaxCallMs,R.MaxRawResolveMs,
             R.ColdMissLevel0,R.ColdMissCoarse,R.RawResolveLevel0Ms,R.RawResolveCoarseMs);
+        FString PerLevel;
+        for(int32 L=0;L<VoxelCoords::kNumLevels;++L){
+            if(!R.ColdMissByLevel[L])continue;
+            PerLevel+=FString::Printf(TEXT(" L%d=%llu/%.1fms/%.2favg"),L,
+                (long long)R.ColdMissByLevel[L],R.RawResolveByLevelMs[L],
+                R.RawResolveByLevelMs[L]/double(R.ColdMissByLevel[L]));
+        }
+        if(!PerLevel.IsEmpty())
+            UE_LOG(LogVoxelPerf,Log,TEXT("Voxel asset resolve misses by level (window): caller=%s%s"),
+                   ResolveCallerNames[I],*PerLevel);
     }
 	// S0-2: apply throughput for THIS window, alongside the leg-long mean
 	// TotalChunksLoaded already gives on the "Voxel streaming" line above.
@@ -20374,6 +20393,8 @@ const std::vector<vxc::AssetField::ResolvedAssetInstance>* FVoxelWorldImpl::Reso
     CallerStats.RawResolveMs+=RawResolveMs;CallerStats.MaxRawResolveMs=FMath::Max(CallerStats.MaxRawResolveMs,RawResolveMs);
     if(Level==0){++CallerStats.ColdMissLevel0;CallerStats.RawResolveLevel0Ms+=RawResolveMs;}
     else{++CallerStats.ColdMissCoarse;CallerStats.RawResolveCoarseMs+=RawResolveMs;}
+    if(Level>=0&&Level<VoxelCoords::kNumLevels){
+        ++CallerStats.ColdMissByLevel[Level];CallerStats.RawResolveByLevelMs[Level]+=RawResolveMs;}
     // The millisecond budget's meter. Only the submit caller, because that is
     // the one the cap defers; admission and the edited-page path are not
     // deferrable and charging them would spend a budget on work the cap cannot
@@ -27842,15 +27863,48 @@ void FVoxelWorldImpl::DispatchJobs()
 				// is how a 20 ms budget overshot to ~80 ms in the 100-300 ms
 				// band on 2026-09-13.
 				//
-				// The proxy is the LEVEL, because that is what the cost tracks
-				// and it is known before any work: coarse footprints measured
-				// 28.91 ms each against level 0's 3.77 over 7,563 misses. The
-				// numbers are deliberately the measured ones rather than round
-				// figures, so a later re-measurement can see they moved.
+				// THE PROXY IS THE LEVEL, and it must be PER level. The first
+				// version of this charged one flat figure for every coarse
+				// level -- 28.91 ms, the average over whatever mix of levels
+				// happened to be asked for -- and that average is not a cost of
+				// anything. Measured per level on 2026-09-13, at 9.5 m/s with
+				// the cap off, 3,975 misses:
+				//
+				//   L0  6.11   L1  8.48   L2  6.27   L3   7.23
+				//   L4 10.70   L5 16.03   L6 43.17   L7 108.22   ms each
+				//
+				// Levels 6 and 7 are 38% of the misses and 86.5% of the
+				// milliseconds. A flat 28.91 is therefore 3.7x TOO LOW exactly
+				// where the bound needs to hold, and too high at L0-L3 where it
+				// costs deferrals for nothing. A level-L footprint is 2^L wider
+				// per side, so this shape is what the geometry predicts; the
+				// numbers are the measured ones rather than the predicted ones
+				// so a later re-measurement can see them move.
+				//
+				// A SINGLE L7 RESOLVE EXCEEDS ANY SANE TICK BUDGET on its own,
+				// which is the honest consequence: with a 20 ms budget an L7
+				// submit goes through only when nothing else has been spent, and
+				// it takes the whole tick when it does.
 				//
 				// An estimate that is WRONG costs a deferral, never a hole: the
 				// coverage test below is unchanged and still refuses to defer
 				// anything without a coarser ancestor.
+				// AND THE PER-LEVEL TABLE WAS TRIED AND IS WORSE. Charging the
+				// measured {6.11, 8.48, 6.27, 7.23, 10.70, 16.03, 43.17, 108.22}
+				// read p50 20.14 / p95 158.42 against the flat figure's 17.29 /
+				// 125.97 at 9.5 m/s -- better on p99 and over-300 ms, worse on
+				// everything else.
+				//
+				// WHY, and it is worth keeping because it is counter-intuitive:
+				// the budget's job is to BOUND A TICK, not to be accurate. A
+				// flat 28.91 over-charges L0-L3 by 4x, and that over-charge is a
+				// throughput limiter that keeps the tick short. Replace it with
+				// the true 6-8 ms and many more fine resolves fit in one tick,
+				// which is exactly the middle band getting worse. An accurate
+				// cost model is not the objective here; a short tick is.
+				//
+				// The flat figure is also the one the owner saw pictures of, so
+				// changing it would invalidate that verdict as well.
 				const double EstimatedResolveMs = LevelKey.Level == 0 ? 3.77 : 28.91;
 				const bool bOverBudget = ColdResolveBudgetMs > 0.0 &&
 					(ColdResolveMsThisTick >= ColdResolveBudgetMs ||

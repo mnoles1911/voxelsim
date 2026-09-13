@@ -233,6 +233,49 @@ a level-7 footprint is vastly wider than a level-1 one, so the estimate is too l
 where it matters most. A per-level estimate — the measurement already splits misses
 by level — is the obvious next refinement.
 
+## The resolve cost per level, measured — and why the accurate model is worse
+
+`assets` is the streaming cost at EVERY speed, not just at a walk. The 20 m/s
+flight leg's TAIL bucket reads tick 1805 ms → dispatch 1662 → submit 1657 →
+**assets 1594 (96%)**, with raster 20.3. It is not admission, not tile IO, not the
+mesher.
+
+Per-level cost, 3,975 misses at 9.5 m/s with the cap off — "coarse" had been one
+bucket averaging levels 1–7, which is a number about the mix rather than a cost:
+
+| level | misses | total ms | ms each |
+|---|---|---|---|
+| 0 | 428 | 2,616 | 6.11 |
+| 1 | 1,045 | 8,866 | 8.48 |
+| 2 | 382 | 2,395 | 6.27 |
+| 3 | 430 | 3,110 | 7.23 |
+| 4 | 97 | 1,038 | 10.70 |
+| 5 | 70 | 1,122 | 16.03 |
+| **6** | 651 | 28,101 | **43.17** |
+| **7** | 872 | 94,367 | **108.22** |
+
+**Levels 6 and 7 are 38% of the misses and 86.5% of the milliseconds.** A single
+level-7 resolve is 108 ms — more than any sane tick budget on its own.
+
+**And putting that table into the estimate made the result WORSE:**
+
+| | flat 28.91 | per-level table |
+|---|---|---|
+| p50 | **17.29** | 20.14 |
+| p95 | **125.97** | 158.42 |
+| p99 | 294.11 | **274.69** |
+| over 100 ms | **6.16%** | 7.72% |
+| over 300 ms | 0.96% | **0.83%** |
+
+**The budget's job is to bound a tick, not to be accurate.** A flat 28.91
+over-charges levels 0–3 by about 4x, and that over-charge is a throughput limiter
+that keeps the tick short. Charge the true 6–8 ms and many more fine resolves fit
+in one tick — which is the middle band getting worse. The accurate model helps
+only the extreme tail, where its 43 and 108 ms figures defer the genuinely huge
+resolves.
+
+The flat figure is kept, and it is also the one the owner saw pictures of.
+
 ## What would settle it
 
 The owner's verdict on those stands, and a repeat of the cap 4/8 runs — the max
