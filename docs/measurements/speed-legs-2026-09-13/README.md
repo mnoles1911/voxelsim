@@ -29,6 +29,26 @@ p95 goes up more than six-fold. The cost is arrival rate: new ground per second,
 paid on the game thread, and `SubmitMs` — the cold asset resolve of
 `docs/measurements/submit-cold-resolve-2026-09-13/` — rises with it.
 
+> **CORRECTION, 2026-09-13 (later the same day). The 20 m/s leg below was NOT at
+> the forest site.** `tools/voxel-run-flight-leg.ps1` cleared only top-level
+> `*.vxlog` and left the session CHECKPOINT store, which holds the pawn pose. So
+> the leg restored the previous leg's position and `-VoxelSpawnAt` lost to it
+> silently. Four consecutive legs asking for the same spawn logged path centres
+> of −6144000, −5904260, −5664702 and −5185007 UU — each exactly the previous
+> leg's travel distance further on, and all about **100 km from the forest**,
+> whose pawn sits at −15,473,834 UU.
+>
+> The walk and route harnesses are unaffected: they pass a per-capture `-UserDir`,
+> so they never shared the checkpoint. **Every on-foot number in this document
+> stands.** What does not stand is the claim that the 20 m/s row describes the
+> temperate forest fixture: it describes terrain with the ecology system active,
+> somewhere else.
+>
+> The harness now clears the checkpoint store, mirroring the block
+> `tools/voxel-capture.ps1` grew for this same bug on 2026-09-07. Confirmed by
+> the number that was wrong: a re-run lands at (−15,473,834, −8,147,600) UU, the
+> requested spawn, at 100 m altitude rather than 1,986 m.
+
 ## At 20 m/s, which needs the fly pawn
 
 `tools/voxel-run-flight-leg.ps1 -Flight line -VoxelPerfSpeed=20` at the same

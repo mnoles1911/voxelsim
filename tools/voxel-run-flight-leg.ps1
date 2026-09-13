@@ -178,10 +178,35 @@ if ($running.Count -gt 0) {
 
 # The edit log persists across runs and replays on load, so a leg measured
 # without clearing it is not cold (ground rule 11).
+#
+# AND THE SESSION CHECKPOINTS, WHICH THIS BLOCK DID NOT CLEAR -- the same bug
+# tools/voxel-capture.ps1 fixed on 2026-09-07, still live here on 2026-09-13 and
+# caught the hard way. The checkpoint store holds the PAWN POSE, so a flight leg
+# restored the previous leg's position and -VoxelSpawnAt lost to it silently.
+# Four consecutive legs asking for the same spawn logged:
+#
+#   path centered at (-6144000, -6144000)   <- ignored the requested spawn
+#   path centered at (-5904260, -6144000)   <- +2.4 km, the previous leg's travel
+#   path centered at (-5664702, -6144000)   <- +2.4 km again
+#   path centered at (-5185007, -6144000)   <- +4.8 km, that leg was twice as long
+#
+# Each leg began where the last one ended, about 100 km from the site every one
+# of them named. A moving-capture A/B shot that way photographs two different
+# hillsides and nothing says so. The walk and route harnesses are immune only
+# because they pass a per-capture -UserDir; this one uses the project's Saved.
 if (-not $KeepEditLog) {
     $dir = Join-Path (Split-Path $Project) 'Saved\VoxelWorlds'
     if (Test-Path $dir) {
-        Get-ChildItem $dir -Filter *.vxlog -ErrorAction SilentlyContinue | Remove-Item -Force
+        $stale = @(Get-ChildItem $dir -Include *.vxlog, *.vxwater, *.vxlog.detached-*.bin -File -Recurse -ErrorAction SilentlyContinue)
+        $staleDirs = @(Get-ChildItem $dir -Directory -Recurse -ErrorAction SilentlyContinue |
+                       Where-Object { $_.Name -like '*.vxlog.checkpoints' })
+        if (($stale.Count + $staleDirs.Count) -gt 0) {
+            $what = (@($stale | ForEach-Object { "{0} ({1:N0} B)" -f $_.Name, $_.Length }) +
+                     @($staleDirs | ForEach-Object { "{0}/ (checkpoint dir)" -f $_.Name })) -join ', '
+            Write-Host "  cleared persisted world state: $what" -ForegroundColor DarkGray
+        }
+        $stale | Remove-Item -Force -ErrorAction SilentlyContinue
+        $staleDirs | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 
