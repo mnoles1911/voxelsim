@@ -3649,6 +3649,16 @@ static TAutoConsoleVariable<int32> CVarVoxelPredictiveCoarseLevels(
 // THE BUDGET, in whole milliseconds, and it is the better bound of the two: a
 // count cannot bind a frame when the things it counts differ 7.7x in cost.
 // Default 0 = off.
+// Charge the ESTIMATED cost of a cold resolve against the budget before doing it,
+// so a single large resolve cannot blow the tick. Default true: without it the
+// budget bounds everything except the first resolve, which is the term that
+// actually hurts. 0 restores the measured-after-the-fact behaviour.
+static TAutoConsoleVariable<bool> CVarVoxelStreamColdResolveChargeEstimate(
+	TEXT("voxel.Stream.ColdResolveChargeEstimate"), true,
+	TEXT("Charge a cold resolve's ESTIMATED cost (by level) against the tick budget before paying "
+	     "it, instead of only counting what has already been spent. A wrong estimate costs a "
+	     "deferral, never a hole."), ECVF_Default);
+
 static TAutoConsoleVariable<int32> CVarVoxelStreamColdResolveBudgetMsPerTick(
 	TEXT("voxel.Stream.ColdResolveBudgetMsPerTick"), 0,
 	TEXT("Millisecond budget for cold asset resolves in one streaming tick; past it, submits wait "
@@ -27809,7 +27819,28 @@ void FVoxelWorldImpl::DispatchJobs()
 				// what the counter below should be read against.
 				const double ColdResolveBudgetMs =
 					double(VoxelStreamAdmission::CVarVoxelStreamColdResolveBudgetMsPerTick.GetValueOnGameThread());
-				const bool bOverBudget = ColdResolveBudgetMs > 0.0 && ColdResolveMsThisTick >= ColdResolveBudgetMs;
+				// CHARGE THE ESTIMATE BEFORE THE WORK, which is the only way a
+				// budget can bound a FRAME rather than bound everything after
+				// the first resolve. A budget can only defer work it has not
+				// done, so the first cold resolve of a tick always went through
+				// -- and one coarse resolve was measured at up to 526 ms, which
+				// is how a 20 ms budget overshot to ~80 ms in the 100-300 ms
+				// band on 2026-09-13.
+				//
+				// The proxy is the LEVEL, because that is what the cost tracks
+				// and it is known before any work: coarse footprints measured
+				// 28.91 ms each against level 0's 3.77 over 7,563 misses. The
+				// numbers are deliberately the measured ones rather than round
+				// figures, so a later re-measurement can see they moved.
+				//
+				// An estimate that is WRONG costs a deferral, never a hole: the
+				// coverage test below is unchanged and still refuses to defer
+				// anything without a coarser ancestor.
+				const double EstimatedResolveMs = LevelKey.Level == 0 ? 3.77 : 28.91;
+				const bool bOverBudget = ColdResolveBudgetMs > 0.0 &&
+					(ColdResolveMsThisTick >= ColdResolveBudgetMs ||
+					 (VoxelStreamAdmission::CVarVoxelStreamColdResolveChargeEstimate.GetValueOnGameThread() &&
+					  ColdResolveMsThisTick + EstimatedResolveMs > ColdResolveBudgetMs));
 				if (bOverBudget)
 				{
 					if (ColdShadingCoveredByCoarserAncestor(ChunkRecords, LevelKey))

@@ -184,6 +184,40 @@ exceeds the remaining budget can be deferred without first paying it. That is th
 next version of this mechanism, and it is the one that could actually bound a
 frame.
 
+## Charging the estimate up front, which is the version that works
+
+`voxel.Stream.ColdResolveChargeEstimate` (default true, only active with a budget
+set) charges a cold resolve's estimated cost against the budget **before** paying
+it, using the level as the proxy — the measured 3.77 ms for level 0 and 28.91 for
+coarse. A wrong estimate costs a deferral, never a hole: the coverage test is
+untouched.
+
+All four arms, same route at 9.5 m/s:
+
+| | off | count 8 | budget, measured | **budget, estimate** |
+|---|---|---|---|---|
+| frame p50 | 20.61 | 18.33 | 20.22 | **17.29** |
+| frame p95 | 168.73 | 160.67 | 148.82 | **125.97** |
+| frame p99 | 392.42 | 284.69 | **261.00** | 294.11 |
+| over 33.3 ms | 20.95% | 20.31% | 24.35% | **19.45%** |
+| over 100 ms | 7.98% | 10.33% | 8.24% | **6.16%** |
+| over 300 ms | 2.12% | **0.67%** | 0.98% | 0.96% |
+
+**It wins the median, p95, and both of the rates that had been getting worse.**
+p50 −16%, p95 −25%, frames over 100 ms −23%, all against the unbounded arm, and
+unlike every earlier variant it does not pay for the tail with the middle band —
+over-33 ms is better than doing nothing at all.
+
+The count cap still holds the best over-300 ms figure, and the measured budget the
+best p99. So the ordering depends on which statistic the owner is buying, and all
+three are one cvar apart.
+
+**What is still not bounded:** the 100–300 ms band's `SubAssetsMs` is 78.53 ms,
+barely moved from 79.94. The estimate charges 28.91 ms for every coarse level, but
+a level-7 footprint is vastly wider than a level-1 one, so the estimate is too low
+where it matters most. A per-level estimate — the measurement already splits misses
+by level — is the obvious next refinement.
+
 ## What would settle it
 
 The owner's verdict on those stands, and a repeat of the cap 4/8 runs — the max
