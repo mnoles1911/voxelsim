@@ -12,6 +12,28 @@
 
 
 
+> **STATUS, 2026-09-13.** All five phases have been run. What changed, and what
+> the numbers are now, at the forest site with the 256 m ring:
+>
+> | | 2026-09-10 | now |
+> |---|---|---|
+> | frame p50 | 41.7 ms (24 fps) | **13.9 ms (72 fps)** |
+> | GPU p50 | 40.5 ms | **12.6 ms** |
+> | game thread p50 | 21.6 ms | **6.2 ms** |
+> | frame p99 | ~350 ms | **~102 ms** |
+>
+> Phase 0 (size culling) and the Nanite default carried the GPU; the roof probe
+> and the across-frames shortlist carried the game thread; the cold-resolve work
+> carried p99. **Phase 4's premise did not survive Phase 5**: the GPU is flat from
+> 2.2 to 9.5 m/s while the tail explodes, so at the speed the target is written
+> for the wall is streaming on the game thread, not the marcher. And the height
+> pyramid — the plan's top marcher lever — was timed at last and COSTS 1.2% here.
+>
+> Records: `docs/measurements/nanite-default-verified-2026-09-13/`,
+> `shortlist-arms-2026-09-13/`, `submit-cold-resolve-2026-09-13/`,
+> `heightpyramid-forest-timing-2026-09-13/`, `heightpyramid-image-gate-2026-09-13/`,
+> `speed-legs-2026-09-13/`, `cold-resolve-cap-2026-09-13/`.
+
 Written 2026-09-10. Target: **p95 frame time under 10 ms while moving at 20 m/s** (the Goal 3
 bar from `docs/50k-budget-2026-08-23.md`). This plan is about the vertical slice as it actually
 runs today, with voxel terrain plus roughly 123,000 instanced understory plants.
