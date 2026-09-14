@@ -59,3 +59,27 @@ the same state. At 20 m/s the seam advances 40 m per window and every chunk on
 it is by construction "just admitted". The ray statistics will say whether the
 uncovered rays are `pending` (latency at the seam) or `never` (admission), and at
 which ring.
+
+## 6. The ray instrument cannot be used while moving — three legs and a memory file learned it
+
+`voxel.March.HoleStats 2` was the obvious next instrument (uncovered rays by ring
+and by reason). Three legs were flown on it before the control was looked at:
+
+| leg | dispatched/s | picture at 8,192 m |
+|---|---|---|
+| no instrument | **3,958** | intact |
+| HoleStats 2, control | 834 | **black void, 2.7 fps, GPU job 1.5 s** |
+| HoleStats 2, ahead cap 1024 | 656 | black void, 2.5 fps, GPU job 3.3 s |
+| HoleStats 1, control | 867 | — |
+
+**Both levels collapse streaming at speed.** The readback path stalls the mesh
+pipeline; the GPU saturates; chunks stop arriving; the world goes black. The
+"~2% on the kernel" figure recorded for level 1 came from a parked timing leg and
+does not survive motion. Every by-ring / by-reason number those legs produced —
+including a plausible-looking "attributed absences halved" for the ahead-cap arm
+— describes a system the instrument had already broken, and none of it is used
+here.
+
+What remains usable at speed, in order of trust: the screenshot; dispatched/s
+and the per-ring dispatch line; the record probe with a repeat. The ahead-cap
+experiment is being re-run on exactly those.
