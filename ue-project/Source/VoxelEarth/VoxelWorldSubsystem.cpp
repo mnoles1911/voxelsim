@@ -3687,6 +3687,71 @@ static TAutoConsoleVariable<int32> CVarVoxelStreamColdResolveCapPerTick(
 	     "resolve costs ~28.91 ms inline on the game thread, so this is the bound on the tail that "
 	     "prediction cannot reach."), ECVF_Default);
 
+// RING-NORMALISED PRIORITY (2026-09-14). The one defect behind the black
+// annulus at 20 m/s: the cross-ring pick is strictly nearest-first on metres,
+// and every ring's leading edge sits at its own OUTER radius while moving
+// (64 / 128 / 256 / 512 m ...), so under any throughput deficit the deficit
+// lands on whichever ring is geometrically farthest -- all of R2's outer
+// half, all of R3 and everything beyond, INCLUDING the interior coarse
+// stand-ins hierarchical coverage keyed at their ring's inner radius. Measured
+// on dense20/denseFloor3/denseCpuFloor (terrain-only, 20 m/s, hill at
+// 1408-2176 m): R3 served 1-2 chunks per 2 s against 4,900 pending, 30-33% of
+// the frame black in a ring between the intact near field and the intact
+// preflight far field.
+//
+// p > 0 multiplies each level's key by (Outer_0 / Outer_L)^(2p): at p = 1 a
+// chunk's key is its distance as a FRACTION of its own ring's radius, so an
+// R3 stand-in at 256 m (0.5 of 512) sorts with an R0 chunk at 32 m and every
+// ring's front recedes together under a deficit instead of one ring going
+// black. The stand-in now loads BEFORE the fine chunk it stands in for --
+// the order LOD streaming wants and the opposite of the intent recorded at
+// BiasedSortKeySq, which was written for a stationary fill.
+// MinSpeed (m/s) fades p in from rest to that speed (0 = always on), so a
+// cold stationary start keeps today's near-first order. The cutoffs and the
+// lead-horizon floor are rescaled with the keys (see StreamRingKeyScale).
+// -VoxelRingNormalizedKey=<p> on the command line wins over the cvar so the
+// preflight's first recomputes run the arm too.
+//
+// DEFAULT ON (p = 1, fade to full at 5 m/s) SINCE 2026-09-14, on the owner's
+// word, from docs/measurements/ring-normalized-key-2026-09-14/: same 32-frame
+// 20 m/s flight, black pixels 1,206,488 (control) -> 8,752 (this default),
+// worst frame 33.1% -> 0.10%; R3-R7 no longer print 'Voxel ring STARVED';
+// chunks/s unchanged (3,940-4,170 both ways); cold start keeps its order
+// (R0 pending hits 0 at 6.2 s against 5.7 s, and 21.9 s with no fade).
+// Control arm: -VoxelRingNormalizedKey=0.
+static TAutoConsoleVariable<float> CVarVoxelStreamRingNormalizedKey(
+	TEXT("voxel.Stream.RingNormalizedKey"), 1.f,
+	TEXT("Exponent p: each ring's admission/dispatch key is scaled by (Outer_0/Outer_L)^(2p), so at 1 "
+	     "rings compete on fraction-of-ring-radius instead of metres and a coarse stand-in loads before "
+	     "the fine front it covers. 0 = off, byte-identical keys."), ECVF_Default);
+static TAutoConsoleVariable<float> CVarVoxelStreamRingNormalizedKeyMinSpeed(
+	TEXT("voxel.Stream.RingNormalizedKeyMinSpeed"), 5.f,
+	TEXT("m/s at which RingNormalizedKey reaches full strength; it fades linearly from 0 at rest. 0 = "
+	     "always at full strength."), ECVF_Default);
+float RingNormalizedKeyP()
+{
+	static const float CmdLine = []
+	{
+		float V = -1.f;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelRingNormalizedKey="), V);
+		return V;
+	}();
+	return CmdLine >= 0.f ? CmdLine : CVarVoxelStreamRingNormalizedKey.GetValueOnGameThread();
+}
+// -VoxelRingNormalizedKeyMinSpeed=<m/s> wins over the cvar for the same
+// reason: an -ExecCmds cvar lands after the preflight's first recomputes, and
+// the fade is exactly what those recomputes are meant to measure.
+float RingNormalizedKeyMinSpeedM()
+{
+	static const float CmdLine = []
+	{
+		float V = -1.f;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelRingNormalizedKeyMinSpeed="), V);
+		return V;
+	}();
+	return CmdLine >= 0.f ? CmdLine : CVarVoxelStreamRingNormalizedKeyMinSpeed.GetValueOnGameThread();
+}
+
 // Serve the ring whose head nothing else draws before serving nearest-first.
 // See the pick loop for the measurement that motivated it. 0 = off, byte-identical.
 static TAutoConsoleVariable<int32> CVarVoxelStreamCoverageFirstPick(
@@ -5672,9 +5737,12 @@ double UnloadOuterUU(int32 Level)
 // (DxUU, DyUU) is chunk centre minus anchor, XY; ViewDirXY is the unit camera
 // forward's XY (zero when no camera / bias off), captured on the game thread.
 double PrioritySortKeySq(int32 Level, double DistSq, double DxUU, double DyUU, const FVector2D& ViewDirXY,
-                          double ViewBiasK)
+                          double ViewBiasK, double LevelKeyScale)
 {
-	double Key = BiasedSortKeySq(Level, DistSq);
+	// LevelKeyScale: this tick's StreamRingKeyScale[Level] (1.0 with
+	// voxel.Stream.RingNormalizedKey off). Applied to the clamped distance
+	// so the view penalty composes exactly as before within a level.
+	double Key = BiasedSortKeySq(Level, DistSq) * LevelKeyScale;
 	if (ViewBiasK > 0.0 && !ViewDirXY.IsNearlyZero())
 	{
 		const double LenXY = FMath::Sqrt(DxUU * DxUU + DyUU * DyUU);
@@ -8169,11 +8237,13 @@ struct FVoxelWorldImpl
 	double WidestAdmissionCutoffM() const
 	{
 		double Widest = -1.0;
-		for (const double Cutoff : LevelAdmissionCutoffDistSq)
+		for (int32 L = 0; L < VoxelCoords::kNumLevels; ++L)
 		{
+			const double Cutoff = LevelAdmissionCutoffDistSq[L];
 			if (Cutoff < DBL_MAX)
 			{
-				Widest = FMath::Max(Widest, FMath::Sqrt(Cutoff) / 100.0);
+				// Stored on the key scale; printed in metres.
+				Widest = FMath::Max(Widest, FMath::Sqrt(Cutoff / StreamRingKeyScale[L]) / 100.0);
 			}
 		}
 		return Widest;
@@ -8672,6 +8742,17 @@ struct FVoxelWorldImpl
 	// proves where dispatches point.
 	FVector2D StreamBiasDirXY = FVector2D::ZeroVector;
 	double StreamBiasK = 0.0;
+	// voxel.Stream.RingNormalizedKey: this tick's per-level key multiplier,
+	// (Outer_0/Outer_L)^(2p), 1.0 everywhere with the switch off. Set once
+	// per streaming tick next to the bias pair above, for the same reason:
+	// the entry scan, SortPendingQueues, the cutoff test and the drop pass
+	// must all read ONE scale. When it changes between ticks the stored
+	// per-level cutoffs are rescaled with it (see the set site), so a cutoff
+	// derived from last tick's keys still means the same chunks.
+	// A short initializer would zero-fill and multiply every key by 0 --
+	// hence the static_assert at the set site.
+	double StreamRingKeyScale[VoxelCoords::kNumLevels] = {1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0};
+	double StreamRingKeyP = 0.0; // effective exponent this tick (speed-faded), for the log line
 	// The view direction each level's entry scan last decided admission
 	// against -- the rotation analogue of LastEntryScanAnchorXY, and the state
 	// that makes the rotation-rescan trigger self-quenching (the rescan it
@@ -11513,6 +11594,34 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 			{
 				StreamBiasDirXY = VelXY.GetSafeNormal();
 				StreamBiasK = VelK;
+			}
+		}
+	}
+	// voxel.Stream.RingNormalizedKey: this tick's per-level key scale. Read
+	// once here so every key producer in the tick sees the same scale (see
+	// StreamRingKeyScale's declaration). Cutoffs are rescaled in place so a
+	// boundary derived from last tick's keys keeps naming the same chunks.
+	{
+		static_assert(VoxelCoords::kNumLevels == 8, "StreamRingKeyScale's initializer has 8 entries");
+		double P = double(VoxelStreamAdmission::RingNormalizedKeyP());
+		const double MinSpeedM = double(VoxelStreamAdmission::RingNormalizedKeyMinSpeedM());
+		if (P > 0.0 && MinSpeedM > 0.0)
+		{
+			P *= FMath::Clamp((SmoothedAnchorSpeedUUPerSec / 100.0) / MinSpeedM, 0.0, 1.0);
+		}
+		StreamRingKeyP = P;
+		const UVoxelWorldSubsystem::FRingPreset* Presets = UVoxelWorldSubsystem::GetRingPresets();
+		for (int32 L = 0; L < VoxelCoords::kNumLevels; ++L)
+		{
+			const double NewScale =
+				(P > 0.0) ? FMath::Pow(Presets[0].OuterMeters / Presets[L].OuterMeters, 2.0 * P) : 1.0;
+			if (NewScale != StreamRingKeyScale[L])
+			{
+				if (LevelAdmissionCutoffDistSq[L] < DBL_MAX)
+				{
+					LevelAdmissionCutoffDistSq[L] *= NewScale / StreamRingKeyScale[L];
+				}
+				StreamRingKeyScale[L] = NewScale;
 			}
 		}
 	}
@@ -15541,7 +15650,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       // -VoxelAdmissionCapMax. drainEMA is the controller's one input;
 	       // if it does not track dispatched/5s / 5 the EMA is broken, which
 	       // no downstream number would otherwise reveal.
-	       TEXT("drainEMA=%.0f capSrc=%s"),
+	       TEXT("drainEMA=%.0f capSrc=%s keyP=%.2f"),
 	       // The EFFECTIVE cap: identical to GetPendingJobCap() unless
 	       // -VoxelAdmissionCapDrainSec is on, in which case this line is the
 	       // arm's proof of traffic -- cap pinned at the static floor with
@@ -15549,7 +15658,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       EffectivePendingJobCap,
 	       WidestAdmissionCutoffM(),
 	       (long long)CandidatesRejectedSinceLog, (long long)RecordsDroppedSinceLog,
-	       DrainPerSecEMA, EffectiveCapSrc);
+	       DrainPerSecEMA, EffectiveCapSrc, StreamRingKeyP);
 
 	// PER-LEVEL, PER-REASON attribution of the line above (2026-08-23; see
 	// LevelRejBudgetSinceLog's doc comment for the night this would have
@@ -15565,7 +15674,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	           [&](int32 L)
 	           {
 		           const double CutM = (LevelAdmissionCutoffDistSq[L] < DBL_MAX)
-		                                   ? FMath::Sqrt(LevelAdmissionCutoffDistSq[L]) / 100.0
+		                                   ? FMath::Sqrt(LevelAdmissionCutoffDistSq[L] / StreamRingKeyScale[L]) / 100.0
 		                                   : -1.0;
 		           // q= appended 2026-08-23 (at the END of the block, same
 		           // old-leg-grep rule as the aggregate line): this ring's
@@ -20916,7 +21025,8 @@ void FVoxelWorldImpl::SortPendingQueues(const FVector& Anchor, int32 OnlyLevel)
 		const double DistSq3D = FMath::Square(CenterX - Anchor.X) + FMath::Square(CenterY - Anchor.Y) +
 		                        FMath::Square(CenterZ - Anchor.Z);
 		return VoxelStreamAdmission::PrioritySortKeySq(LevelKey.Level, DistSq3D, CenterX - Anchor.X,
-		                                                CenterY - Anchor.Y, StreamBiasDirXY, BiasK);
+		                                                CenterY - Anchor.Y, StreamBiasDirXY, BiasK,
+		                                                StreamRingKeyScale[LevelKey.Level]);
 	};
 	// docs/m2-plan.md item 1: "Budgets shared across levels, nearest-first
 	// within level, lower level (finer) wins priority at equal distance."
@@ -21585,7 +21695,7 @@ FVoxelWorldImpl::EAdmitEvalOutcome FVoxelWorldImpl::AdmitCandidateEvaluate(
 	// pair SortPendingQueues refreshed this tick's stored keys with.
 	const double SortKeySq = VoxelStreamAdmission::PrioritySortKeySq(
 	    QueueLevel, DistSq3D, CenterX - Anchor.X, CenterY - Anchor.Y, StreamBiasDirXY,
-	    StreamBiasK);
+	    StreamBiasK, StreamRingKeyScale[QueueLevel]);
 	if (!bOverlayAware && SortKeySq >= LevelAdmissionCutoffDistSq[QueueLevel])
 	{
 		++CandidatesRejectedSinceLog;
@@ -22292,7 +22402,10 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& InAnchor)
 			LP.InnerEvictUU = VoxelStreamAdmission::InnerEvictUU(ResidLevel);
 			LP.UnloadOuterUU = VoxelStreamAdmission::UnloadOuterUU(ResidLevel);
 			LP.VerticalKeepUU = VoxelUnderground::VerticalKeepUU(ResidLevel, LP.ChunkEdgeUU);
-			LP.CutoffSortKeySq = LevelAdmissionCutoffDistSq[ResidLevel];
+			// The shader forms its own key in metres^2; hand it the cutoff on that scale.
+			LP.CutoffSortKeySq = (LevelAdmissionCutoffDistSq[ResidLevel] < DBL_MAX)
+			                         ? LevelAdmissionCutoffDistSq[ResidLevel] / StreamRingKeyScale[ResidLevel]
+			                         : DBL_MAX;
 			const FVoxelCoord ResidAnchorVoxel = WorldToVoxelForLevel(Anchor, ResidLevel);
 			const FVoxelChunkKey ResidAnchorChunk = ChunkKeyForVoxel(ResidAnchorVoxel);
 			LP.AnchorChunk = FIntVector(ResidAnchorChunk.X, ResidAnchorChunk.Y, ResidAnchorChunk.Z);
@@ -24301,7 +24414,9 @@ void FVoxelWorldImpl::TruncatePendingJobQueue()
 		for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
 		{
 			const double ClampedUU = FMath::Min(FloorUU, VoxelStreamAdmission::AdmitOuterUU(Level));
-			FloorKeySqByLevel[Level] = (ClampedUU > 0.0) ? FMath::Square(ClampedUU) : 0.0;
+			// On the KEY scale (StreamRingKeyScale), like the entries it is compared to.
+			FloorKeySqByLevel[Level] =
+				(ClampedUU > 0.0) ? FMath::Square(ClampedUU) * StreamRingKeyScale[Level] : 0.0;
 			LevelFloorUUForLog[Level] = ClampedUU;
 		}
 	}
