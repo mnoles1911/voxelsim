@@ -28,6 +28,22 @@ public:
     FootprintResolveCache(size_t entries=8192,uint64_t bytes=64ull*1024*1024,uint64_t entryBytes=2ull*1024*1024,size_t history=8192,size_t pending=8)
         :maxEntries_(entries),maxHistory_(history),maxPending_(pending),maxBytes_(bytes),maxEntryBytes_(entryBytes){}
     FootprintResolveCache(const FootprintResolveCache&)=delete;FootprintResolveCache& operator=(const FootprintResolveCache&)=delete;
+    // THE LIMITS, SETTABLE AFTER CONSTRUCTION, because the one that mattered was
+    // invisible. `pending` defaults to EIGHT: at most eight warm tokens may be
+    // outstanding at once, whatever the caller's launch or in-flight caps say.
+    // On 2026-09-13 a run with launchCap=64 and inFlightCap=256 refused
+    // 4,906,442 launches for want of a token while the game thread paid 191
+    // seconds of cold resolves inline. Growing is safe at any time; shrinking is
+    // too, because putOwned already evicts to fit before inserting.
+    void setLimits(size_t entries,uint64_t bytes,uint64_t entryBytes,size_t history,size_t pending){
+        if(entries)maxEntries_=entries;
+        if(bytes)maxBytes_=bytes;
+        if(entryBytes)maxEntryBytes_=entryBytes;
+        if(history)maxHistory_=history;
+        if(pending)maxPending_=pending;
+    }
+    size_t pendingLimit()const{return maxPending_;}
+    size_t pendingCount()const{return pending_.size();}
     void disable(){invalidate();epoch_=UINT64_MAX;}
     uint64_t epoch()const{return epoch_;}uint64_t bytes()const{return bytes_;}
     size_t size()const{return entries_.size();}size_t historySize()const{return history_.size();}size_t pendingSize()const{return pending_.size();}
@@ -62,8 +78,24 @@ public:
 };
 // Bound ALL site layers because AssetField::instancesForRect currently builds
 // the all-layer site vector before terrainOnly filters column sampling.
+//
+// THE CEILING IS NOW 1<<20 RATHER THAN 8192, and the reason is an asymmetry
+// measured on 2026-09-13. This bound gates only SPECULATIVE warming. The inline
+// path -- the game thread, inside the GPU submit -- resolves the same footprint
+// with no bound at all when the cache misses. So for every rect between the two
+// numbers, the old ceiling did not prevent the work: it guaranteed the work
+// happened on the game thread instead of on a BackgroundLow worker.
+//
+// What that cost, over 31 windows of a forest walk: 6,716 coarse cold misses at
+// 28.91 ms each, 194,162 ms of game thread, worst single call 526 ms. Coarse
+// footprints are 89% of the misses and 98.4% of the milliseconds, and every one
+// of them was refused for warming by this line while being paid inline anyway.
+//
+// The ceiling is kept -- an unbounded site vector is still a real hazard, and a
+// caller may still pass a smaller cap -- but it now sits above the coarse
+// footprints this system actually asks for rather than below them.
 inline bool footprintResolveSitesBound(const AssetVoxelRect& rect,const std::vector<AssetLayer>& layers,uint64_t cap=8192){
-    if(!cap||cap>8192||rect.vx1<rect.vx0||rect.vy1<rect.vy0||layers.size()>kAssetLayerCount)return false;
+    if(!cap||cap>(uint64_t(1)<<20)||rect.vx1<rect.vx0||rect.vy1<rect.vy0||layers.size()>kAssetLayerCount)return false;
     constexpr int64_t pitch=kVoxelSizeMm;
     constexpr int64_t safe=INT64_MAX/pitch-INT32_MAX;
     if(rect.vx0 < -safe||rect.vy0 < -safe||rect.vx1>safe||rect.vy1>safe)return false;

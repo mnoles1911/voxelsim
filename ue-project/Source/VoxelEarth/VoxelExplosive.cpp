@@ -1,4 +1,5 @@
 #include "VoxelExplosive.h"
+#include "VoxelFrameProfiling.h"
 #include "VoxelGameplayActors.h"
 
 #include "Camera/PlayerCameraManager.h"
@@ -126,6 +127,7 @@ void AVoxelExplosive::Launch(const FVector& InitialVelocityUUPerSec)
 
 void AVoxelExplosive::Tick(float DeltaSeconds)
 {
+	CSV_SCOPED_TIMING_STAT(VoxelStream, ExplosiveTickMs);
 	if(!HasAuthority()) return;
 	Super::Tick(DeltaSeconds);
 

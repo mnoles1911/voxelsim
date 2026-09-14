@@ -6,6 +6,7 @@
 // ==========================================================================
 
 #include "VoxelRiverRibbonActor.h"
+#include "VoxelFrameProfiling.h"
 
 #include "Camera/PlayerCameraManager.h"
 #include "Engine/World.h"
@@ -496,6 +497,7 @@ void AVoxelRiverRibbonActor::CountSubPixelPaths(const FVector& CamUU)
 
 void AVoxelRiverRibbonActor::Tick(float DeltaTime)
 {
+	CSV_SCOPED_TIMING_STAT(VoxelStream, RiverRibbonTickMs);
 	Super::Tick(DeltaTime);
 
 	if (!bEnabled || !Mesh)

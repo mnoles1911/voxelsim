@@ -1,4 +1,4 @@
-#include "VoxelEcologicalPlacement.h"
+﻿#include "VoxelEcologicalPlacement.h"
 #include "VoxelAppearanceBankBinding.h"
 #include "Dom/JsonObject.h"
 #include "Serialization/JsonReader.h"
@@ -6,7 +6,64 @@
 #include "HAL/FileManager.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
+#include "Misc/CommandLine.h"
+#include "Misc/Parse.h"
+#include "VoxelEarth.h"
 #include <openssl/sha.h>
+
+// PER-KIND LEVERS FOR TEST AND DEVELOPMENT (owner request, 2026-09-13):
+//   -VoxelAssetKinds=tree,bush        place ONLY these kinds
+//   -VoxelNoAssetKinds=creature,reed  place everything EXCEPT these
+// Kind names are the manifest's own (tree bush rock grass reed flower fish bird
+// quadruped cetacean) plus two groups: "creature" = fish+bird+quadruped+cetacean,
+// "plant" = tree+bush+rock+grass+reed+flower. Case-insensitive; a trailing s is
+// ignored. "craftable" is not an ecology kind -- craftables are not placed by
+// this system -- so it is reported as unknown rather than silently accepted.
+//
+// WHERE THE SWITCH ACTS, AND WHY HERE. This is the one place species enter the
+// field. Excluded species are KEPT in the table with every biome weight zeroed
+// rather than removed: the built table is not index-aligned with the manifest
+// (rows with no scattered layer or no authored density are skipped), other
+// tables key on the species index, and a zero weight is already the manifest's
+// own "not permitted" path. Nothing is placed, resolved, or rendered for a
+// zeroed species -- the cold-resolve cost of
+// docs/measurements/submit-cold-resolve-2026-09-13/ goes with it.
+//
+// AssetSpecies.bankId IS the manifest row index (foldRow is called with
+// static_cast<uint16_t>(i)), which is what makes the kind lookup below sound.
+//
+// THE LOG LINE IS THE ENGAGEMENT PROOF: kept/total per kind, so a run that asked
+// for trees only and still shows bushes can be read against it.
+static void ApplyAssetKindSwitches(const vxc::AssetManifest& Manifest,std::vector<vxc::AssetSpecies>& Table){
+    FString Only,Not;
+    const bool bOnly=FParse::Value(FCommandLine::Get(),TEXT("VoxelAssetKinds="),Only)&&!Only.IsEmpty();
+    const bool bNot=FParse::Value(FCommandLine::Get(),TEXT("VoxelNoAssetKinds="),Not)&&!Not.IsEmpty();
+    if(!bOnly&&!bNot)return;
+    static const TCHAR* const KindNames[vxc::kAssetKindCount]={TEXT("tree"),TEXT("bush"),TEXT("rock"),TEXT("grass"),TEXT("reed"),TEXT("flower"),TEXT("fish"),TEXT("bird"),TEXT("quadruped"),TEXT("cetacean")};
+    auto ParseMask=[&](const FString& Spec,FString& Unknown)->uint32{
+        uint32 Mask=0;TArray<FString> Parts;Spec.ParseIntoArray(Parts,TEXT(","),true);
+        for(FString P:Parts){P=P.TrimStartAndEnd().ToLower();if(P.Len()>1&&P.EndsWith(TEXT("s")))P.LeftChopInline(1);
+            if(P==TEXT("creature")){Mask|=(1u<<6)|(1u<<7)|(1u<<8)|(1u<<9);continue;}
+            if(P==TEXT("plant")){Mask|=(1u<<0)|(1u<<1)|(1u<<2)|(1u<<3)|(1u<<4)|(1u<<5);continue;}
+            bool Found=false;for(uint32 K=0;K<vxc::kAssetKindCount;++K)if(P==KindNames[K]){Mask|=1u<<K;Found=true;break;}
+            if(!Found){if(!Unknown.IsEmpty())Unknown+=TEXT(",");Unknown+=P;}}
+        return Mask;};
+    FString Unknown;
+    uint32 Allow=bOnly?ParseMask(Only,Unknown):((1u<<vxc::kAssetKindCount)-1u);
+    if(bNot)Allow&=~ParseMask(Not,Unknown);
+    const auto& Rows=Manifest.species();
+    int32 Kept[vxc::kAssetKindCount]={},Zeroed[vxc::kAssetKindCount]={};
+    for(auto& S:Table){
+        if(S.bankId>=Rows.size())continue;
+        const uint32 K=uint32(Rows[S.bankId].kind);if(K>=vxc::kAssetKindCount)continue;
+        if(Allow&(1u<<K)){++Kept[K];continue;}
+        for(uint32 B=0;B<vxc::kBiomeCount;++B)S.weightPerMille[B]=0;
+        ++Zeroed[K];}
+    FString Report;
+    for(uint32 K=0;K<vxc::kAssetKindCount;++K)if(Kept[K]||Zeroed[K])Report+=FString::Printf(TEXT(" %s=%d/%d"),KindNames[K],Kept[K],Kept[K]+Zeroed[K]);
+    UE_LOG(LogVoxelEarth,Display,TEXT("VoxelAssetKinds: kept/total per kind:%s%s"),*Report,
+        Unknown.IsEmpty()?TEXT(""):*FString::Printf(TEXT(" | UNKNOWN kinds ignored: %s (craftables are not placed by ecology)"),*Unknown));
+}
 
 bool VoxelEcologicalPlacement::Install(const vxc::EcoPlacementConfig& Config,const vxc::AssetManifest& Manifest,
     vxc::AssetField& Field,std::vector<vxc::AssetSpecies>& SpeciesTable){
@@ -16,6 +73,7 @@ bool VoxelEcologicalPlacement::Install(const vxc::EcoPlacementConfig& Config,con
         Policies.push_back({P.bankId,P.densityAbundanceQ10,P.densitySpacingMm,Config.biomeMask});
     std::vector<vxc::AssetSpecies> NextTable;
     vxc::assetSpeciesTableFromManifest(Manifest,NextTable,Policies);
+    ApplyAssetKindSwitches(Manifest,NextTable);
     auto NextField=Field;
     NextField.setSpecies(NextTable.data(),int(NextTable.size()));
     if(!NextField.setEcology(Config))return false;

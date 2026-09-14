@@ -55,6 +55,20 @@ DEFINE_LOG_CATEGORY_STATIC(LogVoxelMarch, Log, All);
 DECLARE_GPU_STAT_NAMED(VoxelMarch, TEXT("VoxelMarch"));
 DECLARE_GPU_STAT_NAMED(VoxelMarchEmit, TEXT("VoxelMarchEmit"));
 
+// A THIRD, for a pass that has never been priced. The ZTight reduce dispatches one
+// thread per chunk SLOT -- ChunkCapacity, 393,216 by default, and NOT the "~50k" the
+// comment at its dispatch site claims -- every frame, to produce 28 words whose inputs
+// change at streaming rate rather than frame rate. It opens no scope of its own, so its
+// GPU time is charged to VoxelMarch and nothing separates the two. That is why it has
+// sat unmeasured while VoxelMarch was read as if it were the march.
+//
+// GPU stat time is charged to the innermost scope, so this bracket costs nothing and
+// changes no behaviour. It exists to DECIDE whether gating the dispatch on the index
+// generation is worth adding a correctness surface to the one arm in this file that can
+// produce a hole. If it reads below ~0.15 ms at the forest site, that idea is dead and
+// should not be built.
+DECLARE_GPU_STAT_NAMED(VoxelMarchZTight, TEXT("VoxelMarchZTight"));
+
 // Macro, not a const TCHAR*: IMPLEMENT_GLOBAL_SHADER stringizes its path
 // argument (same note as VoxelFluidSim.cpp:21).
 #define VOXEL_MARCH_USF "/VoxelEarth/VoxelMarch.usf"
@@ -11662,6 +11676,7 @@ void FVoxelMarchRenderExtension::PreRenderBasePass_RenderThread(FRDGBuilder& Gra
 			// declines, RDG culls the orphaned clear rather than paying it.
 			if (Arm.ZTight != 0 && Params->MarchChunkIndex != nullptr)
 			{
+				RDG_EVENT_SCOPE_STAT(GraphBuilder, VoxelMarchZTight, "VoxelMarchZTight");
 				const uint32 ZtChunkSlots =
 					GetGlobalVoxelBrickPool().GetConfig().ChunkCapacity;
 				FVoxelMarchState::FZTightReadback* ZtFree = nullptr;

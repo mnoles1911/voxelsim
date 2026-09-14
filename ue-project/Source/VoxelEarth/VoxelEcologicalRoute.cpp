@@ -1,4 +1,5 @@
 #include "VoxelEcologicalRoute.h"
+#include "VoxelFrameProfiling.h"
 #include "VoxelEarthFlyPawn.h"
 #include "VoxelCharacterMovement.h"
 #include "VoxelWorldSubsystem.h"
@@ -37,6 +38,12 @@ TSharedPtr<FVoxelEcologicalRoute> FVoxelEcologicalRoute::ParseArguments(const TC
     FParse::Value(Arguments,TEXT("VoxelEcologyRouteSha256="),R->RouteHash);
     FParse::Value(Arguments,TEXT("VoxelEcologyRouteOutput="),R->Output);
     FParse::Value(Arguments,TEXT("VoxelEcologyConfig="),R->ConfigPath);
+    // Clamped to the dial's own range rather than trusted: an out-of-range tier
+    // would otherwise silently become tier 0 (0.7 m/s) inside AdjustSpeedTier's
+    // clamp and the capture would look like a catastrophic slowdown that was
+    // really a typo. The log line at the walk start prints what was used.
+    if(FParse::Value(Arguments,TEXT("VoxelEcologyRouteSpeedTier="),R->SpeedTier))
+        R->SpeedTier=FMath::Clamp(R->SpeedTier,0,VoxelMovementTuning::kNumSpeedTiers-1);
     FString Assets;FParse::Value(Arguments,TEXT("VoxelAssetDir="),Assets);
     R->SpeciesPath=Assets/TEXT("species.vxm");
     FString Json;TSharedPtr<FJsonObject> O;
@@ -223,6 +230,7 @@ bool FVoxelEcologicalRoute::ExportFoundation(UWorld* W){
     return Known&&Saved&&PinsMatch();
 }
 void FVoxelEcologicalRoute::Tick(UWorld* W,float Dt){
+    CSV_SCOPED_TIMING_STAT(VoxelStream, EcoRouteTickMs);
     if(Stage==EStage::Done)return;
     if(Stage==EStage::Flushing){
         // Continue ticking until asynchronous file writing completes. A hung
@@ -261,7 +269,17 @@ void FVoxelEcologicalRoute::Tick(UWorld* W,float Dt){
         const bool Settled=Field&&Field->ecologyEnabled()&&Ground->IsFineRingSettled(Ready,Total)&&Pending==0&&Progress.TotalJobsInFlight==0&&Details->IsPlacementSettled(Instances);
         if(!Settled){Quiet=-1;return;}if(Quiet<0)Quiet=Now;if(Now-Quiet<5)return;
         if(FVector2D::Distance(FVector2D(Pos.X/100.,Pos.Y/100.),FVector2D(SpawnX,SpawnY))>4){Finish(W,false,TEXT("Spawn differs from pinned route"));return;}
-        if(!bMovementStarted){Pawn->SetWalkMode(true);Mover->AdjustSpeedTier(2-Mover->GetSpeedTierIndex());bMovementStarted=true;return;}
+        if(!bMovementStarted){
+            Pawn->SetWalkMode(true);Mover->AdjustSpeedTier(SpeedTier-Mover->GetSpeedTierIndex());
+            // PRINTED, because a pace that silently differs from the one asked
+            // for turns every millisecond on the leg into a number about
+            // another experiment. Read this against controller_speed_m_s in the
+            // samples CSV: the dial is what was requested, that column is what
+            // the pawn actually reached.
+            UE_LOG(LogVoxelWalkTest,Display,TEXT("VoxelRoute SPEED_TIER index=%d name=%s dialMps=%.2f"),
+                   Mover->GetSpeedTierIndex(),VoxelMovementTuning::NameForTier(Mover->GetSpeedTierIndex()),
+                   Mover->GetDialSpeedUU()/100.0);
+            bMovementStarted=true;return;}
         if(!Pawn->IsGroundedNow())return;
         if(!StartProfile(Now))return;
         Stage=EStage::Walking;StageStart=LastProgress=Now;LastPosition=Pos;LastSample=Now;LastSamplePosition=Pos;

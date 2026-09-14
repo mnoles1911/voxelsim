@@ -1,11 +1,73 @@
 param([Parameter(Mandatory=$true)][string]$AssetDirectory,[Parameter(Mandatory=$true)][string]$Output,
     [string]$SpawnAt='-156260,-82356',[ValidateRange(60,7200)][int]$TimeoutSeconds=900,
-    [switch]$DetailMeshLOD,[switch]$DetailSizeCull,[switch]$DetailRetireUnused,[string]$DetailMeshCache='',
+    [switch]$DetailMeshLOD,[switch]$DetailSizeCull,[switch]$NoDetailSizeCull,[switch]$DetailRetireUnused,[string]$DetailMeshCache='',
     [switch]$PredictiveAssetResolve,[switch]$NoPredictiveAssetResolve,[switch]$MarchDispatchIdentity,
-    [switch]$AllowPreviewDetailCache,[ValidateRange(16,512)][double]$DetailRingMeters=48,
-    [string[]]$ExtraArgs=@())
+    [switch]$AllowPreviewDetailCache,[ValidateRange(16,512)][double]$DetailRingMeters=256,
+    [string[]]$ExtraArgs=@(),
+    # Output resolution. The engine renders at a screen percentage of this and TSR
+    # upscales; the log's "px of a WxH view" line is the real internal size. Default
+    # 1280x720 keeps every historical capture comparable -- change it only to measure
+    # resolution scaling, and never between the arms of an A/B.
+    [ValidateRange(640,3840)][int]$RenderWidth=1280,[ValidateRange(360,2160)][int]$RenderHeight=720,
+    # Screen percentage. THIS is the resolution knob that works: -ResX/-ResY are inert here
+    # (2560x1440 requested still rendered 832x468, 2026-09-10), and the project default is
+    # r.ScreenPercentage=65 in DefaultEngine.ini. Passed via -dpcvars because it is
+    # Init-latched. Use it to measure pixel scaling; never vary it between A/B arms.
+    [ValidateRange(10,100)][int]$ScreenPercentage=0)
 $ErrorActionPreference='Stop'
 if(Get-Process UnrealEditor,UnrealEditor-Cmd,cl,link,MSBuild,UnrealBuildTool,dotnet -ErrorAction SilentlyContinue){throw 'UE or a build process is already running'}
+# FOREIGN GPU LOAD. Added 2026-09-11 after a capture was launched while a game
+# was running on the same GPU. The process guards below catch UE and build
+# tools; they cannot see an unrelated 3D application, and a GPU timing capture
+# taken next to one measures contention, not the renderer. The signature is
+# recognisable after the fact -- the run sat at 62 CPU seconds for 25 minutes --
+# but nothing refused it at the start, which is the half that matters.
+#
+# Returns $null if the counter is unavailable (then we warn rather than refuse,
+# because failing closed on a missing instrument would block every capture on a
+# machine that simply does not expose it).
+function Get-ForeignGpuLoad {
+    # Three samples, and judge on the MINIMUM per process. A single sample cannot
+    # tell a browser compositing a frame from a game holding the card: both read
+    # ~20% for an instant. Sustained load shows up in every sample; a spike does
+    # not. Measured 2026-09-11: a game sat at 77% and a video tab at a steady
+    # 16.5-20.7%, while an idle desktop reads nothing above 1%.
+    param([int[]]$OwnPids = @(), [int]$Samples = 3, [int]$GapMs = 700)
+    $mins = @{}
+    for ($i = 0; $i -lt $Samples; $i++) {
+        try { $set = (Get-Counter '\GPU Engine(*)\Utilization Percentage' -ErrorAction Stop).CounterSamples }
+        catch { return $null }
+        $byProc = @{}
+        foreach ($c in $set) {
+            if ($c.CookedValue -le 0.5) { continue }
+            if ($c.InstanceName -match 'pid_(\d+)') {
+                $procId = [int]$Matches[1]
+                if ($OwnPids -contains $procId) { continue }
+                $byProc[$procId] = $byProc[$procId] + $c.CookedValue
+            }
+        }
+        foreach ($k in @($mins.Keys)) { if (-not $byProc.ContainsKey($k)) { $mins[$k] = 0 } }
+        foreach ($k in $byProc.Keys) {
+            if ($i -eq 0) { $mins[$k] = $byProc[$k] }
+            elseif ($byProc[$k] -lt $mins[$k]) { $mins[$k] = $byProc[$k] }
+        }
+        if ($i -lt $Samples - 1) { Start-Sleep -Milliseconds $GapMs }
+    }
+    $busy = @()
+    foreach ($k in $mins.Keys) {
+        if ($mins[$k] -ge 10) {
+            $p = Get-Process -Id $k -ErrorAction SilentlyContinue
+            $busy += [pscustomobject]@{ ProcessId = $k; Name = $(if ($p) { $p.ProcessName } else { '(exited)' }); Percent = [math]::Round($mins[$k], 1) }
+        }
+    }
+    return , $busy
+}
+$foreignGpu = Get-ForeignGpuLoad
+if ($null -eq $foreignGpu) { Write-Output 'WARNING: GPU utilisation counter unavailable; foreign GPU load was NOT checked' }
+elseif ($foreignGpu.Count) {
+    throw ('Another process is using the GPU (' + (($foreignGpu | ForEach-Object { "$($_.Name) $($_.Percent)%" }) -join ', ') + '); a timing capture taken beside it measures contention, not this renderer')
+}
+
 $outPath=[IO.Path]::GetFullPath($Output)
 if(Test-Path -LiteralPath $outPath){throw 'Use a fresh output directory'}
 $assetPath=[IO.Path]::GetFullPath($AssetDirectory)
@@ -17,11 +79,14 @@ $cachePath=$null
 if($DetailMeshCache){$cachePath=(Resolve-Path -LiteralPath $DetailMeshCache).Path}
 New-Item -ItemType Directory -Path $outPath | Out-Null
 $runArgs=@('D:\voxelsim\ue-project\VoxelEarth.uproject','/Engine/Maps/Entry','-game','-dx12','-RenderOffscreen','-unattended','-nosplash','-nop4',
-    '-ResX=1280','-ResY=720','-csvGpuStats','-csvCompression=0',"-VoxelAssetDir=$assetPath","-VoxelEcologyConfig=$config",
+    "-ResX=$RenderWidth","-ResY=$RenderHeight",'-csvGpuStats','-csvCompression=0',"-VoxelAssetDir=$assetPath","-VoxelEcologyConfig=$config",
     '-VoxelWalkTest=1','-VoxelWalkWaitForEcology',"-VoxelDetailRingMeters=$($DetailRingMeters.ToString([Globalization.CultureInfo]::InvariantCulture))","-VoxelSpawnAt=$SpawnAt",'-VoxelSpawnAltM=5',
     '-VoxelTimeOfDay=10:00','-VoxelDate=2026-05-15','-VoxelTimeScale=0',"-UserDir=$outPath/session","-abslog=$outPath/game.log")
 if($DetailMeshLOD){$runArgs+='-VoxelDetailMeshLOD'}
-if($DetailSizeCull){$runArgs+='-VoxelDetailSizeCull'}
+# Size culling is DEFAULT ON since 2026-09-11 (owner's verdict on the route 16/17
+# pictures). -DetailSizeCull is now a no-op kept so older call sites still parse;
+# -NoDetailSizeCull is the control arm.
+if($NoDetailSizeCull){$runArgs+='-VoxelNoDetailSizeCull'}
 if($DetailRetireUnused){$runArgs+='-VoxelDetailRetireUnused'}
 if($PredictiveAssetResolve){$runArgs+='-VoxelPredictiveAssetResolve'}
 if($NoPredictiveAssetResolve){$runArgs+='-VoxelNoPredictiveAssetResolve'}
@@ -30,6 +95,7 @@ if($cachePath){$runArgs+="-VoxelDetailMeshCache=$cachePath"}
 if($AllowPreviewDetailCache){$runArgs+='-VoxelDetailMeshCachePreview'}
 # Opt-in diagnostics (e.g. -VoxelR0EntryProfile -VoxelRecomputeCensus). Recorded in the manifest's
 # argument list like every other flag, so a receipt binds them; never used for A/B arms.
+if($ScreenPercentage){$runArgs+="-dpcvars=r.ScreenPercentage=$ScreenPercentage"}
 foreach($extra in $ExtraArgs){if($extra -notmatch '^-[A-Za-z0-9=.:,_-]+$'){throw 'Unsupported extra argument'};$runArgs+=$extra}
 $record=@{arguments=$runArgs;configurationSha256=(Get-FileHash -LiteralPath $config).Hash;startedUtc=[DateTime]::UtcNow.ToString('o');
     scope='Actual movement controller in ecological forest after streaming settles; scripted straight route, not general navigation acceptance'}
@@ -56,6 +122,7 @@ try {
 $proc=Start-Process D:\UE_5.8\Engine\Binaries\Win64\UnrealEditor-Cmd.exe -ArgumentList $quotedArgs -WindowStyle Hidden -PassThru
 Write-Output "Ecological walking test PID $($proc.Id)"
 $deadline=[DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+$gpuTick=0
 while(-not $proc.WaitForExit(1000)){
     # Fail this owned capture if another renderer/compiler competes. Do not
     # terminate somebody else's process. ShaderCompileWorker and the engine's
@@ -64,6 +131,24 @@ while(-not $proc.WaitForExit(1000)){
     if($competing.Count){
         $validation.competingProcesses=@($competing | ForEach-Object {@{id=$_.Id;name=$_.ProcessName;observedUtc=[DateTime]::UtcNow.ToString('o')}})
         throw 'Competing UE/compiler process detected; capture is invalid'
+    }
+    # Foreign GPU load DURING the run, not only at the start. The start guard is not
+    # enough on its own: capture 37 began on an idle GPU and a browser resumed compositing
+    # before it finished. That one survived -- its GPU time was flat across every fifth of
+    # the run -- but nothing except luck made it so, and a start-only check cannot tell a
+    # clean capture from a lucky one.
+    #
+    # Sampled every ~10th tick rather than every second, because reading the counter costs
+    # real time and perturbing the thing being measured to check whether it is perturbed is
+    # its own mistake. Get-ForeignGpuLoad takes the minimum of three reads, so a one-frame
+    # spike does not void a good capture while sustained load does.
+    $gpuTick++
+    if($gpuTick % 10 -eq 0){
+        $foreignNow=Get-ForeignGpuLoad -OwnPids @($proc.Id)
+        if($null -ne $foreignNow -and $foreignNow.Count){
+            $validation.competingProcesses=@($foreignNow | ForEach-Object {@{id=$_.ProcessId;name=$_.Name;gpuPercent=$_.Percent;observedUtc=[DateTime]::UtcNow.ToString('o')}})
+            throw ('Another process began using the GPU mid-capture (' + (($foreignNow | ForEach-Object { "$($_.Name) $($_.Percent)%" }) -join ', ') + '); this capture is invalid')
+        }
     }
     foreach($module in $moduleMetadata.Keys){
         $info=Get-Item -LiteralPath (Join-Path 'D:\voxelsim\ue-project\Binaries\Win64' $module)
@@ -76,7 +161,7 @@ while(-not $proc.WaitForExit(1000)){
     }
 }
 $log=Get-Content -LiteralPath "$outPath/game.log" -Raw
-if($DetailSizeCull -and $log -notmatch 'DetailSizeCull key=') {throw 'Requested size culling was not exercised'}
+if(-not $NoDetailSizeCull -and $log -notmatch 'DetailSizeCull key=') {throw 'Size culling is on by default but was not exercised'}
 $csvMatches=[regex]::Matches($log,'Writing CSV to file : (.+\.csv)')
 if($csvMatches.Count -eq 1){Copy-Item -LiteralPath $csvMatches[0].Groups[1].Value.Trim() -Destination "$outPath/frames.csv"}
 if($proc.ExitCode -ne 0){throw "Walking test exited $($proc.ExitCode)"}

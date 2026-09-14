@@ -1,4 +1,5 @@
 #include "VoxelThrownItem.h"
+#include "VoxelFrameProfiling.h"
 #include "VoxelGameplayActors.h"
 #include "VoxelPlayerRecords.h"
 #include "VoxelEarthPlayerController.h"
@@ -432,6 +433,7 @@ AVoxelThrownItem* AVoxelThrownItem::SpawnAndThrow(UWorld* World, const FVector& 
 
 void AVoxelThrownItem::Tick(float DeltaSeconds)
 {
+    CSV_SCOPED_TIMING_STAT(VoxelStream, ThrownItemTickMs);
     if (!HasAuthority()) return;
 	Super::Tick(DeltaSeconds);
 

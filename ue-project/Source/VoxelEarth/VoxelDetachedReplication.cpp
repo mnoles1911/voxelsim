@@ -1,4 +1,5 @@
 #include "VoxelDetachedReplication.h"
+#include "VoxelFrameProfiling.h"
 #include "VoxelDetachedPersistence.h"
 #include "VoxelEnvironmentAsset.h"
 #include "VoxelReplicaMotion.h"
@@ -170,6 +171,7 @@ void UVoxelDetachedReplication::Acknowledge(AVoxelEarthPlayerController* PC,uint
 }
 void UVoxelDetachedReplication::Tick(float Delta)
 {
+    CSV_SCOPED_TIMING_STAT(VoxelStream, DetachedReplTickMs);
     UWorld* W=GetWorld();if(!State||!W)return;
     VoxelDetachedNetworkFixture::Tick(W,Delta);
     if(W->GetNetMode()==NM_Client){

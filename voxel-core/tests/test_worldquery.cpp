@@ -94,6 +94,46 @@ VXC_TEST(worldquery_batch_reuse_rebuild_and_live_edits) {
     CHECK_EQ(next.preparationCount(),size_t(1));
 }
 
+// A BATCH MAY NOW OUTLIVE THE FRAME THAT MADE IT, so the one thing that can
+// change under it has to be checked rather than argued about. What the shortlist
+// caches is which asset INSTANCES overlap the rect: edits stay live (the test
+// above proves that), the amplifier is pure, and the remaining input is the
+// asset field's own configuration. AssetField::configurationRevision moves on
+// every mutating setter, and prepare() compares it.
+//
+// THE TEST CAN FAIL: the first half asserts the batch does NOT rebuild while
+// nothing changes -- so a version that rebuilt unconditionally (the old
+// behaviour, which is what per-frame recreation imitated) fails here -- and the
+// second asserts it DOES rebuild once the field is reconfigured, so a version
+// that never checked the revision fails there. Removing the revision line from
+// prepare() breaks exactly one of the two.
+VXC_TEST(worldquery_batch_survives_frames_until_the_field_changes) {
+    Fixture f;WorldQueryBatch<8> batch(f.world);
+    batch.prepare({-12,-11,-8,-7});
+    CHECK_EQ(batch.preparationCount(),size_t(1));
+    // Whatever a caller does across many "frames", an unchanged field and a
+    // contained rect must cost no rebuild at all.
+    for(int frame=0;frame<32;++frame) batch.prepare({-11,-10,-9,-8});
+    CHECK_EQ(batch.preparationCount(),size_t(1));
+
+    // Reconfigure the field: same rect, same world, but the instance set is no
+    // longer the one the kept query resolved.
+    AssetSpecies species[2];
+    for(int i=0;i<2;++i){auto& s=species[i];s.bankId=uint16_t(i+1);s.layer=uint8_t(i);s.heightMm=3000;
+        s.voxelSizeMm=100;s.elevMinMm=-1000000;s.elevMaxMm=9000000;s.slopeMaxMmPerM=100000;
+        // The change that matters: a water limit these columns no longer meet.
+        s.waterMaxMm=1;
+        for(int b=0;b<kBiomeCount;++b)s.weightPerMille[b]=1000;}
+    const auto before=f.field.configurationRevision();
+    f.field.setSpecies(species,2);
+    CHECK(f.field.configurationRevision()!=before);
+    batch.prepare({-11,-10,-9,-8});
+    CHECK_EQ(batch.preparationCount(),size_t(2));
+    // And having rebuilt once, it settles again rather than rebuilding forever.
+    batch.prepare({-11,-10,-9,-8});
+    CHECK_EQ(batch.preparationCount(),size_t(2));
+}
+
 VXC_TEST(worldquery_point_reach_and_invalid_rectangle_fallback) {
     Fixture f(0);WorldQuery<8> query(f.world,{-10,-10,10,10});
     int air=0,solid=0;

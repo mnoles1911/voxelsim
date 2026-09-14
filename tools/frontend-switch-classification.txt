@@ -526,6 +526,7 @@ VoxelDetailLodMinSaving
 VoxelDetailMeshCache
 VoxelDetailMeshCachePreview
 VoxelDetailMeshLOD
+VoxelDetailNanite
 VoxelDetailSizeCull
 VoxelEcologyConfig
 VoxelEcologyDecisionTrace

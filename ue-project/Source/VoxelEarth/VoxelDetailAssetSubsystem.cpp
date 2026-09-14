@@ -42,7 +42,7 @@ TSharedPtr<const FVoxelDetailMeshCacheIndex,ESPMode::ThreadSafe> LoadDetailCache
     if(!DetailCacheHashFile(FPackageName::LongPackageNameToFilename(TEXT("/Game/Voxel/M_VoxelDetailAsset"),TEXT(".uasset")),E.MaterialSourceSHA256))return nullptr;
     float Tolerance=.015f,Saving=.20f;FParse::Value(FCommandLine::Get(),TEXT("VoxelDetailLodColorTolerance="),Tolerance);FParse::Value(FCommandLine::Get(),TEXT("VoxelDetailLodMinSaving="),Saving);
     if(!FMath::IsFinite(Tolerance)||!FMath::IsFinite(Saving))return nullptr;
-    E.Settings=FString::Printf(TEXT("schema=2;lod=%d;tolerance=%.9g;minSaving=%.9g;screens=1,.10,.025;patches=2,4;bounds=windXY-v1-allLOD-margin0.01UU-unitScale-quarterYaw-Z0-missing30-rejectNonFinite;collision=0;nanite=0;cpuAccess=1;fingerprint=1;authoredLOD=1"),FParse::Param(FCommandLine::Get(),TEXT("VoxelDetailMeshLOD"))?1:0,FMath::Clamp(Tolerance,0.f,.05f),FMath::Clamp(Saving,0.f,1.f));
+    E.Settings=FString::Printf(TEXT("schema=2;lod=%d;tolerance=%.9g;minSaving=%.9g;screens=1,.10,.025;patches=2,4;bounds=windXY-v1-allLOD-margin0.01UU-unitScale-quarterYaw-Z0-missing30-rejectNonFinite;collision=0;nanite=%d;cpuAccess=1;fingerprint=1;authoredLOD=1"),FParse::Param(FCommandLine::Get(),TEXT("VoxelDetailMeshLOD"))?1:0,FMath::Clamp(Tolerance,0.f,.05f),FMath::Clamp(Saving,0.f,1.f),(!FParse::Param(FCommandLine::Get(),TEXT("VoxelNoDetailNanite")))?1:0);
     return FVoxelDetailMeshCacheIndex::ParseEditorSource(Text,Publication,Binding->SourceSnapshot(),E,Error);
 #else
     return nullptr;
@@ -1452,7 +1452,87 @@ UStaticMesh* VoxelBakePersistentDetailMesh(const vxc::AssetGrid& Grid,
     auto Add=[&](const FVoxelDetailLodMesh& G){auto D=MakeUnique<FMeshDescription>();FillDetailMeshDescription(G,*D);Descs.Add(D.Get());Owned.Add(MoveTemp(D));};
     Add(Geometry);for(const auto& Lod:Geometry.Lods)Add(Lod);
     Mesh->SetNumSourceModels(Descs.Num());Mesh->SetAutoComputeLODScreenSize(false);
-    Mesh->NaniteSettings.bEnabled=false;
+    // DEFAULT ON SINCE 2026-09-12, ON THE OWNER'S VERDICT. -VoxelNoDetailNanite is off.
+    //
+    // The pictures were shot as two walks of the same authored route stopping at the
+    // same eight stands on two bakes differing only by this flag, arrival positions
+    // 0-35 cm apart. The owner could not tell them apart and chose the faster one. The
+    // lighting question below was the reason to ask -- these plants enter the Lumen
+    // scene for the first time -- and it is answered.
+    //
+    // The cost side, control against Nanite on equivalent bakes, quiet stretch:
+    //   GPUTime              19.310 -> 12.632 ms   -34.6%   (49 fps -> 72)
+    //   GPU/Basepass          4.402 ->  0.029 ms   -99.3%
+    //   GPU/RenderVelocities  4.399 ->  0.006 ms   -99.9%
+    //   DrawCall/Basepass       131 ->      4
+    //   DrawCall/RenderVelocities 127 ->    0
+    //   GPU/VoxelMarch        8.879 ->  8.917 ms            unmoved, the control
+    // Ground cover's two passes 8.801 -> 0.035, plus 1.165 of Nanite's own: 8.80 -> 1.20.
+    //
+    // THE VELOCITY PASS DOES NOT GET CHEAPER, IT STOPS EXISTING -- zero draw calls,
+    // because Nanite vertex factories are excluded from velocity shader compilation
+    // (VelocityRendering.cpp:201-202) and velocity is exported from the visibility
+    // buffer. That is why -VoxelDetailNoWpoVelocity was deleted rather than kept: it
+    // bought similar time by DISCARDING wind motion vectors, which smears foliage under
+    // temporal upscaling. Nanite keeps the motion vectors and removes the pass.
+    //
+    // THE COVERAGE CONDITION, which the owner's verdict does not cover and which is the
+    // real risk here. Only the BAKED path produces Nanite meshes: CreateDetailStaticMesh
+    // uses bFastBuild=true, which never allocates Nanite resources, and in a non-editor
+    // build StaticMesh.cpp:8924 asserts fast build is the only option. So any plant from
+    // a cache miss or the geometry fallback keeps the traditional proxy, and partial
+    // coverage means a population drawn both ways at once. Measured on the deciding
+    // runs: cache fallbacks ZERO in both walk-capture-55 and route-capture-19, so the
+    // risk did not materialise at this site with this bake. It is a claim about BAKE
+    // COVERAGE, not about this code, and it wants re-checking whenever the species set
+    // or the bake scope changes.
+    //
+    // Trees are untouched and keep the destructibility constraint.
+    //
+    // Historic note on why it was off, kept because it explains the shape of the code:
+    //
+    // Nanite is disabled here as a side effect of a decision taken for TREES, whose
+    // editable procedural-mesh path must support arbitrary voxel destruction
+    // (docs/tree-appearance-pilot-status.md). The understory is a different system:
+    // baked static meshes on HISM, never edited in place, explicitly accepted as
+    // instanced meshes. This subsystem contains no per-instance destruction code.
+    //
+    // Why it is worth measuring: the understory's 29.8 ms is GEOMETRY-bound (proven --
+    // 3.87x fewer shaded pixels moved it 0.4%), and half of it is a duplicate geometry
+    // submission for motion vectors. Nanite vertex factories are excluded from velocity
+    // shader compilation entirely (VelocityRendering.cpp:201-202) and export velocity
+    // from the visibility buffer instead, so that second pass disappears structurally
+    // rather than getting cheaper. Cluster LOD then attacks what remains.
+    //
+    // NOT A DEFAULT and NOT a decision: enabling it puts these plants into the Lumen
+    // scene for the first time (HierarchicalInstancedStaticMesh.cpp:806-807 excludes
+    // the non-Nanite dynamic path), which is a lighting change for the owner to judge.
+    // Trees keep the destructibility constraint.
+    //
+    // The flag is in the cache identity below, so one arm cannot silently reuse the
+    // other arm's bake. Note also that r.Nanite 0/1 is NOT a valid A/B: it measures the
+    // simplified fallback mesh (see ue-project/Tools/capture_tree_appearance_pilot.py).
+    static const bool bDetailNanite=!FParse::Param(FCommandLine::Get(),TEXT("VoxelNoDetailNanite"));
+    Mesh->NaniteSettings.bEnabled=bDetailNanite;
+    if(bDetailNanite){
+        // FallbackRelativeError defaults to 1.0, which lets Nanite decimate the fallback
+        // mesh until it reaches that error: the first arm produced 77,950 triangles from
+        // an authored 104,678, a 25% cut, and the authored-LOD guard refused the run.
+        //
+        // Set it to 0 so the fallback IS the authored geometry. That keeps the exact
+        // triangle guard below working unchanged for both arms, and it is the safer
+        // shape anyway: the fallback is what renders wherever Nanite cannot run, so an
+        // exact fallback degrades to precisely today's geometry instead of to a silently
+        // reduced mesh. It costs disk and memory for a second copy, which is acceptable
+        // for an experiment and is a real consideration before any of this ships.
+        // FallbackTarget defaults to Auto, "automatic heuristic based on project
+        // settings", and Auto IGNORES the two values below -- setting them alone left a
+        // 104,678-triangle mesh with a 77,950-triangle fallback, a 25% cut. Naming the
+        // target is what makes them take effect.
+        Mesh->NaniteSettings.FallbackTarget=ENaniteFallbackTarget::PercentTriangles;
+        Mesh->NaniteSettings.FallbackPercentTriangles=1.f;
+        Mesh->NaniteSettings.FallbackRelativeError=0.f;
+    }
     for(int32 L=0;L<Descs.Num();++L){
         auto& Source=Mesh->GetSourceModel(L);
         // SetNumSourceModels initializes missing descriptions with 50%^LOD
@@ -1477,17 +1557,47 @@ UStaticMesh* VoxelBakePersistentDetailMesh(const vxc::AssetGrid& Grid,
     if(!Built||Built->LODResources.Num()!=Descs.Num()){
         Error=TEXT("persistent mesh did not preserve authored LOD count");return nullptr;
     }
+    // UNDER NANITE THIS GUARD IS CHECKING THE WRONG ARTIFACT, so it is scoped.
+    //
+    // With Nanite off (the shipping path) LODResources IS the rendered geometry, and the
+    // exact-triangle check below is what caught the editor builder silently replacing
+    // authored distant LODs with generic 50%-per-level reductions. That check is
+    // unchanged and must stay exact.
+    //
+    // With -VoxelDetailNanite the rendered geometry is the Nanite cluster data and
+    // LODResources holds the fallback mesh, which is what renders wherever Nanite cannot
+    // run. The flag site asks Nanite for an EXACT fallback, so the triangle check stays
+    // exact for both arms; what is added here is that a run which asked for Nanite and
+    // did not get it fails loudly, rather than quietly measuring non-Nanite geometry.
+    const bool bNaniteBuilt=Built->HasValidNaniteData();
+    if(bDetailNanite&&!bNaniteBuilt){
+        Error=TEXT("Nanite is on (default; -VoxelNoDetailNanite disables it) but the built mesh has no Nanite data");return nullptr;
+    }
     FString AuthoredCounts;
     for(int32 L=0;L<Descs.Num();++L){
         const uint32 Expected=uint32(Descs[L]->Triangles().Num());
+        const uint32 Actual=Built->LODResources[L].GetNumTriangles();
+        // Exact with Nanite off: that is the shipping path and the check that caught the
+        // builder silently reducing authored LODs.
+        //
+        // With Nanite on, the fallback builder removes degenerate triangles no matter what
+        // the reduction settings say. Measured: 4704 -> 4702 with FallbackRelativeError=0
+        // and FallbackPercentTriangles=1, i.e. exactly one quad face on a mesh built from
+        // cube faces. So the bound has to separate CLEANUP from DECIMATION rather than
+        // demand equality. A near-absolute bound does that: a handful of triangles passes,
+        // and the 104678 -> 77950 (25%) decimation that an unconstrained fallback produced
+        // fails as loudly as it should. A percentage bound would scale with the mesh and
+        // wave that through on anything large.
+        const uint32 Slack=bNaniteBuilt?FMath::Max<uint32>(8,Expected/1000):0;
+        const bool bTrianglesOk=(Actual<=Expected+Slack)&&(Actual+Slack>=Expected);
         // Vertex welding/reordering is legitimate; source triangles here are
         // nondegenerate exposed voxel faces and must not be reduced or removed.
-        if(Built->LODResources[L].GetNumTriangles()!=Expected||Mesh->IsReductionActive(L)){
-            Error=FString::Printf(TEXT("persistent authored LOD%d changed: expected=%u triangles actual=%u reductionActive=%d"),L,Expected,Built->LODResources[L].GetNumTriangles(),int(Mesh->IsReductionActive(L)));return nullptr;
+        if(!bTrianglesOk||Mesh->IsReductionActive(L)){
+            Error=FString::Printf(TEXT("persistent authored LOD%d changed: expected=%u triangles actual=%u reductionActive=%d nanite=%d"),L,Expected,Actual,int(Mesh->IsReductionActive(L)),int(bNaniteBuilt));return nullptr;
         }
         AuthoredCounts+=FString::Printf(TEXT(" L%d=%u/%u"),L,Expected,Built->LODResources[L].GetNumTriangles());
     }
-    UE_LOG(LogVoxelEarth,Log,TEXT("DetailAuthoredLOD preserved mesh=%s lods=%d authored/builtTriangles:%s"),*Mesh->GetPathName(),Descs.Num(),*AuthoredCounts);
+    UE_LOG(LogVoxelEarth,Log,TEXT("DetailAuthoredLOD preserved mesh=%s lods=%d nanite=%d authored/builtTriangles:%s"),*Mesh->GetPathName(),Descs.Num(),int(bNaniteBuilt),*AuthoredCounts);
     Mesh->SetAutoComputeLODScreenSize(false);
     for(int32 L=0;L<Descs.Num();++L){
         const float Screen=L?Geometry.LodScreens[L-1]:1.f;
@@ -1783,7 +1893,29 @@ void UVoxelDetailAssetSubsystem::Tick(float DeltaTime)
 			Hism->SetCastShadow(Impl->bCastShadow);
             // Presentation distance stays inside the configured residency
             // ring. Start/end values alone do not establish material fading.
-            const bool SizeCull=FParse::Param(FCommandLine::Get(),TEXT("VoxelDetailSizeCull"));
+            //
+            // DEFAULT ON SINCE 2026-09-11, ON THE OWNER'S VERDICT. The pictures
+            // were shot as two walks of the same authored route stopping at the
+            // same eight stands, arrival positions 1-19 cm apart, and the owner
+            // read them as "pretty much identical, no visual issues at all".
+            // The cost side, third independent pair and the first on a route:
+            // GPU 34.77 -> 20.02 ms, the ground cover's two passes 23.26 ->
+            // 8.63, the marcher and the game thread unmoved. It is by a wide
+            // margin the largest lever measured in this work, and it had been
+            // sitting behind an opt-in flag.
+            //
+            // -VoxelNoDetailSizeCull is the off switch and restores the
+            // previous behaviour exactly; it is the control arm for any future
+            // A/B and the Settings row this becomes (voxelsim settings panel
+            // policy: every visual-trade toggle is a row, owner verdicts set
+            // defaults).
+            //
+            // WHAT THE VERDICT DOES NOT COVER, because still frames cannot show
+            // it: popping, when an instance crosses its draw distance while the
+            // player walks. Not captured, and out of scope by the owner's own
+            // instruction. If popping is ever reported, this default is the
+            // first thing to question.
+            const bool SizeCull=!FParse::Param(FCommandLine::Get(),TEXT("VoxelNoDetailSizeCull"));
             // Every current detail transform has the same unit scale; keep the
             // source of that contract shared instead of assuming mesh units.
             const FVector Scale=DetailInstanceTransform(FDetailInstanceRec{},FVector3d::ZeroVector).GetScale3D();

@@ -1,4 +1,5 @@
 #include "VoxelWaterSheetActor.h"
+#include "VoxelFrameProfiling.h"
 
 #include "Materials/MaterialInstanceDynamic.h"
 
@@ -1188,6 +1189,7 @@ bool AVoxelWaterSheetActor::RebuildSheet(FSheet& Sheet, const FVector& CamUU)
 
 void AVoxelWaterSheetActor::Tick(float DeltaTime)
 {
+	CSV_SCOPED_TIMING_STAT(VoxelStream, WaterSheetTickMs);
 	Super::Tick(DeltaTime);
 
 	if (!bEnabled || !Mesh)

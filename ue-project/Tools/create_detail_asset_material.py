@@ -62,6 +62,41 @@ def main():
 
     mel = unreal.MaterialEditingLibrary
     material.set_editor_property("used_with_instanced_static_meshes", True)
+    # WITHOUT THIS, A NANITE ARM SILENTLY MEASURES THE TRADITIONAL PATH.
+    #
+    # Measured 2026-09-11: walk-capture-41 baked every plant with Nanite data,
+    # verified it, streamed 5.97 MB of Nanite pages and ran the visibility
+    # buffer at 0.121 ms -- and still drew all 126,679 plants through
+    # FHierarchicalStaticMeshSceneProxy. Base pass moved 0.05 ms of 29.58, and
+    # the arm cost +0.73 ms for nothing. The capture's own log said why, 253
+    # times, once per baked material instance:
+    #
+    #   LogMaterial: Warning: Material .../M_aa14d626... missing usage flag
+    #   Nanite! Default Material will be used in game.
+    #
+    # Nanite::FNaniteResourcesHelper::ShouldCreateNaniteProxy
+    # (NaniteResourcesHelper.h:155-194) has exactly six ways to refuse. Five are
+    # not us: masked blend is allowed by default, the shading model is
+    # default-lit, it is not sky, bDisallowNanite is never set in this project,
+    # and the mesh has valid Nanite data. The sixth is the material audit, and
+    # the audit rejects on MATUSAGE_Nanite alone.
+    #
+    # It does not self-heal. In the EDITOR, Unreal auto-sets a missing usage
+    # flag and recompiles; under -game -- which is how every capture in this
+    # archive runs -- Material.cpp:1889-1945 takes the other branch, warns, and
+    # uses the default material. Material INSTANCES inherit their parent's usage
+    # flags wholesale (MaterialInstance.cpp:2657), so setting it here reaches
+    # all 253 baked MICs without touching the bake.
+    #
+    # r.Nanite.ForceEnableMeshes is NOT a substitute: it acts at cook
+    # serialization and in shader-permutation selection, the audit never
+    # consults it, and it is ECVF_ReadOnly besides.
+    #
+    # THIS ONLY TAKES EFFECT WHEN THE ASSET IS REGENERATED. Run this script
+    # (one editor per box, see docs/detail-asset-rendering.md), and note that
+    # M_VoxelDetailAsset is part of the detail cache identity, so regenerating
+    # it forces a full re-bake before any capture can reuse a cache.
+    material.set_editor_property("used_with_nanite", True)
 
     vertex_color = mel.create_material_expression(
         material, unreal.MaterialExpressionVertexColor, -500, -50)

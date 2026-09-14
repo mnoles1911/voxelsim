@@ -1,4 +1,5 @@
 #include "VoxelWorldSubsystem.h"
+#include "VoxelFrameProfiling.h"
 #include "voxelcore/foundationquery.h"
 #include "VoxelAppearanceBankBinding.h"
 #include "VoxelEcologicalPlacement.h"
@@ -3602,6 +3603,191 @@ bool AsyncAssetResolveEnabled()
 //
 // The earlier "predictive prewarm gave mixed results" verdict (walks 22/23) predates
 // the authored-LOD understory payload and is superseded, not contradicted.
+
+// THE PREWARM'S FOUR CAPS. They were the pilot's values (2048/256/8/32) until
+// 2026-09-13, when the set below was measured to take frame p99 from 146.90 to
+// 109.92 ms over two runs each with throughput unchanged. The pilot values are
+// still reachable as the control arm.
+// See WarmPredictiveAssetResolves for what measured them into existence: the
+// submit path's cold misses cost ~4.6 ms each on the game thread and the
+// prewarm was capped at eight launches a tick.
+static TAutoConsoleVariable<int32> CVarVoxelPredictiveQueueCap(
+	TEXT("voxel.Stream.PredictiveQueueCap"), 16384,
+	TEXT("Predictive asset-resolve keys retained in the queue."), ECVF_Default);
+static TAutoConsoleVariable<int32> CVarVoxelPredictiveProbeCap(
+	TEXT("voxel.Stream.PredictiveProbeCap"), 1024,
+	TEXT("Predictive asset-resolve queue entries probed per tick."), ECVF_Default);
+static TAutoConsoleVariable<int32> CVarVoxelPredictiveLaunchCap(
+	TEXT("voxel.Stream.PredictiveLaunchCap"), 64,
+	TEXT("Predictive asset resolves launched per tick. The gate on raising it is GpuSubmit "
+	     "coldMisses falling, NOT launched= rising -- launching more and landing the same is a "
+	     "knob that did nothing."), ECVF_Default);
+// HOW MANY LEVELS THE PREWARM COVERS. 0 = level 0 only, which is what it did
+// before 2026-09-13; that is now the CONTROL ARM, not the default. The misses
+// that matter are COARSE: 6,716 of 7,563 of them, carrying 98.4% of the resolve
+// milliseconds at 28.91 ms each against level 0's 3.77.
+static TAutoConsoleVariable<int32> CVarVoxelPredictiveCoarseLevels(
+	TEXT("voxel.Stream.PredictiveCoarseLevels"), 7,
+	TEXT("Highest ring level the predictive asset resolve warms. 0 warms level 0 only and is the "
+	     "control arm; the cost it is aimed at is the coarse cold miss, which no cap could ever "
+	     "reach because nothing queued it."), ECVF_Default);
+
+// The site cap used when deciding whether a footprint MAY be warmed. 8192 was
+// the historical bound and is the control arm. The inline path has no such bound,
+// so anything between this and the real footprint size is work the game thread
+// does instead of a worker.
+// THE RESOLVE CACHE'S LIMITS. `Pending` is the one that bound everything at its
+// old value of eight outstanding warm tokens, which no launch cap could exceed;
+// it now defaults to 256. THE TWO MEMORY KNOBS ARE DELIBERATELY UNCHANGED: an
+// arm that also raised them to 512 MiB total and 32 MiB per entry measured p99
+// 113.91 against this configuration's 109.92, i.e. the extra 448 MiB bought
+// nothing and is not being spent.
+// THE COLD RESOLVE CAP. DEFAULT 8 SINCE 2026-09-13, ON THE OWNER'S VERDICT.
+//
+// It is a visual trade -- coarser ground held longer -- so under the
+// settings-panel policy the pictures decide it, not the milliseconds. Three
+// route captures at the same authored stand were put side by side: the same
+// cap-off configuration TWICE, so the harness's own 17.65%-of-pixels noise was
+// visible rather than described, and then this arm at cap 8. The owner's words:
+// "3 looks no worse than 1 or 2".
+//
+// What it buys, at 9.5 m/s where the slice is furthest from its target:
+//   frames over 300 ms   2.12% -> 0.67%
+//   frame p99           392.42 -> 284.69 ms
+//   frame p50            20.61 -> 18.33 ms
+// At a walk it is closer to even -- p99 better, the 33-100 ms band slightly
+// worse -- so the value is concentrated where the player is moving fast.
+//
+// 0 restores the old behaviour and is the control arm. A budget in milliseconds
+// (ColdResolveBudgetMsPerTick) measured better on p50/p95/over-100 ms but was NOT
+// in the pictures the owner judged, so it stays off until its own pair is shot.
+// THE BUDGET, in whole milliseconds, and it is the better bound of the two: a
+// count cannot bind a frame when the things it counts differ 7.7x in cost.
+// Default 0 = off.
+// Charge the ESTIMATED cost of a cold resolve against the budget before doing it,
+// so a single large resolve cannot blow the tick. Default true: without it the
+// budget bounds everything except the first resolve, which is the term that
+// actually hurts. 0 restores the measured-after-the-fact behaviour.
+static TAutoConsoleVariable<bool> CVarVoxelStreamColdResolveChargeEstimate(
+	TEXT("voxel.Stream.ColdResolveChargeEstimate"), true,
+	TEXT("Charge a cold resolve's ESTIMATED cost (by level) against the tick budget before paying "
+	     "it, instead of only counting what has already been spent. A wrong estimate costs a "
+	     "deferral, never a hole."), ECVF_Default);
+
+static TAutoConsoleVariable<int32> CVarVoxelStreamColdResolveBudgetMsPerTick(
+	TEXT("voxel.Stream.ColdResolveBudgetMsPerTick"), 0,
+	TEXT("Millisecond budget for cold asset resolves in one streaming tick; past it, submits wait "
+	     "a tick where a coarser ancestor covers. Bounds the tick at roughly budget + one resolve, "
+	     "because the first resolve of a tick always goes through. 0 = off."), ECVF_Default);
+
+static TAutoConsoleVariable<int32> CVarVoxelStreamColdResolveCapPerTick(
+	TEXT("voxel.Stream.ColdResolveCapPerTick"), 8,
+	TEXT("At most N cold asset-resolve submits per streaming tick; the excess WAITS a tick, but "
+	     "only where a coarser ancestor is resident and holds terrain. 0 = off. A cold coarse "
+	     "resolve costs ~28.91 ms inline on the game thread, so this is the bound on the tail that "
+	     "prediction cannot reach."), ECVF_Default);
+
+// RING-NORMALISED PRIORITY (2026-09-14). The one defect behind the black
+// annulus at 20 m/s: the cross-ring pick is strictly nearest-first on metres,
+// and every ring's leading edge sits at its own OUTER radius while moving
+// (64 / 128 / 256 / 512 m ...), so under any throughput deficit the deficit
+// lands on whichever ring is geometrically farthest -- all of R2's outer
+// half, all of R3 and everything beyond, INCLUDING the interior coarse
+// stand-ins hierarchical coverage keyed at their ring's inner radius. Measured
+// on dense20/denseFloor3/denseCpuFloor (terrain-only, 20 m/s, hill at
+// 1408-2176 m): R3 served 1-2 chunks per 2 s against 4,900 pending, 30-33% of
+// the frame black in a ring between the intact near field and the intact
+// preflight far field.
+//
+// p > 0 multiplies each level's key by (Outer_0 / Outer_L)^(2p): at p = 1 a
+// chunk's key is its distance as a FRACTION of its own ring's radius, so an
+// R3 stand-in at 256 m (0.5 of 512) sorts with an R0 chunk at 32 m and every
+// ring's front recedes together under a deficit instead of one ring going
+// black. The stand-in now loads BEFORE the fine chunk it stands in for --
+// the order LOD streaming wants and the opposite of the intent recorded at
+// BiasedSortKeySq, which was written for a stationary fill.
+// MinSpeed (m/s) fades p in from rest to that speed (0 = always on), so a
+// cold stationary start keeps today's near-first order. The cutoffs and the
+// lead-horizon floor are rescaled with the keys (see StreamRingKeyScale).
+// -VoxelRingNormalizedKey=<p> on the command line wins over the cvar so the
+// preflight's first recomputes run the arm too.
+//
+// DEFAULT ON (p = 1, fade to full at 5 m/s) SINCE 2026-09-14, on the owner's
+// word, from docs/measurements/ring-normalized-key-2026-09-14/: same 32-frame
+// 20 m/s flight, black pixels 1,206,488 (control) -> 8,752 (this default),
+// worst frame 33.1% -> 0.10%; R3-R7 no longer print 'Voxel ring STARVED';
+// chunks/s unchanged (3,940-4,170 both ways); cold start keeps its order
+// (R0 pending hits 0 at 6.2 s against 5.7 s, and 21.9 s with no fade).
+// Control arm: -VoxelRingNormalizedKey=0.
+static TAutoConsoleVariable<float> CVarVoxelStreamRingNormalizedKey(
+	TEXT("voxel.Stream.RingNormalizedKey"), 1.f,
+	TEXT("Exponent p: each ring's admission/dispatch key is scaled by (Outer_0/Outer_L)^(2p), so at 1 "
+	     "rings compete on fraction-of-ring-radius instead of metres and a coarse stand-in loads before "
+	     "the fine front it covers. 0 = off, byte-identical keys."), ECVF_Default);
+static TAutoConsoleVariable<float> CVarVoxelStreamRingNormalizedKeyMinSpeed(
+	TEXT("voxel.Stream.RingNormalizedKeyMinSpeed"), 5.f,
+	TEXT("m/s at which RingNormalizedKey reaches full strength; it fades linearly from 0 at rest. 0 = "
+	     "always at full strength."), ECVF_Default);
+float RingNormalizedKeyP()
+{
+	static const float CmdLine = []
+	{
+		float V = -1.f;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelRingNormalizedKey="), V);
+		return V;
+	}();
+	return CmdLine >= 0.f ? CmdLine : CVarVoxelStreamRingNormalizedKey.GetValueOnGameThread();
+}
+// -VoxelRingNormalizedKeyMinSpeed=<m/s> wins over the cvar for the same
+// reason: an -ExecCmds cvar lands after the preflight's first recomputes, and
+// the fade is exactly what those recomputes are meant to measure.
+float RingNormalizedKeyMinSpeedM()
+{
+	static const float CmdLine = []
+	{
+		float V = -1.f;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelRingNormalizedKeyMinSpeed="), V);
+		return V;
+	}();
+	return CmdLine >= 0.f ? CmdLine : CVarVoxelStreamRingNormalizedKeyMinSpeed.GetValueOnGameThread();
+}
+
+// Serve the ring whose head nothing else draws before serving nearest-first.
+// See the pick loop for the measurement that motivated it. 0 = off, byte-identical.
+static TAutoConsoleVariable<int32> CVarVoxelStreamCoverageFirstPick(
+	TEXT("voxel.Stream.CoverageFirstPick"), 0,
+	TEXT("Before the ring-floor and nearest-first passes, pick the coarsest ring whose queue head "
+	     "is not covered by a resident coarser ancestor. Trades refinement for coverage while "
+	     "moving fast: no ring may starve while its ground is a hole. Gate: 'Voxel coverage "
+	     "(window): holes=' on a fast flight."), ECVF_Default);
+
+static TAutoConsoleVariable<int32> CVarVoxelResolveCachePending(
+	TEXT("voxel.Stream.ResolveCachePending"), 256,
+	TEXT("Outstanding predictive warm tokens the footprint resolve cache will issue. Eight is the "
+	     "historical default and it outranks voxel.Stream.PredictiveLaunchCap silently."), ECVF_Default);
+static TAutoConsoleVariable<int32> CVarVoxelResolveCacheEntries(
+	TEXT("voxel.Stream.ResolveCacheEntries"), 8192,
+	TEXT("Footprint resolve cache entries (and history length)."), ECVF_Default);
+static TAutoConsoleVariable<int32> CVarVoxelResolveCacheMB(
+	TEXT("voxel.Stream.ResolveCacheMB"), 64,
+	TEXT("Footprint resolve cache total budget in MiB."), ECVF_Default);
+static TAutoConsoleVariable<int32> CVarVoxelResolveCacheEntryMB(
+	TEXT("voxel.Stream.ResolveCacheEntryMB"), 2,
+	TEXT("Largest single cached footprint in MiB. A coarse footprint resolves far more instances "
+	     "than a level-0 one, and an entry over this size is refused -- so it is resolved again, "
+	     "inline, every time it is asked for."), ECVF_Default);
+
+static TAutoConsoleVariable<int32> CVarVoxelPredictiveSiteCap(
+	TEXT("voxel.Stream.PredictiveSiteCap"), 1048576,
+	TEXT("Candidate-site ceiling for warming a footprint speculatively. Raising it lets COARSE "
+	     "footprints be warmed; they are refused today and then resolved inline on the game "
+	     "thread anyway, at 28.91 ms each."), ECVF_Default);
+
+static TAutoConsoleVariable<int32> CVarVoxelPredictiveInFlightCap(
+	TEXT("voxel.Stream.PredictiveInFlightCap"), 256,
+	TEXT("Predictive asset resolve tasks outstanding at once. They run at BackgroundLow so they "
+	     "cannot take a worker slot from a chunk somebody is waiting for."), ECVF_Default);
+
 bool PredictiveAssetResolveEnabled()
 {
 	static const bool Enabled = []
@@ -5551,9 +5737,12 @@ double UnloadOuterUU(int32 Level)
 // (DxUU, DyUU) is chunk centre minus anchor, XY; ViewDirXY is the unit camera
 // forward's XY (zero when no camera / bias off), captured on the game thread.
 double PrioritySortKeySq(int32 Level, double DistSq, double DxUU, double DyUU, const FVector2D& ViewDirXY,
-                          double ViewBiasK)
+                          double ViewBiasK, double LevelKeyScale)
 {
-	double Key = BiasedSortKeySq(Level, DistSq);
+	// LevelKeyScale: this tick's StreamRingKeyScale[Level] (1.0 with
+	// voxel.Stream.RingNormalizedKey off). Applied to the clamped distance
+	// so the view penalty composes exactly as before within a level.
+	double Key = BiasedSortKeySq(Level, DistSq) * LevelKeyScale;
 	if (ViewBiasK > 0.0 && !ViewDirXY.IsNearlyZero())
 	{
 		const double LenXY = FMath::Sqrt(DxUU * DxUU + DyUU * DyUU);
@@ -7460,6 +7649,35 @@ struct FVoxelWorldImpl
 	vxc::World<VoxelCoords::BrickEdgeVoxels> Voxels;
 	TUniquePtr<vxc::WorldQueryBatch<VoxelCoords::BrickEdgeVoxels>> MovementCollisionQueries;
 
+	// THE SAME SHORTLIST, FOR EVERYONE ELSE IN THE FRAME.
+	//
+	// MovementCollisionQueries above exists only between Begin/End inside the
+	// movement tick, and IsSolidAtVoxel below takes the "exact standalone path"
+	// without it -- one full per-point asset resolve per call. Measured
+	// 2026-09-11 at the temperate forest site, that difference is most of the
+	// game thread:
+	//
+	//   CollisionPrepareMs      3.79 ms   the shortlist, built once per frame
+	//   OceanUnderwaterMs       4.12 ms   ONE standalone call, no shortlist
+	//   RippleAutoWatchMs       4.01 ms   ONE standalone call, no shortlist
+	//                          -------
+	//                          11.92 ms   of a 21.6 ms game thread
+	//
+	// while the twelve calls the movement component makes inside its own scope
+	// cost 0.021 ms BETWEEN THEM. Same function, same frame, same column: the
+	// only difference is whether a shortlist was prepared.
+	//
+	// This one is keyed by frame counter instead of by a Begin/End pair, so it
+	// cannot outlive a frame and carries exactly the staleness guarantee the
+	// movement scope already had -- edits stay live either way, because
+	// WorldQuery::materialAt consults the edited-brick overlay BEFORE it reaches
+	// the asset entries (voxel-core/include/voxelcore/worldquery.h:69-80). What
+	// the shortlist caches is which asset instances overlap the rect, and a
+	// felled tree reads as air from the overlay whatever the shortlist
+	// remembers.
+	TUniquePtr<vxc::WorldQueryBatch<VoxelCoords::BrickEdgeVoxels>> FrameQueries;
+	uint64 FrameQueriesFrame = 0;
+
 	// THE COARSE-TIER AMPLIFIER, for ring levels at or above
 	// VoxelTier::kFirstCoarseLevel.
 	//
@@ -8019,11 +8237,13 @@ struct FVoxelWorldImpl
 	double WidestAdmissionCutoffM() const
 	{
 		double Widest = -1.0;
-		for (const double Cutoff : LevelAdmissionCutoffDistSq)
+		for (int32 L = 0; L < VoxelCoords::kNumLevels; ++L)
 		{
+			const double Cutoff = LevelAdmissionCutoffDistSq[L];
 			if (Cutoff < DBL_MAX)
 			{
-				Widest = FMath::Max(Widest, FMath::Sqrt(Cutoff) / 100.0);
+				// Stored on the key scale; printed in metres.
+				Widest = FMath::Max(Widest, FMath::Sqrt(Cutoff / StreamRingKeyScale[L]) / 100.0);
 			}
 		}
 		return Widest;
@@ -8522,6 +8742,17 @@ struct FVoxelWorldImpl
 	// proves where dispatches point.
 	FVector2D StreamBiasDirXY = FVector2D::ZeroVector;
 	double StreamBiasK = 0.0;
+	// voxel.Stream.RingNormalizedKey: this tick's per-level key multiplier,
+	// (Outer_0/Outer_L)^(2p), 1.0 everywhere with the switch off. Set once
+	// per streaming tick next to the bias pair above, for the same reason:
+	// the entry scan, SortPendingQueues, the cutoff test and the drop pass
+	// must all read ONE scale. When it changes between ticks the stored
+	// per-level cutoffs are rescaled with it (see the set site), so a cutoff
+	// derived from last tick's keys still means the same chunks.
+	// A short initializer would zero-fill and multiply every key by 0 --
+	// hence the static_assert at the set site.
+	double StreamRingKeyScale[VoxelCoords::kNumLevels] = {1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0};
+	double StreamRingKeyP = 0.0; // effective exponent this tick (speed-faded), for the log line
 	// The view direction each level's entry scan last decided admission
 	// against -- the rotation analogue of LastEntryScanAnchorXY, and the state
 	// that makes the rotation-rescan trigger self-quenching (the rescan it
@@ -9758,11 +9989,32 @@ struct FVoxelWorldImpl
     enum class EAssetResolveCaller : uint8 {Admission,GpuSubmit,EditedPage};
     struct FAssetResolveCallerStats {
         uint64 Calls=0,Hits=0,ColdMisses=0,ForcedInline=0,Level0Calls=0,CoarseCalls=0;
+        // THE MISSES SPLIT BY LEVEL, added 2026-09-13. Calls were already split
+        // and misses were not, which is the half that decides whether the
+        // predictive prewarm can ever help: it enqueues Key{0,...} and nothing
+        // else, so a COARSE footprint can never be warm however high its caps
+        // are raised -- measured, after raising all four caps moved coldMisses
+        // 7903 -> 8247, i.e. not at all.
+        uint64 ColdMissLevel0=0,ColdMissCoarse=0;
+        double RawResolveLevel0Ms=0,RawResolveCoarseMs=0;
+        // PER LEVEL, because "coarse" is one bucket averaging levels 1-7 and the
+        // cost cannot be flat across them: a level-L footprint is 2^L wider per
+        // side, so its rect covers 4^L the area and finds that many more
+        // instances. The 28.91 ms average is therefore a number about the MIX
+        // that happened to be asked for, and an estimate built on it is too low
+        // at the top levels and too high at the bottom -- which is exactly where
+        // the shipped cap's bound is loosest. Measure before estimating.
+        uint64 ColdMissByLevel[VoxelCoords::kNumLevels]={};
+        double RawResolveByLevelMs[VoxelCoords::kNumLevels]={};
         double TotalMs=0,InlineMs=0,RawResolveMs=0,MaxCallMs=0,MaxRawResolveMs=0;
     };
     // Mutable only because admission queries are logically const. All three
     // callers and the window report/reset execute on the game thread.
     mutable FAssetResolveCallerStats AssetResolveCallerStats[3];
+	// The four launch refusals plus the token one, so probes-minus-launches is
+	// attributable instead of merely large. Reset with the other window counters.
+	uint64 PredictiveRefusedAdmission = 0, PredictiveRefusedCached = 0;
+	uint64 PredictiveRefusedNotResident = 0, PredictiveRefusedUnbound = 0, PredictiveRefusedNoToken = 0;
 	double AccumGpuSubmitMgrMs = 0.0;     // Manager->Submit + GpuJobsPending insert
 	double AccumGpuSubmitTotalMs = 0.0;   // whole SubmitGpuMeshJob wall
 	int64 GpuSubmitCallsSinceLog = 0;     // calls entered (success, decline, speculative)
@@ -9793,6 +10045,22 @@ struct FVoxelWorldImpl
 	// tick. NOT reset at the window edge (MaybeLogCounters can run mid-tick and
 	// zeroing it there would silently drop a burst in progress).
 	int32 ColdShadingsThisTick = 0;
+	// The cold-resolve cap's twin of the above: resolves this tick WILL pay,
+	// counted where they are paid rather than where they are decided.
+	int32 ColdResolvesThisTick = 0;
+	// THE SAME BUDGET IN MILLISECONDS, because a COUNT is a poor proxy for the
+	// cost it is meant to bound. A cold coarse resolve is 28.91 ms and a cold
+	// level-0 one 3.77, so "8 per tick" is anything from 30 to 231 ms -- and at
+	// 9.5 m/s with the count cap at 8 the 100-300 ms game-thread band still
+	// reads SubAssetsMs 87.12 of 144.23, which is the count cap failing to bind.
+	// Accumulated where the resolve is PAID, in ResolvedAssetsForFootprint, and
+	// only for the submit caller.
+	// mutable for the same reason AssetResolveCallerStats is: the resolve that
+	// pays is reached through a const query path, and a meter that cannot be
+	// written from where the cost happens is a meter about somewhere else.
+	mutable double ColdResolveMsThisTick = 0.0;
+	uint64 ColdResolveDeferredSinceLog = 0, ColdResolveExemptSinceLog = 0;
+	uint64 ColdResolveBudgetDeferredSinceLog = 0;
 	// Window totals. ColdTotalSinceLog is counted at the ++ site, not summed
 	// from the fold, so it stays honest even if a submit ever happens outside
 	// the folded block -- and coverable + holeRisk is incremented at that SAME
@@ -9947,6 +10215,10 @@ struct FVoxelWorldImpl
 	// since-log ones, so a run's total per-ring dispatch is readable from the
 	// final log line alone.
 	int64 LevelJobsDispatchedSinceLog[VoxelCoords::kNumLevels] = {};
+	// Coverage-first picks per ring this window (see the pick loop). Printed on
+	// the ring dispatch line as coverageFirst= so a run can prove the pass
+	// engaged and say which ring it served.
+	int64 CoverageFirstPicksSinceLog[VoxelCoords::kNumLevels] = {};
 	int64 LevelJobsDispatchedTotal[VoxelCoords::kNumLevels] = {};
 	// --- Cold-start settle probe state (see VoxelStreamAdmission::
 	// ColdSettleEnabled for the design and the two traps it dodges). All of
@@ -11325,6 +11597,34 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 			}
 		}
 	}
+	// voxel.Stream.RingNormalizedKey: this tick's per-level key scale. Read
+	// once here so every key producer in the tick sees the same scale (see
+	// StreamRingKeyScale's declaration). Cutoffs are rescaled in place so a
+	// boundary derived from last tick's keys keeps naming the same chunks.
+	{
+		static_assert(VoxelCoords::kNumLevels == 8, "StreamRingKeyScale's initializer has 8 entries");
+		double P = double(VoxelStreamAdmission::RingNormalizedKeyP());
+		const double MinSpeedM = double(VoxelStreamAdmission::RingNormalizedKeyMinSpeedM());
+		if (P > 0.0 && MinSpeedM > 0.0)
+		{
+			P *= FMath::Clamp((SmoothedAnchorSpeedUUPerSec / 100.0) / MinSpeedM, 0.0, 1.0);
+		}
+		StreamRingKeyP = P;
+		const UVoxelWorldSubsystem::FRingPreset* Presets = UVoxelWorldSubsystem::GetRingPresets();
+		for (int32 L = 0; L < VoxelCoords::kNumLevels; ++L)
+		{
+			const double NewScale =
+				(P > 0.0) ? FMath::Pow(Presets[0].OuterMeters / Presets[L].OuterMeters, 2.0 * P) : 1.0;
+			if (NewScale != StreamRingKeyScale[L])
+			{
+				if (LevelAdmissionCutoffDistSq[L] < DBL_MAX)
+				{
+					LevelAdmissionCutoffDistSq[L] *= NewScale / StreamRingKeyScale[L];
+				}
+				StreamRingKeyScale[L] = NewScale;
+			}
+		}
+	}
 
 	LastAnchorLocation = Anchor;
 
@@ -12348,6 +12648,8 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 		}
 		ColdCapDeferredThisTick = 0;
 		ColdShadingsThisTick = 0;
+		ColdResolvesThisTick = 0;
+		ColdResolveMsThisTick = 0.0;
 
 		++AccumTicks;
 	}
@@ -12576,6 +12878,31 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 		CSV_CUSTOM_STAT(VoxelStream, TickMs,        double(TickMsSoFar),               ECsvCustomStatOp::Set);
 		CSV_CUSTOM_STAT(VoxelStream, DispatchMs,    double(ThisFrameDispatchMs),       ECsvCustomStatOp::Set);
 		CSV_CUSTOM_STAT(VoxelStream, SubmitMs,      double(ThisFrameDispatchSubmitMs), ECsvCustomStatOp::Set);
+		// THE SUBMIT SIX, PER FRAME. They already existed on FFrameSample, and
+		// that sample is only ever printed as BUCKET MEANS in the census -- which
+		// is the same bar the split was invented to get past, one level down: a
+		// mean over a bucket cannot isolate the worst 1% of frames, and in
+		// attribution mode 1 the buckets pool cold fill with settled play, so
+		// the absolute milliseconds describe LOADING.
+		//
+		// 2026-09-13 is what made this worth the six stores. The census said
+		// assets is 96.5% of the submit bracket (SLOW subTotal 1316.270 of which
+		// assets 1270.527; raster 3.383), which refuted the standing raster-atlas
+		// hypothesis outright -- but it said it over a population that includes
+		// the cold fill, and the hitch that matters is a p99 frame during
+		// settled play. These columns are what let the same question be asked of
+		// that population, with percentiles, from the CSV.
+		//
+		// Mode 2 cannot serve instead: it selects on VoxelFramePhase's settled
+		// flag, which reads settled=0 on every window of a walk capture, so the
+		// report never prints at all in this harness.
+		CSV_CUSTOM_STAT(VoxelStream, SubReqHdrMs,   double(ThisFrameSubReqHdrMs),      ECsvCustomStatOp::Set);
+		CSV_CUSTOM_STAT(VoxelStream, SubBandMs,     double(ThisFrameSubBandMs),        ECsvCustomStatOp::Set);
+		CSV_CUSTOM_STAT(VoxelStream, SubRasterMs,   double(ThisFrameSubRasterMs),      ECsvCustomStatOp::Set);
+		CSV_CUSTOM_STAT(VoxelStream, SubAssetsMs,   double(ThisFrameSubAssetsMs),      ECsvCustomStatOp::Set);
+		CSV_CUSTOM_STAT(VoxelStream, SubPoolMs,     double(ThisFrameSubPoolMs),        ECsvCustomStatOp::Set);
+		CSV_CUSTOM_STAT(VoxelStream, SubMgrMs,      double(ThisFrameSubMgrMs),         ECsvCustomStatOp::Set);
+		CSV_CUSTOM_STAT(VoxelStream, SubTotalMs,    double(ThisFrameSubTotalMs),       ECsvCustomStatOp::Set);
 		CSV_CUSTOM_STAT(VoxelStream, ApplyMs,       double(ThisFrameApplyMs),          ECsvCustomStatOp::Set);
 		CSV_CUSTOM_STAT(VoxelStream, DispAirProofMs, double(ThisFrameDispatchAirProofMs), ECsvCustomStatOp::Set);
 		CSV_CUSTOM_STAT(VoxelStream, DispBandMs,    double(ThisFrameDispatchBandMs),   ECsvCustomStatOp::Set);
@@ -13887,9 +14214,9 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	// 5s window, total= and load= are cumulative over the whole run.
 	UE_LOG(LogVoxelPerf, Log, TEXT("Voxel ring dispatch: %s"), *JoinPerLevel([&](int32 L)
 	       {
-		       return FString::Printf(TEXT("R%d disp=%lld total=%lld load=%lld zq=%lld"), L,
+		       return FString::Printf(TEXT("R%d disp=%lld total=%lld load=%lld zq=%lld coverageFirst=%lld"), L,
 		                              (long long)LevelJobsDispatchedSinceLog[L], (long long)LevelJobsDispatchedTotal[L],
-		                              (long long)LevelChunksLoadedTotal[L], (long long)LevelZeroQuadTotal[L]);
+		                              (long long)LevelChunksLoadedTotal[L], (long long)LevelZeroQuadTotal[L], (long long)CoverageFirstPicksSinceLog[L]);
 	       }));
 
 	// The disp= number above, split by ARM, plus each arm's in-flight count at
@@ -13991,6 +14318,10 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	for (int64& V : LevelJobsDispatchedSinceLog)
 	{
 		V = 0;
+	}
+	for (int64& C : CoverageFirstPicksSinceLog)
+	{
+		C = 0;
 	}
 	// The split-arm dispatch counters reset with the blended one above so all
 	// three always describe the same window (GpuMeshDispatchedByLevel could
@@ -14651,9 +14982,19 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
     // request ever reaches the GPU submit path. These are nested CPU timings,
     // not additive to the existing submission/tick totals.
     if (VoxelStreamAdmission::PredictiveAssetResolveEnabled())
-        UE_LOG(LogVoxelPerf,Log,TEXT("Voxel predictive asset resolve (window): probes=%llu launched=%llu landed=%llu raced=%llu nonresident=%llu rejected=%llu epochRejected=%llu pending=%d queueRemaining=%d tickMs=%.3f maxTickMs=%.3f queueBuilds=%llu queueCells=%llu queueBuildMs=%.3f maxQueueBuildMs=%.3f launchCap=8 inFlightCap=32 probeCap=256 queueCap=2048"),
+        UE_LOG(LogVoxelPerf,Log,TEXT("Voxel predictive asset resolve (window): probes=%llu launched=%llu landed=%llu raced=%llu nonresident=%llu rejected=%llu epochRejected=%llu pending=%d queueRemaining=%d tickMs=%.3f maxTickMs=%.3f queueBuilds=%llu queueCells=%llu queueBuildMs=%.3f maxQueueBuildMs=%.3f launchCap=%d inFlightCap=%d probeCap=%d queueCap=%d refusedAdmission=%llu refusedCached=%llu refusedNotResident=%llu refusedUnbound=%llu refusedNoToken=%llu"),
             PredictiveAssetProbes,PredictiveAssetLaunched,PredictiveAssetLanded,PredictiveAssetRaced,PredictiveAssetNotResident,PredictiveAssetRejected,PredictiveAssetEpochRejected,
-            PredictiveAssetInFlight.Num(),PredictiveAssetQueue.Num()-PredictiveAssetCursor,PredictiveAssetTickMs,PredictiveAssetMaxTickMs,PredictiveAssetQueueBuilds,PredictiveAssetQueueCells,PredictiveAssetQueueBuildMs,PredictiveAssetMaxQueueBuildMs);
+            PredictiveAssetInFlight.Num(),PredictiveAssetQueue.Num()-PredictiveAssetCursor,PredictiveAssetTickMs,PredictiveAssetMaxTickMs,PredictiveAssetQueueBuilds,PredictiveAssetQueueCells,PredictiveAssetQueueBuildMs,PredictiveAssetMaxQueueBuildMs,
+            // THE CAPS AS USED, not as once written. They were literals in this
+            // format string, so a changed cap went on printing the pilot's
+            // numbers -- a counter that lies about the configuration it describes
+            // is worse than no counter, because every reader believes it.
+            VoxelStreamAdmission::CVarVoxelPredictiveLaunchCap.GetValueOnGameThread(),
+            VoxelStreamAdmission::CVarVoxelPredictiveInFlightCap.GetValueOnGameThread(),
+            VoxelStreamAdmission::CVarVoxelPredictiveProbeCap.GetValueOnGameThread(),
+            VoxelStreamAdmission::CVarVoxelPredictiveQueueCap.GetValueOnGameThread(),
+            PredictiveRefusedAdmission,PredictiveRefusedCached,PredictiveRefusedNotResident,
+            PredictiveRefusedUnbound,PredictiveRefusedNoToken);
     for(int L=0;L<8;++L){const auto& W=AppearanceStageWindows[L];if(!W.Calls)continue;
         UE_LOG(LogVoxelPerf,Log,TEXT("Voxel appearance stages (window, nested): level=%d calls=%llu input=%llu filtered=%llu cells=%llu words=%llu filterMs=%.3f resourceMs=%.3f canonicalMs=%.3f winnerMs=%.3f packMs=%.3f uploadMs=%.3f maxFilterMs=%.3f maxResourceMs=%.3f maxCanonicalMs=%.3f maxWinnerMs=%.3f maxPackMs=%.3f maxUploadMs=%.3f"),
             L,W.Calls,W.Total.Input,W.Total.Filtered,W.Total.Cells,W.Total.Words,W.Total.FilterMs,W.Total.ResourceMs,W.Total.CanonicalMs,W.Total.WinnerMs,W.Total.PackMs,W.Total.UploadMs,
@@ -14661,8 +15002,19 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
     }
     const TCHAR* ResolveCallerNames[]={TEXT("Admission"),TEXT("GpuSubmit"),TEXT("EditedPage")};
     for(int32 I=0;I<3;++I){const auto& R=AssetResolveCallerStats[I];if(!R.Calls)continue;
-        UE_LOG(LogVoxelPerf,Log,TEXT("Voxel asset resolve caller (window): caller=%s calls=%llu hits=%llu coldMisses=%llu forcedInline=%llu level0=%llu coarse=%llu totalMs=%.3f inlineMs=%.3f rawResolveMs=%.3f maxCallMs=%.3f maxRawResolveMs=%.3f"),
-            ResolveCallerNames[I],R.Calls,R.Hits,R.ColdMisses,R.ForcedInline,R.Level0Calls,R.CoarseCalls,R.TotalMs,R.InlineMs,R.RawResolveMs,R.MaxCallMs,R.MaxRawResolveMs);
+        UE_LOG(LogVoxelPerf,Log,TEXT("Voxel asset resolve caller (window): caller=%s calls=%llu hits=%llu coldMisses=%llu forcedInline=%llu level0=%llu coarse=%llu totalMs=%.3f inlineMs=%.3f rawResolveMs=%.3f maxCallMs=%.3f maxRawResolveMs=%.3f missLevel0=%llu missCoarse=%llu rawLevel0Ms=%.3f rawCoarseMs=%.3f"),
+            ResolveCallerNames[I],R.Calls,R.Hits,R.ColdMisses,R.ForcedInline,R.Level0Calls,R.CoarseCalls,R.TotalMs,R.InlineMs,R.RawResolveMs,R.MaxCallMs,R.MaxRawResolveMs,
+            R.ColdMissLevel0,R.ColdMissCoarse,R.RawResolveLevel0Ms,R.RawResolveCoarseMs);
+        FString PerLevel;
+        for(int32 L=0;L<VoxelCoords::kNumLevels;++L){
+            if(!R.ColdMissByLevel[L])continue;
+            PerLevel+=FString::Printf(TEXT(" L%d=%llu/%.1fms/%.2favg"),L,
+                (long long)R.ColdMissByLevel[L],R.RawResolveByLevelMs[L],
+                R.RawResolveByLevelMs[L]/double(R.ColdMissByLevel[L]));
+        }
+        if(!PerLevel.IsEmpty())
+            UE_LOG(LogVoxelPerf,Log,TEXT("Voxel asset resolve misses by level (window): caller=%s%s"),
+                   ResolveCallerNames[I],*PerLevel);
     }
 	// S0-2: apply throughput for THIS window, alongside the leg-long mean
 	// TotalChunksLoaded already gives on the "Voxel streaming" line above.
@@ -15298,7 +15650,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       // -VoxelAdmissionCapMax. drainEMA is the controller's one input;
 	       // if it does not track dispatched/5s / 5 the EMA is broken, which
 	       // no downstream number would otherwise reveal.
-	       TEXT("drainEMA=%.0f capSrc=%s"),
+	       TEXT("drainEMA=%.0f capSrc=%s keyP=%.2f"),
 	       // The EFFECTIVE cap: identical to GetPendingJobCap() unless
 	       // -VoxelAdmissionCapDrainSec is on, in which case this line is the
 	       // arm's proof of traffic -- cap pinned at the static floor with
@@ -15306,7 +15658,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       EffectivePendingJobCap,
 	       WidestAdmissionCutoffM(),
 	       (long long)CandidatesRejectedSinceLog, (long long)RecordsDroppedSinceLog,
-	       DrainPerSecEMA, EffectiveCapSrc);
+	       DrainPerSecEMA, EffectiveCapSrc, StreamRingKeyP);
 
 	// PER-LEVEL, PER-REASON attribution of the line above (2026-08-23; see
 	// LevelRejBudgetSinceLog's doc comment for the night this would have
@@ -15322,7 +15674,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	           [&](int32 L)
 	           {
 		           const double CutM = (LevelAdmissionCutoffDistSq[L] < DBL_MAX)
-		                                   ? FMath::Sqrt(LevelAdmissionCutoffDistSq[L]) / 100.0
+		                                   ? FMath::Sqrt(LevelAdmissionCutoffDistSq[L] / StreamRingKeyScale[L]) / 100.0
 		                                   : -1.0;
 		           // q= appended 2026-08-23 (at the END of the block, same
 		           // old-leg-grep rule as the aggregate line): this ring's
@@ -15465,6 +15817,22 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       (long long)ColdByLevelSinceLog[2], (long long)ColdByLevelSinceLog[3],
 	       (long long)ColdByLevelSinceLog[4], (long long)ColdByLevelSinceLog[5],
 	       (long long)ColdByLevelSinceLog[6], (long long)ColdByLevelSinceLog[7]);
+	// ITS OWN LINE rather than four more fields on the census above, because the
+	// two caps are independent and a reader must be able to tell which one
+	// deferred a chunk. Prints whenever the cap is armed OR anything was
+	// deferred, so an arm that silently stopped engaging is visible as a line
+	// that keeps printing zeros rather than as no line at all.
+	if (VoxelStreamAdmission::CVarVoxelStreamColdResolveCapPerTick.GetValueOnGameThread() > 0 ||
+	    VoxelStreamAdmission::CVarVoxelStreamColdResolveBudgetMsPerTick.GetValueOnGameThread() > 0 ||
+	    ColdResolveDeferredSinceLog > 0 || ColdResolveExemptSinceLog > 0)
+	{
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("Voxel cold resolve cap (window): cap=%d budgetMs=%d deferred=%llu ofWhichBudget=%llu exempt=%llu"),
+		       VoxelStreamAdmission::CVarVoxelStreamColdResolveCapPerTick.GetValueOnGameThread(),
+		       VoxelStreamAdmission::CVarVoxelStreamColdResolveBudgetMsPerTick.GetValueOnGameThread(),
+		       (long long)ColdResolveDeferredSinceLog, (long long)ColdResolveBudgetDeferredSinceLog,
+		       (long long)ColdResolveExemptSinceLog);
+	}
 	static_assert(VoxelCoords::kNumLevels == 8,
 	              "the coldByLevel print spells 8 slots; respell it with the level count");
 
@@ -17332,6 +17700,8 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
     for(auto& W:AppearanceStageWindows)W={};
     for(auto& R:AssetResolveCallerStats)R={};
     PredictiveAssetProbes=PredictiveAssetLaunched=PredictiveAssetLanded=0;
+    PredictiveRefusedAdmission=PredictiveRefusedCached=PredictiveRefusedNotResident=
+        PredictiveRefusedUnbound=PredictiveRefusedNoToken=0;
     PredictiveAssetRaced=PredictiveAssetNotResident=PredictiveAssetRejected=PredictiveAssetEpochRejected=0;
     PredictiveAssetTickMs=PredictiveAssetMaxTickMs=0;
     PredictiveAssetQueueBuilds=PredictiveAssetQueueCells=0;
@@ -17366,6 +17736,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	// ColdShadingsThisTick is not: it is per-tick working state cleared at the
 	// fold, and this function can run part-way through a tick.
 	ColdCapDeferredSinceLog = ColdCapDeferredTicksSinceLog = ColdCapExemptSinceLog = 0;
+	ColdResolveDeferredSinceLog = ColdResolveExemptSinceLog = ColdResolveBudgetDeferredSinceLog = 0;
 	AccumBrickFlushMs = 0.0;
 	AccumSpecDispatchMs = AccumSpecEnumerateMs = AccumSpecParkMs = 0.0;
 	AccumTicks = 0;
@@ -20146,6 +20517,15 @@ const std::vector<vxc::AssetField::ResolvedAssetInstance>* FVoxelWorldImpl::Reso
     OutScratch=VoxelResolveTerrainInstances(Voxels.generated(),VoxelAssetRectForFootprint(Level,ChunkX,ChunkY));
     const double RawResolveMs=(FPlatformTime::Seconds()-Started)*1000.0;
     CallerStats.RawResolveMs+=RawResolveMs;CallerStats.MaxRawResolveMs=FMath::Max(CallerStats.MaxRawResolveMs,RawResolveMs);
+    if(Level==0){++CallerStats.ColdMissLevel0;CallerStats.RawResolveLevel0Ms+=RawResolveMs;}
+    else{++CallerStats.ColdMissCoarse;CallerStats.RawResolveCoarseMs+=RawResolveMs;}
+    if(Level>=0&&Level<VoxelCoords::kNumLevels){
+        ++CallerStats.ColdMissByLevel[Level];CallerStats.RawResolveByLevelMs[Level]+=RawResolveMs;}
+    // The millisecond budget's meter. Only the submit caller, because that is
+    // the one the cap defers; admission and the edited-page path are not
+    // deferrable and charging them would spend a budget on work the cap cannot
+    // decline.
+    if(Caller==EAssetResolveCaller::GpuSubmit)ColdResolveMsThisTick+=RawResolveMs;
     VoxelStreamAdmission::GAssetResolveInline.fetch_add(1,std::memory_order_relaxed);
     VoxelStreamAdmission::GAssetResolveGameThreadUs.fetch_add(int64((FPlatformTime::Seconds()-Started)*1e6),std::memory_order_relaxed);
     if(VoxelStreamAdmission::AsyncAssetResolveEnabled()){
@@ -20184,17 +20564,33 @@ void FVoxelWorldImpl::DrainAssetResolveResults()
 bool FVoxelWorldImpl::LaunchAssetResolveWarm(const VoxelCoords::FVoxelLevelChunkKey& CacheKey)
 {
 	check(IsInGameThread());
-    if(!CpuAdmission.isOpen())return false;
+    // WHY A PROBE DID NOT LAUNCH, counted at each refusal.
+    //
+    // The loop counted probes and launches and nothing between them, so a run
+    // reading probes=200,025 launched=109 said only that something refused
+    // 99.9% of candidates -- not which predicate, and there are four. That is
+    // the same silence as a counter that cannot fail: every hypothesis about the
+    // prewarm survives it. 2026-09-13, after extending the queue to coarse
+    // levels bought nothing.
+    if(!CpuAdmission.isOpen()){++PredictiveRefusedAdmission;return false;}
     SyncAssetResolveCache();
-	if (AssetResolveCache.contains(ResolveKeyOf(CacheKey)) ||
-	    !AssetResolveFootprintResident(CacheKey.Level, CacheKey.Key.X, CacheKey.Key.Y)) return false;
+	if (AssetResolveCache.contains(ResolveKeyOf(CacheKey))){++PredictiveRefusedCached;return false;}
+	if (!AssetResolveFootprintResident(CacheKey.Level, CacheKey.Key.X, CacheKey.Key.Y)){++PredictiveRefusedNotResident;return false;}
 	const vxc::GeneratedWorld<VoxelCoords::BrickEdgeVoxels>* GenPtr = &Voxels.generated();
 	TQueue<FAssetResolveResult, EQueueMode::Mpsc>* QueuePtr = &AssetResolveQueue;
     const auto* Field=Voxels.assetField();
-    if(!Field||!vxc::footprintResolveSitesBound(VoxelAssetRectForFootprint(CacheKey.Level,CacheKey.Key.X,CacheKey.Key.Y),Field->layers()))return false;
+    // THE SITE CAP FOR SPECULATIVE WARMING. Default 8192 is the historical
+    // value, so an arm that leaves it alone behaves exactly as before. It is the
+    // line that refused 175% of probes (a probe can be retried across ticks) and
+    // it refused them for being COARSE -- the footprints that cost 28.91 ms each
+    // inline, against level 0's 3.77. Raising it moves that work off the game
+    // thread; it does not create it.
+    const uint64 WarmSiteCap = uint64(FMath::Clamp(
+        VoxelStreamAdmission::CVarVoxelPredictiveSiteCap.GetValueOnGameThread(), 1, 1 << 20));
+    if(!Field||!vxc::footprintResolveSitesBound(VoxelAssetRectForFootprint(CacheKey.Level,CacheKey.Key.X,CacheKey.Key.Y),Field->layers(),WarmSiteCap)){++PredictiveRefusedUnbound;return false;}
     SyncAssetResolveCache();
     const auto WarmToken=AssetResolveCache.beginWarm(ResolveKeyOf(CacheKey));
-    if(!WarmToken)return false;
+    if(!WarmToken){++PredictiveRefusedNoToken;return false;}
 	VoxelStreamAdmission::GAssetResolveWarmLaunched.fetch_add(1, std::memory_order_relaxed);
 	const vxc::AssetVoxelRect Rect = VoxelAssetRectForFootprint(CacheKey.Level, CacheKey.Key.X, CacheKey.Key.Y);
 	// GenPtr and QueuePtr are raw pointers into Impl-owned data, exactly
@@ -20230,9 +20626,39 @@ void FVoxelWorldImpl::WarmPredictiveAssetResolves(const FVector& Anchor, float D
 	const double Start = FPlatformTime::Seconds();
 	const vxc::AssetField* Field = Voxels.assetField();
 	if (!Field || Field->empty()) return;
-	// Fixed pilot limits: retain 2,048 queued keys, 256 probes/tick, eight
-	// launches/tick and 32 predictive tasks outstanding. No residency loads.
-	constexpr int32 QueueCap = 2048, ProbeCap = 256, LaunchCap = 8, InFlightCap = 32;
+	// THE PILOT LIMITS, NOW TUNABLE, AND WHY THAT BECAME WORTH DOING.
+	//
+	// They were fixed at the pilot's values: 2,048 queued keys, 256 probes/tick,
+	// eight launches/tick, 32 tasks outstanding. On 2026-09-13 the submit path
+	// was measured against them for the first time:
+	//
+	//   caller=GpuSubmit calls=6286 hits=5950 coldMisses=336
+	//                    totalMs=1555.830 inlineMs=1553.786
+	//   predictive       probes=842 launched=154 landed=152
+	//
+	// The cache is doing its job -- 5,950 hits cost 2.0 ms BETWEEN THEM -- and
+	// every one of those 1,553.8 ms is a cold miss paid inline on the game
+	// thread, about 4.6 ms each, with a worst single call of 29.9 ms. Sixty of
+	// them in one frame is the 277 ms hitch that p99 is made of. The prewarm
+	// exists to stop exactly this and landed 152 against 336 misses, while its
+	// launch cap let it start only eight a tick.
+	//
+	// So the caps are now readable from cvars, with the pilot values as the
+	// DEFAULTS -- a control arm is byte-identical -- and the window line prints
+	// what it actually used rather than the literals it used to hard-code, which
+	// would have gone on printing "launchCap=8" whatever the cap became.
+	//
+	// THIS IS A THROUGHPUT KNOB ON SPECULATIVE WORK AND IT CAN LOSE. The tasks
+	// run at BackgroundLow precisely so a predictive resolve never takes a slot
+	// from a chunk somebody is waiting for; raising the caps spends more worker
+	// time on work that may be thrown away, and this project has already
+	// measured a case where releasing a cap made throughput FALL. The gate is
+	// GpuSubmit coldMisses, not launched= -- launching more and landing the same
+	// is the shape of a knob that did nothing.
+	const int32 QueueCap = FMath::Clamp(VoxelStreamAdmission::CVarVoxelPredictiveQueueCap.GetValueOnGameThread(), 0, 1 << 20);
+	const int32 ProbeCap = FMath::Clamp(VoxelStreamAdmission::CVarVoxelPredictiveProbeCap.GetValueOnGameThread(), 0, 1 << 16);
+	const int32 LaunchCap = FMath::Clamp(VoxelStreamAdmission::CVarVoxelPredictiveLaunchCap.GetValueOnGameThread(), 0, 1 << 12);
+	const int32 InFlightCap = FMath::Clamp(VoxelStreamAdmission::CVarVoxelPredictiveInFlightCap.GetValueOnGameThread(), 0, 1 << 12);
 	const double Edge = VoxelCoords::ChunkEdgeUUForLevel(0);
 	FVector Lead = FVector::ZeroVector;
 	if (bPredictiveAssetHasAnchor && DeltaTime > 0.f)
@@ -20261,24 +20687,76 @@ void FVoxelWorldImpl::WarmPredictiveAssetResolves(const FVector& Anchor, float D
 		// Bound construction scratch to 129 squared keys (under 267 KB at
 		// 16 bytes/key before allocator slack); sort then truncate to
 		// nearest-first. Only XY keys are retained, never candidate/source copies.
-		const int32 Span = FMath::Min(64, FMath::CeilToInt32(Radius / Edge));
-		for (int32 DY = -Span; DY <= Span; ++DY)
-		for (int32 DX = -Span; DX <= Span; ++DX)
+		// THE LEVELS THIS WARMS, AND WHY IT USED TO BE ONE.
+		//
+		// Every key enqueued here was `Key{0, ...}` -- level 0 and nothing else.
+		// On 2026-09-13 the submit path's cold misses were split by level for the
+		// first time, over 31 windows of a forest walk:
+		//
+		//   level 0    847 misses    3,195 ms     3.77 ms each     1.6% of miss time
+		//   coarse   6,716 misses  194,162 ms    28.91 ms each    98.4% of miss time
+		//
+		// A coarse footprint resolves over a rect 2^L times wider per side, so it
+		// finds far more instances and costs 7.7x what a level-0 one does, with a
+		// worst single call of 526 ms -- one call, one visible freeze. And it
+		// could never be warm, whatever the caps were: nothing ever queued it.
+		// That is why raising all four caps moved coldMisses 7903 -> 8247, which
+		// is to say not at all.
+		//
+		// Each level is enumerated over ITS OWN admit radius, so a level with a
+		// wider ring does not get a level-0-sized window, and the chunk count per
+		// level stays modest because the edge grows with the radius.
+		//
+		// Ordering is by distance in CHUNKS OF THAT LEVEL rather than in world
+		// units, deliberately: a coarse chunk is enormous, so ranking by world
+		// distance would put every coarse key behind every level-0 key and
+		// reinstate exactly the starvation this is meant to remove.
+		const int32 WarmMaxLevel = FMath::Clamp(
+			VoxelStreamAdmission::CVarVoxelPredictiveCoarseLevels.GetValueOnGameThread(),
+			0, UVoxelWorldSubsystem::GetMaxRingLevel());
+		for (int32 Level = 0; Level <= WarmMaxLevel; ++Level)
 		{
-			++PredictiveAssetQueueCells;
-			const int64 X = int64(Center.X) + DX, Y = int64(Center.Y) + DY;
-			if (X < MIN_int32 || X > MAX_int32 || Y < MIN_int32 || Y > MAX_int32) continue;
-			const double CX = (double(X) + 0.5) * Edge, CY = (double(Y) + 0.5) * Edge;
-			if (FMath::Square(CX - Anchor.X) + FMath::Square(CY - Anchor.Y) > FMath::Square(Radius)) continue;
-			const VoxelCoords::FVoxelLevelChunkKey Key{0, {int32(X), int32(Y), 0}};
-			if (!AssetResolveCache.contains(ResolveKeyOf(Key))) PredictiveAssetQueue.Add(Key);
+			const double LevelEdge = VoxelCoords::ChunkEdgeUUForLevel(Level);
+			const double LevelRadius = FMath::Min(VoxelStreamAdmission::AdmitOuterUU(Level) + 2.0 * LevelEdge,
+			                                      64.0 * LevelEdge);
+			// A level-L chunk spans ChunkEdgeUUForLevel(L) of world, so the key
+			// containing a point is that division -- there is no
+			// ChunkKeyForLevel helper, and ChunkKeyForVoxel would answer in
+			// LEVEL-0 chunks, which is the mistake HoldsGeometry-vs-HoldsTerrain
+			// is made of.
+			const FVector LevelProbe = Anchor + Lead;
+			const int64 LevelCenterX = int64(FMath::FloorToDouble(LevelProbe.X / LevelEdge));
+			const int64 LevelCenterY = int64(FMath::FloorToDouble(LevelProbe.Y / LevelEdge));
+			const int32 Span = FMath::Min(64, FMath::CeilToInt32(LevelRadius / LevelEdge));
+			for (int32 DY = -Span; DY <= Span; ++DY)
+			for (int32 DX = -Span; DX <= Span; ++DX)
+			{
+				++PredictiveAssetQueueCells;
+				const int64 X = LevelCenterX + DX, Y = LevelCenterY + DY;
+				if (X < MIN_int32 || X > MAX_int32 || Y < MIN_int32 || Y > MAX_int32) continue;
+				const double CX = (double(X) + 0.5) * LevelEdge, CY = (double(Y) + 0.5) * LevelEdge;
+				if (FMath::Square(CX - Anchor.X) + FMath::Square(CY - Anchor.Y) > FMath::Square(LevelRadius)) continue;
+				const VoxelCoords::FVoxelLevelChunkKey Key{Level, {int32(X), int32(Y), 0}};
+				if (!AssetResolveCache.contains(ResolveKeyOf(Key))) PredictiveAssetQueue.Add(Key);
+			}
 		}
-		PredictiveAssetQueue.Sort([Center](const auto& A, const auto& B)
+		PredictiveAssetQueue.Sort([&Anchor, &Lead](const auto& A, const auto& B)
 		{
-			const int64 AX = int64(A.Key.X) - Center.X, AY = int64(A.Key.Y) - Center.Y;
-			const int64 BX = int64(B.Key.X) - Center.X, BY = int64(B.Key.Y) - Center.Y;
-			const int64 DA = AX * AX + AY * AY, DB = BX * BX + BY * BY;
-			return DA != DB ? DA < DB : (A.Key.X != B.Key.X ? A.Key.X < B.Key.X : A.Key.Y < B.Key.Y);
+			// Distance measured in each key's OWN chunks, so levels interleave
+			// instead of the coarse ones queueing behind every fine one.
+			const auto Rank = [&Anchor, &Lead](const VoxelCoords::FVoxelLevelChunkKey& K)
+			{
+				const double Edge = VoxelCoords::ChunkEdgeUUForLevel(K.Level);
+				const FVector P = Anchor + Lead;
+				const int64 CX = int64(FMath::FloorToDouble(P.X / Edge));
+				const int64 CY = int64(FMath::FloorToDouble(P.Y / Edge));
+				const int64 DX = int64(K.Key.X) - CX, DY = int64(K.Key.Y) - CY;
+				return DX * DX + DY * DY;
+			};
+			const int64 DA = Rank(A), DB = Rank(B);
+			if (DA != DB) return DA < DB;
+			if (A.Level != B.Level) return A.Level < B.Level;
+			return A.Key.X != B.Key.X ? A.Key.X < B.Key.X : A.Key.Y < B.Key.Y;
 		});
 		if (PredictiveAssetQueue.Num() > QueueCap) PredictiveAssetQueue.SetNum(QueueCap);
 		const double QueueMs = (FPlatformTime::Seconds() - QueueStart) * 1000.0;
@@ -20547,7 +21025,8 @@ void FVoxelWorldImpl::SortPendingQueues(const FVector& Anchor, int32 OnlyLevel)
 		const double DistSq3D = FMath::Square(CenterX - Anchor.X) + FMath::Square(CenterY - Anchor.Y) +
 		                        FMath::Square(CenterZ - Anchor.Z);
 		return VoxelStreamAdmission::PrioritySortKeySq(LevelKey.Level, DistSq3D, CenterX - Anchor.X,
-		                                                CenterY - Anchor.Y, StreamBiasDirXY, BiasK);
+		                                                CenterY - Anchor.Y, StreamBiasDirXY, BiasK,
+		                                                StreamRingKeyScale[LevelKey.Level]);
 	};
 	// docs/m2-plan.md item 1: "Budgets shared across levels, nearest-first
 	// within level, lower level (finer) wins priority at equal distance."
@@ -21216,7 +21695,7 @@ FVoxelWorldImpl::EAdmitEvalOutcome FVoxelWorldImpl::AdmitCandidateEvaluate(
 	// pair SortPendingQueues refreshed this tick's stored keys with.
 	const double SortKeySq = VoxelStreamAdmission::PrioritySortKeySq(
 	    QueueLevel, DistSq3D, CenterX - Anchor.X, CenterY - Anchor.Y, StreamBiasDirXY,
-	    StreamBiasK);
+	    StreamBiasK, StreamRingKeyScale[QueueLevel]);
 	if (!bOverlayAware && SortKeySq >= LevelAdmissionCutoffDistSq[QueueLevel])
 	{
 		++CandidatesRejectedSinceLog;
@@ -21923,7 +22402,10 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& InAnchor)
 			LP.InnerEvictUU = VoxelStreamAdmission::InnerEvictUU(ResidLevel);
 			LP.UnloadOuterUU = VoxelStreamAdmission::UnloadOuterUU(ResidLevel);
 			LP.VerticalKeepUU = VoxelUnderground::VerticalKeepUU(ResidLevel, LP.ChunkEdgeUU);
-			LP.CutoffSortKeySq = LevelAdmissionCutoffDistSq[ResidLevel];
+			// The shader forms its own key in metres^2; hand it the cutoff on that scale.
+			LP.CutoffSortKeySq = (LevelAdmissionCutoffDistSq[ResidLevel] < DBL_MAX)
+			                         ? LevelAdmissionCutoffDistSq[ResidLevel] / StreamRingKeyScale[ResidLevel]
+			                         : DBL_MAX;
 			const FVoxelCoord ResidAnchorVoxel = WorldToVoxelForLevel(Anchor, ResidLevel);
 			const FVoxelChunkKey ResidAnchorChunk = ChunkKeyForVoxel(ResidAnchorVoxel);
 			LP.AnchorChunk = FIntVector(ResidAnchorChunk.X, ResidAnchorChunk.Y, ResidAnchorChunk.Z);
@@ -23932,7 +24414,9 @@ void FVoxelWorldImpl::TruncatePendingJobQueue()
 		for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
 		{
 			const double ClampedUU = FMath::Min(FloorUU, VoxelStreamAdmission::AdmitOuterUU(Level));
-			FloorKeySqByLevel[Level] = (ClampedUU > 0.0) ? FMath::Square(ClampedUU) : 0.0;
+			// On the KEY scale (StreamRingKeyScale), like the entries it is compared to.
+			FloorKeySqByLevel[Level] =
+				(ClampedUU > 0.0) ? FMath::Square(ClampedUU) * StreamRingKeyScale[Level] : 0.0;
 			LevelFloorUUForLog[Level] = ClampedUU;
 		}
 	}
@@ -26557,6 +27041,7 @@ void FVoxelWorldImpl::DispatchJobs()
 	// comment for the 24-vs-96 readout that fix removed).
 	const int32 MaxJobsInFlight = MaxJobsInFlightCap();
 	const bool bRingQuota = VoxelStreamAdmission::GetRingQuotaEnabled();
+	const bool bCoverageFirst = VoxelStreamAdmission::CVarVoxelStreamCoverageFirstPick.GetValueOnGameThread() != 0;
 	// voxel.Stream.RingFloorCpuOnly (default 0 = the blended behaviour below).
 	// Read once per call like every other gate in this loop; see the cvar's
 	// comment in VoxelDebug.cpp for the starvation mechanism and the paired
@@ -26598,6 +27083,21 @@ void FVoxelWorldImpl::DispatchJobs()
 	// popped from, carrying the DistSq it was popped with; the requeue and its
 	// priority argument are after the pop loop.
 	TArray<FSortEntry> DeferredColdShadingCap[VoxelCoords::kNumLevels];
+
+	// THE SAME HOLD, FOR A COLD ASSET RESOLVE RATHER THAN A COLD SHADING, and
+	// it exists because the resolve is the larger of the two by an order of
+	// magnitude. Measured 2026-09-13: a cold COARSE footprint resolve costs
+	// 28.91 ms on the game thread, worst single call 526 ms, and sixty of them
+	// in one frame is the 277 ms p99 hitch. Prewarming now covers coarse levels
+	// and halved the count, but the extreme tail did not move -- a resolve
+	// demanded in the frame it is needed cannot be predicted, only bounded.
+	//
+	// Same hold, same requeue, same hole-safety argument, and the argument is
+	// the load-bearing part: a fine submit may wait ONLY while a coarser
+	// ancestor is resident and holds terrain, because that ancestor is what the
+	// marcher falls through to and draws meanwhile. A chunk with nothing coarser
+	// over it is never deferred; it pays and is counted as exempt.
+	TArray<FSortEntry> DeferredColdResolveCap[VoxelCoords::kNumLevels];
 
 	// -VoxelColdBandDeferPark: release parked column-mates whose seeding mark
 	// has cleared or aged out, BEFORE the pop loop so they are dispatchable in
@@ -26795,7 +27295,57 @@ void FVoxelWorldImpl::DispatchJobs()
 		const double PickStart = FPlatformTime::Seconds();
 		TRACE_CPUPROFILER_EVENT_SCOPE(VoxelDispatch_Pick);
 		int32 PickLevel = INDEX_NONE;
-		if (bRingQuota)
+		// COVERAGE-FIRST PICK (voxel.Stream.CoverageFirstPick, default 0 = off).
+		//
+		// WHAT IT ANSWERS. At 20 m/s on a terrain-only flight the coverage
+		// probe read holes=1,000-2,900 of ~10,050 scanned columns per window --
+		// 10-29% of the ground uncovered -- while dispatch ran flat out at ~4,000
+		// chunks/s and the queues read R0-R3 at ZERO with R4-R7 at 1,000-3,500
+		// each. Nearest-first hands the fine rings the whole of a capped budget,
+		// and the ring that starves is the one whose chunks are the ONLY thing
+		// drawing their ground: a missing R7 chunk is a 410 m black square, a
+		// missing R0 chunk is 3.2 m of mip-pop. Refinement was being bought
+		// with holes.
+		//
+		// THE RULE: before the floor and nearest-first passes, scan the rings
+		// COARSEST first and take the first whose queue head is NOT already
+		// drawn by a resident coarser ancestor. That is the same predicate the
+		// cold-shading and cold-resolve caps use to decide a submit may WAIT --
+		// inverted: a chunk nothing else covers may not wait. For the coarsest
+		// active ring it is always true, which is the point: that ring is the
+		// floor of the whole cascade and it is cheap in count (a 20 m/s flight
+		// needs about one new R7 chunk a second once caught up).
+		//
+		// WHAT IT DOES NOT ASK, on purpose: whether resident FINER descendants
+		// draw the ground -- that walk is 4^k lookups and this runs per dispatch.
+		// So the coarsest ring is over-served by at most its own queue depth,
+		// which is bounded and measured (coverageFirst= on the ring line).
+		//
+		// COST: at most one TMap walk per ring per dispatch, short-circuiting on
+		// the first uncovered head, in the pick bracket where it will be seen.
+		//
+		// THE GATE that can fail: `Voxel coverage (window): holes=` on a 20 m/s
+		// terrain-only flight. It must fall from the 1,000-2,900 above toward
+		// zero; if it does not, the starvation was not the mechanism.
+		bool bCoveragePick = false;
+		if (bCoverageFirst)
+		{
+			for (int32 Level = VoxelCoords::kNumLevels - 1; Level >= 0; --Level)
+			{
+				if (PendingJobKeysByLevel[Level].Num() == 0 || Level == SplitHeldLevel)
+				{
+					continue;
+				}
+				if (!ColdShadingCoveredByCoarserAncestor(ChunkRecords, PendingJobKeysByLevel[Level].Last().Key))
+				{
+					PickLevel = Level;
+					bCoveragePick = true;
+					++CoverageFirstPicksSinceLog[Level];
+					break;
+				}
+			}
+		}
+		if (bRingQuota && !bCoveragePick)
 		{
 			const int32* const Floors = VoxelStreamAdmission::GetRingSlotFloors();
 			int32 BestDeficit = 0;
@@ -26828,7 +27378,7 @@ void FVoxelWorldImpl::DispatchJobs()
 		// Whether the ring-quota pass chose this pick. Latched here, before the
 		// nearest-first pass can overwrite PickLevel, because the CPU-only mode
 		// pins floor-deficit picks to the CPU arm at the fork below.
-		const bool bFloorDeficitPick = (PickLevel != INDEX_NONE);
+		const bool bFloorDeficitPick = (PickLevel != INDEX_NONE) && !bCoveragePick;
 		if (PickLevel == INDEX_NONE)
 		{
 			double BestDistSq = 0.0;
@@ -27443,6 +27993,147 @@ void FVoxelWorldImpl::DispatchJobs()
 				// cap or no cap; counting it here is what makes the exemption
 				// visible instead of an assumption about the census's 0-5%.
 				++ColdCapExemptSinceLog;
+			}
+		}
+
+		// THE COLD *RESOLVE* CAP. voxel.Stream.ColdResolveCapPerTick, default 0
+		// = off, so a control arm is byte-identical.
+		//
+		// WHAT IT IS FOR. The asset resolve behind a GPU submit costs 3.77 ms
+		// cold at level 0 and 28.91 ms cold at a coarse level, worst single call
+		// 526 ms, all of it inline on the game thread
+		// (docs/measurements/submit-cold-resolve-2026-09-13/). Warming ahead now
+		// covers coarse footprints and halved the count, but frames over 300 ms
+		// did not move: a resolve first asked for in the frame it is needed
+		// cannot be predicted. It can only be BOUNDED, and this is the bound --
+		// at a cap of 2, a tick pays at most about 58 ms of resolve instead of
+		// the 277 ms a p99 frame was measured paying.
+		//
+		// THE TEST IS A HASH LOOKUP, NOT A RESOLVE. `contains` asks whether the
+		// answer is already cached; it never computes one. Getting that wrong
+		// would make the instrument into the cost it is measuring, which is a
+		// recorded failure on this exact path.
+		//
+		// HOLE SAFETY IS BY CONSTRUCTION, exactly as it is for cold shading
+		// above: a submit may wait only while a COARSER ancestor is resident and
+		// holds terrain right now, which is what the marcher falls through to
+		// and draws while the fine one waits. The visible cost is a bounded
+		// mip-pop. A cold submit with nothing coarser over it is never deferred.
+		//
+		// AND IT IS A TRADE, NOT A WIN, which is why both sides are counted:
+		// deferred= is refinement delayed, and a cap set too low trades a hitch
+		// for visible coarse ground. Read deferred= against the tail it bought.
+		const int32 ColdResolveCap = VoxelStreamAdmission::CVarVoxelStreamColdResolveCapPerTick.GetValueOnGameThread();
+		const int32 ColdResolveBudget = VoxelStreamAdmission::CVarVoxelStreamColdResolveBudgetMsPerTick.GetValueOnGameThread();
+		// A CHUNK IS COLD ONLY IF A RESOLVE WOULD ACTUALLY BE PAID, and that is
+		// the bug this guard closes. The first version asked the cache alone:
+		// "is this footprint cached?" In a world with NO asset field the submit
+		// never resolves anything, the cache never holds anything, and so every
+		// chunk read as cold -- after eight per tick the whole queue was popped,
+		// deferred and requeued, every tick. Measured 2026-09-13 on a terrain-only
+		// flight at 20 m/s: deferred=552,861 in ONE window, dispatch pinned at
+		// exactly 8.00 per tick for seventeen windows, per-dispatch cost 0.085 ->
+		// 0.8 ms of churn, and a kilometre-wide crater around the player where
+		// the near field was never built. The same leg with the cap off: 3,999.9
+		// chunks/s and an intact world. The predicate below is the one the
+		// submit path itself uses before it resolves (AField && !AField->empty()),
+		// plus the cache being enabled at all -- a disabled cache also misses
+		// forever, for the same reason.
+		const vxc::AssetField* CapField = Voxels.assetField();
+		const bool bResolveWouldBePaid = CapField && !CapField->empty() &&
+			AssetResolveCache.epoch() != UINT64_MAX;
+		if ((ColdResolveCap > 0 || ColdResolveBudget > 0) && bUseGpuMesh && bResolveWouldBePaid)
+		{
+			SyncAssetResolveCache();
+			if (!AssetResolveCache.contains(ResolveKeyOf(LevelKey)))
+			{
+				// The budget binds FIRST when it is armed, because it is the
+				// one that bounds the frame rather than the call count. The
+				// first cold resolve of a tick always goes through -- nothing
+				// has been spent yet -- so the tick is bounded by roughly
+				// budget + one resolve, which is the honest guarantee and is
+				// what the counter below should be read against.
+				const double ColdResolveBudgetMs =
+					double(VoxelStreamAdmission::CVarVoxelStreamColdResolveBudgetMsPerTick.GetValueOnGameThread());
+				// CHARGE THE ESTIMATE BEFORE THE WORK, which is the only way a
+				// budget can bound a FRAME rather than bound everything after
+				// the first resolve. A budget can only defer work it has not
+				// done, so the first cold resolve of a tick always went through
+				// -- and one coarse resolve was measured at up to 526 ms, which
+				// is how a 20 ms budget overshot to ~80 ms in the 100-300 ms
+				// band on 2026-09-13.
+				//
+				// THE PROXY IS THE LEVEL, and it must be PER level. The first
+				// version of this charged one flat figure for every coarse
+				// level -- 28.91 ms, the average over whatever mix of levels
+				// happened to be asked for -- and that average is not a cost of
+				// anything. Measured per level on 2026-09-13, at 9.5 m/s with
+				// the cap off, 3,975 misses:
+				//
+				//   L0  6.11   L1  8.48   L2  6.27   L3   7.23
+				//   L4 10.70   L5 16.03   L6 43.17   L7 108.22   ms each
+				//
+				// Levels 6 and 7 are 38% of the misses and 86.5% of the
+				// milliseconds. A flat 28.91 is therefore 3.7x TOO LOW exactly
+				// where the bound needs to hold, and too high at L0-L3 where it
+				// costs deferrals for nothing. A level-L footprint is 2^L wider
+				// per side, so this shape is what the geometry predicts; the
+				// numbers are the measured ones rather than the predicted ones
+				// so a later re-measurement can see them move.
+				//
+				// A SINGLE L7 RESOLVE EXCEEDS ANY SANE TICK BUDGET on its own,
+				// which is the honest consequence: with a 20 ms budget an L7
+				// submit goes through only when nothing else has been spent, and
+				// it takes the whole tick when it does.
+				//
+				// An estimate that is WRONG costs a deferral, never a hole: the
+				// coverage test below is unchanged and still refuses to defer
+				// anything without a coarser ancestor.
+				// AND THE PER-LEVEL TABLE WAS TRIED AND IS WORSE. Charging the
+				// measured {6.11, 8.48, 6.27, 7.23, 10.70, 16.03, 43.17, 108.22}
+				// read p50 20.14 / p95 158.42 against the flat figure's 17.29 /
+				// 125.97 at 9.5 m/s -- better on p99 and over-300 ms, worse on
+				// everything else.
+				//
+				// WHY, and it is worth keeping because it is counter-intuitive:
+				// the budget's job is to BOUND A TICK, not to be accurate. A
+				// flat 28.91 over-charges L0-L3 by 4x, and that over-charge is a
+				// throughput limiter that keeps the tick short. Replace it with
+				// the true 6-8 ms and many more fine resolves fit in one tick,
+				// which is exactly the middle band getting worse. An accurate
+				// cost model is not the objective here; a short tick is.
+				//
+				// The flat figure is also the one the owner saw pictures of, so
+				// changing it would invalidate that verdict as well.
+				const double EstimatedResolveMs = LevelKey.Level == 0 ? 3.77 : 28.91;
+				const bool bOverBudget = ColdResolveBudgetMs > 0.0 &&
+					(ColdResolveMsThisTick >= ColdResolveBudgetMs ||
+					 (VoxelStreamAdmission::CVarVoxelStreamColdResolveChargeEstimate.GetValueOnGameThread() &&
+					  ColdResolveMsThisTick + EstimatedResolveMs > ColdResolveBudgetMs));
+				if (bOverBudget)
+				{
+					if (ColdShadingCoveredByCoarserAncestor(ChunkRecords, LevelKey))
+					{
+						DeferredColdResolveCap[PickLevel].Add(PoppedEntry);
+						++ColdResolveDeferredSinceLog;
+						++ColdResolveBudgetDeferredSinceLog;
+						continue;
+					}
+					++ColdResolveExemptSinceLog;
+				}
+				if (ColdResolveCap > 0 && ColdResolvesThisTick >= ColdResolveCap)
+				{
+					if (ColdShadingCoveredByCoarserAncestor(ChunkRecords, LevelKey))
+					{
+						DeferredColdResolveCap[PickLevel].Add(PoppedEntry);
+						++ColdResolveDeferredSinceLog;
+						continue;
+					}
+					++ColdResolveExemptSinceLog;
+				}
+				// Counted where it is PAID, whether under the cap or exempt from
+				// it, so the counter keeps meaning "resolves this tick will do".
+				++ColdResolvesThisTick;
 			}
 		}
 
@@ -28586,6 +29277,10 @@ void FVoxelWorldImpl::DispatchJobs()
 		if (DeferredColdShadingCap[Level].Num() > 0)
 		{
 			PendingJobKeysByLevel[Level].Append(DeferredColdShadingCap[Level]);
+		}
+		if (DeferredColdResolveCap[Level].Num() > 0)
+		{
+			PendingJobKeysByLevel[Level].Append(DeferredColdResolveCap[Level]);
 		}
 	}
 
@@ -33678,6 +34373,18 @@ void UVoxelWorldSubsystem::Initialize(FSubsystemCollectionBase& Collection)
     }
 	Impl = MakeUnique<FVoxelWorldImpl>(Seed, TileDir, TileScale, FineTileDir, FineProviderId, FineBudgetBytes,
 	                                   FineRingRadius);
+	// THE RESOLVE CACHE'S OWN LIMITS, and the only one that has ever bound
+	// anything here is `pending`. Its default is EIGHT outstanding warm tokens,
+	// which silently outranks every launch and in-flight cap above it: a
+	// 2026-09-13 run at launchCap=64 / inFlightCap=256 refused 4,906,442
+	// launches for want of a token. Defaults below reproduce the constructor's
+	// own values exactly, so an arm that passes nothing is unchanged.
+	Impl->AssetResolveCache.setLimits(
+		size_t(FMath::Max(1, VoxelStreamAdmission::CVarVoxelResolveCacheEntries.GetValueOnGameThread())),
+		uint64(FMath::Max(1, VoxelStreamAdmission::CVarVoxelResolveCacheMB.GetValueOnGameThread())) * 1024ull * 1024ull,
+		uint64(FMath::Max(1, VoxelStreamAdmission::CVarVoxelResolveCacheEntryMB.GetValueOnGameThread())) * 1024ull * 1024ull,
+		size_t(FMath::Max(1, VoxelStreamAdmission::CVarVoxelResolveCacheEntries.GetValueOnGameThread())),
+		size_t(FMath::Max(1, VoxelStreamAdmission::CVarVoxelResolveCachePending.GetValueOnGameThread())));
 	Impl->EnvironmentObjectWorld=GetWorld();
 }
 
@@ -34291,6 +34998,7 @@ bool UVoxelWorldSubsystem::IsFineRingSettled(int32& OutSettledTiles, int32& OutR
 
 void UVoxelWorldSubsystem::Tick(float DeltaTime)
 {
+    CSV_SCOPED_TIMING_STAT(VoxelStream, WorldSubsystemTickMs);
     if(Impl&&Impl->VisualBoundary)return;
 	if (!Impl || !ChunkOwner || !ChunkRoot)
 	{
@@ -35245,6 +35953,69 @@ double UVoxelWorldSubsystem::SampleTerrainHeightUU(double WorldXUU, double World
 	return FMath::Lerp(Hx0, Hx1, Fy);
 }
 
+// THE FRAME-SCOPED ASSET SHORTLIST. Default ON; 0 is the control arm and
+// restores the exact previous behaviour, where only the movement tick's
+// Begin/End pair got a shortlist and every other caller paid a full per-point
+// asset resolve. See FrameQueries' declaration for the measurement.
+static TAutoConsoleVariable<bool> CVarVoxelFrameAssetShortlist(
+	TEXT("voxel.Collision.FrameAssetShortlist"), true,
+	TEXT("Share one prepared asset shortlist across the whole frame instead of only inside the ")
+	TEXT("movement tick. 0 restores the previous per-call standalone path and is the control arm."),
+	ECVF_Default);
+
+// The clipmap's underground-roof probe on the same shared shortlist. Separate
+// from the cvar above so the two can be A/B'd apart: this one changes WHICH
+// callers share, not whether sharing exists, and it is the only game-thread
+// query left that still built its own. Requires the frame shortlist to be on.
+static TAutoConsoleVariable<bool> CVarVoxelRoofProbeShortlist(
+	TEXT("voxel.Collision.RoofProbeShortlist"), true,
+	TEXT("Let the underground-roof probe use the frame's prepared asset shortlist instead of ")
+	TEXT("building its own for a one-voxel column. 0 restores the standalone query and is the ")
+	TEXT("control arm. Read VoxelStream/CollisionPreparations with it: the change is only a win ")
+	TEXT("if preparations stay at 1 per frame."),
+	ECVF_Default);
+
+// THE SHORTLIST KEPT ACROSS FRAMES, not rebuilt once per frame.
+//
+// After the frame shortlist landed, ONE prepare a frame serves the movement
+// sweep, the ocean's camera test and the ripple watcher together -- and that
+// single prepare is now the largest item on the game thread at 3.69 ms
+// (walk 52/53, 2026-09-11). It is rebuilt every frame only because the batch is
+// keyed by frame counter, which was the conservative choice while nothing had
+// established what a kept batch could get wrong.
+//
+// What it can get wrong is exactly one thing: the set of asset instances
+// overlapping the rect. Edits are live (the overlay is consulted before the
+// entries), the amplifier is a pure function of the column, and the asset field
+// carries configurationRevision, bumped by every mutating setter. So the guard
+// lives in WorldQueryBatch::prepare -- a kept query is reused only while the
+// revision is unchanged AND the asked rect is inside the covered one, which
+// carries a 32-voxel margin. At 2.2 m/s that margin is crossed about every 1.5 s
+// rather than every frame.
+//
+// 0 restores per-frame rebuilds and is the control arm.
+static TAutoConsoleVariable<bool> CVarVoxelShortlistAcrossFrames(
+	TEXT("voxel.Collision.ShortlistAcrossFrames"), true,
+	TEXT("Keep the frame asset shortlist between frames, rebuilding only when the camera leaves ")
+	TEXT("the covered rect or the asset field's configuration revision changes. 0 rebuilds once ")
+	TEXT("per frame and is the control arm."),
+	ECVF_Default);
+
+// One place where the frame batch is created, so the three callers that share it
+// cannot drift apart on the retention rule.
+static vxc::WorldQueryBatch<VoxelCoords::BrickEdgeVoxels>& EnsureFrameQueryBatch(FVoxelWorldImpl& WorldImpl)
+{
+	if (!WorldImpl.FrameQueries ||
+	    (!CVarVoxelShortlistAcrossFrames.GetValueOnGameThread() &&
+	     WorldImpl.FrameQueriesFrame != GFrameCounter))
+	{
+		WorldImpl.FrameQueries =
+			MakeUnique<vxc::WorldQueryBatch<VoxelCoords::BrickEdgeVoxels>>(WorldImpl.Voxels);
+	}
+	WorldImpl.FrameQueriesFrame = GFrameCounter;
+	return *WorldImpl.FrameQueries;
+}
+
 bool UVoxelWorldSubsystem::IsSolidAtVoxel(int64 Vx, int64 Vy, int64 Vz) const
 {
 	if (!Impl)
@@ -35258,9 +36029,33 @@ bool UVoxelWorldSubsystem::IsSolidAtVoxel(int64 Vx, int64 Vy, int64 Vz) const
     // asset shortlist. Worker queries and calls outside that scope keep the
     // exact standalone path; overlay reads remain live in either case.
     const auto Material = [&]() {
-        if (!IsInGameThread() || !Impl->MovementCollisionQueries)
+        if (!IsInGameThread())
             return Impl->Voxels.materialAt(Vx,Vy,Vz);
-        auto& Queries=*Impl->MovementCollisionQueries;
+        // ONE BATCH FOR THE WHOLE FRAME, INCLUDING THE MOVEMENT TICK.
+        //
+        // The first cut kept the movement tick on its own Begin/End batch and
+        // gave only the outside callers a shared one. That measured -5.16 ms of
+        // game thread -- the ripple watcher went 3.976 -> 0.019 ms -- but it left
+        // TWO shortlists being prepared per frame instead of one, and the
+        // counters said so plainly: CollisionPreparations 1 -> 2 and
+        // CollisionPrepareMs 3.742 -> 7.091. The ocean's call stopped being a
+        // standalone resolve and became the second prepare, which costs about
+        // the same, so its 4.226 ms only fell to 3.306.
+        //
+        // Two batch OBJECTS cannot share a prepare however close their rects
+        // are, so the movement tick has to come onto the same one. Its own
+        // scope is a strict subset of the frame, and the containment check in
+        // WorldQueryBatch::prepare handles the rest: whoever asks for the widest
+        // rect pays once and everyone inside it is free.
+        auto* Batch = Impl->MovementCollisionQueries.Get();
+        if (CVarVoxelFrameAssetShortlist.GetValueOnGameThread())
+        {
+            Batch = &EnsureFrameQueryBatch(*Impl);
+            CSV_CUSTOM_STAT(VoxelStream, FrameShortlistPointCalls, 1, ECsvCustomStatOp::Accumulate);
+        }
+        if (Batch == nullptr)
+            return Impl->Voxels.materialAt(Vx,Vy,Vz);
+        auto& Queries=*Batch;
         const auto Before=Queries.preparationCount();
         const double Start=FPlatformTime::Seconds();
         const auto& Query=Queries.prepare({Vx,Vy,Vx,Vy});
@@ -35378,7 +36173,19 @@ bool UVoxelWorldSubsystem::FindFirstSolidVoxelSlice(const int64 (&Min)[3], const
     for (int32 I=0; I<3; ++I) if (Min[I] > Max[I]) return false;
     const double PrepareStart=FPlatformTime::Seconds();
     vxc::WorldQueryBatch<VoxelCoords::BrickEdgeVoxels> LocalQueries(Impl->Voxels);
-    auto& Queries=Impl->MovementCollisionQueries ? *Impl->MovementCollisionQueries : LocalQueries;
+    // The frame batch, for the same reason as IsSolidAtVoxel above: two batch
+    // OBJECTS cannot share a prepare however close their rects are. This is the
+    // caller that asks for the WIDEST rect -- a whole sweep slab rather than a
+    // point -- so putting it on the shared batch is what makes everyone else's
+    // query fall inside an already-covered region.
+    if (IsInGameThread() && CVarVoxelFrameAssetShortlist.GetValueOnGameThread())
+    {
+        EnsureFrameQueryBatch(*Impl);
+    }
+    auto& Queries =
+        (IsInGameThread() && CVarVoxelFrameAssetShortlist.GetValueOnGameThread() && Impl->FrameQueries)
+            ? *Impl->FrameQueries
+            : (Impl->MovementCollisionQueries ? *Impl->MovementCollisionQueries : LocalQueries);
     const auto PreviousPreparations=Queries.preparationCount();
     const auto& Query=Queries.prepare({Min[0],Min[1],Max[0],Max[1]});
     CSV_CUSTOM_STAT(VoxelStream, CollisionPrepareMs, (FPlatformTime::Seconds()-PrepareStart)*1000., ECsvCustomStatOp::Accumulate);
@@ -35414,8 +36221,48 @@ int32 UVoxelWorldSubsystem::CountUndergroundRoofSamples(const FVector& CameraUU,
 	if (!Impl || StepUU <= 0 || MaxUU < StepUU || MaxUU / StepUU > 128 || StopAfter <= 0) return 0;
 	const int64 X = FMath::FloorToInt64(CameraUU.X / VoxelCoords::VoxelSizeUU);
 	const int64 Y = FMath::FloorToInt64(CameraUU.Y / VoxelCoords::VoxelSizeUU);
-	const vxc::WorldQuery<VoxelCoords::BrickEdgeVoxels> Query(Impl->Voxels, {X,Y,X,Y});
+	// THE SHORTLIST, NOT A FRESH ONE PER FRAME. This probe walks up to 128
+	// column samples, and until now it built its own `WorldQuery` to do it --
+	// which means an `instancesForRect` plus a `resolveForCompose` per instance
+	// every frame, for a rect one voxel wide. That is the same standalone asset
+	// resolve that cost the ocean and the ripple watcher about 4 ms each until
+	// 2026-09-11, measured then at ~4 ms for ONE point query; this one is the
+	// last game-thread caller that still paid it.
+	//
+	// The frame batch is prepared by whoever asks widest -- the movement sweep's
+	// slab -- and `WorldQueryBatch::prepare` hands back that shortlist free for
+	// any rect contained in it. The camera column is contained in the pawn's
+	// sweep slab whenever the camera sits on the pawn.
+	//
+	// WHAT MUST BE CHECKED, not assumed: if the camera column falls OUTSIDE the
+	// prepared rect, prepare rebuilds, and a second rebuild per frame costs what
+	// the first one does -- that is exactly how the first cut of the shared
+	// shortlist turned an 8 ms saving into 5 (CollisionPreparations 1 -> 2). So
+	// the gate on this change is `VoxelStream/CollisionPreparations` staying at
+	// 1 per frame, and the counter below says which path was taken.
+	//
+	// 0 restores the standalone query and is the control arm.
 	int32 Count = 0;
+	const bool bShared = IsInGameThread() && CVarVoxelRoofProbeShortlist.GetValueOnGameThread()
+	                   && CVarVoxelFrameAssetShortlist.GetValueOnGameThread();
+	if (bShared)
+	{
+		auto& Batch = EnsureFrameQueryBatch(*Impl);
+		const auto PreviousPreparations = Batch.preparationCount();
+		const auto& Query = Batch.prepare({X,Y,X,Y});
+		CSV_CUSTOM_STAT(VoxelStream, CollisionPreparations,
+		                int32(Batch.preparationCount()-PreviousPreparations),
+		                ECsvCustomStatOp::Accumulate);
+		CSV_CUSTOM_STAT(VoxelStream, RoofProbeSharedCalls, 1, ECsvCustomStatOp::Accumulate);
+		for (double Up = StepUU; Up <= MaxUU; Up += StepUU)
+		{
+			const int64 Z = FMath::FloorToInt64((CameraUU.Z + Up) / VoxelCoords::VoxelSizeUU);
+			if (Query.undergroundRoofAt(X,Y,Z) && ++Count >= StopAfter) break;
+		}
+		return Count;
+	}
+	CSV_CUSTOM_STAT(VoxelStream, RoofProbeStandaloneCalls, 1, ECsvCustomStatOp::Accumulate);
+	const vxc::WorldQuery<VoxelCoords::BrickEdgeVoxels> Query(Impl->Voxels, {X,Y,X,Y});
 	for (double Up = StepUU; Up <= MaxUU; Up += StepUU)
 	{
 		const int64 Z = FMath::FloorToInt64((CameraUU.Z + Up) / VoxelCoords::VoxelSizeUU);

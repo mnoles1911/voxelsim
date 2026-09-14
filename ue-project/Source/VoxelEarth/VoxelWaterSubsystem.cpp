@@ -8479,6 +8479,14 @@ uint8 UVoxelWaterSubsystem::GetImplicitFillAtWorld(const FVector& WorldUU) const
 	                                 int64(FMath::FloorToDouble(WorldUU.Z / VoxelCoords::VoxelSizeUU)));
 }
 
+// Diagnostic only, and it doubles the cost of the query it measures. See the
+// block at its use site below for the question it settles.
+static TAutoConsoleVariable<bool> CVarVoxelWaterFillMemoProbe(
+	TEXT("voxel.Water.FillMemoProbe"), false,
+	TEXT("Repeat each implicit water-fill query once and time the repeat separately, to tell a ")
+	TEXT("cold amplifier column memo from an expensive query. Diagnostic; doubles the cost."),
+	ECVF_Default);
+
 uint8 UVoxelWaterSubsystem::GetWaterFillAtWorld(const FVector& WorldUU) const
 {
 	if (!Impl)
@@ -8492,8 +8500,60 @@ uint8 UVoxelWaterSubsystem::GetWaterFillAtWorld(const FVector& WorldUU) const
 	// already reads 0 there, so the max of the two is the whole water column
 	// with no double count in either direction (waterca.h's ownership
 	// partition is what guarantees that, not call order here).
-	const uint8 CaFill = Impl->CA.fillAt(Vx, Vy, Vz);
-	return CaFill > 0 ? CaFill : Impl->Mob.implicitFillAt(Vx, Vy, Vz);
+	// SPLIT, BECAUSE THIS LINE IS 99.8% OF THE QUERY AND NOBODY KNEW WHICH HALF.
+	//
+	// walk-capture-45/46 (2026-09-11) measured IsUnderwaterAtWorld at 8.10 ms of
+	// a 21.6 ms game thread, and its two sub-scopes said UnderwaterFillMs 8.088
+	// against UnderwaterSurfaceMs 0.013. So the worldgen ground sample was never
+	// the cost and the whole of it is here. These two name which of the pair it
+	// is: the CA cell read, or the implicit field.
+	uint8 CaFill;
+	{
+		CSV_SCOPED_TIMING_STAT(VoxelStream, WaterFillCaMs);
+		CaFill = Impl->CA.fillAt(Vx, Vy, Vz);
+	}
+	if (CaFill > 0)
+	{
+		return CaFill;
+	}
+	uint8 Fill;
+	{
+		CSV_SCOPED_TIMING_STAT(VoxelStream, WaterFillImplicitMs);
+		Fill = Impl->Mob.implicitFillAt(Vx, Vy, Vz);
+	}
+
+	// THE MEMO PROBE. Off by default; it doubles the cost of the query it
+	// measures, which is the point.
+	//
+	// THE QUESTION IT ANSWERS. Of twelve IsUnderwaterAtWorld calls a frame,
+	// exactly two cost anything: the ocean's camera call at ~4.13 ms and the
+	// ripple watcher's pawn call at ~3.96 ms. The other ten cost about 0.008 ms
+	// BETWEEN THEM. The two dear ones are each the FIRST call made inside their
+	// own subsystem's tick, which is the signature of a cache that the first
+	// caller misses and later callers in the same tick hit.
+	//
+	// The chain under this line ends at a world material query --
+	// implicitFillAt -> sourceFillAt -> terrain_(vx,vy,vz) (waterca.cpp:1991) --
+	// and the amplifier keeps a THREAD-LOCAL COLUMN MEMO. Between the ocean's
+	// tick and the ripple field's, the streaming tick asks for thousands of
+	// other columns, which would evict a single-entry memo and make each
+	// subsystem pay a cold amplification for the same column.
+	//
+	// So: repeat the identical call immediately and time it separately. A
+	// near-zero repeat proves the memo works and the problem is EVICTION
+	// BETWEEN TICKS, which a small per-frame cache fixes. A repeat that costs
+	// the same as the first proves there is no memo to warm and the cost is the
+	// query itself, which is a different and much larger piece of work. One
+	// capture, and the two outcomes are not close together.
+	if (CVarVoxelWaterFillMemoProbe.GetValueOnGameThread())
+	{
+		CSV_SCOPED_TIMING_STAT(VoxelStream, WaterFillImplicitRepeatMs);
+		const uint8 Again = Impl->Mob.implicitFillAt(Vx, Vy, Vz);
+		// Read the result so no compiler can delete the call being measured.
+		CSV_CUSTOM_STAT(VoxelStream, WaterFillRepeatAgreed, Again == Fill ? 1 : 0,
+		                ECsvCustomStatOp::Accumulate);
+	}
+	return Fill;
 }
 
 double UVoxelWaterSubsystem::SeaLevelZUU()
@@ -8582,11 +8642,50 @@ bool UVoxelWaterSubsystem::GetBasinDatumNowZUU(int32 TileX, int32 TileY, int32 B
 	return true;
 }
 
+// THE ABOVE-THE-WATERLINE SHORT CIRCUIT: BUILT, ENGAGED, MEASURED NULL, RETIRED.
+//
+// It skipped the worldgen ground sample whenever the point was at or above the
+// tided sea surface, on the grounds that IsOpenSeaNowAtWorld is
+//     WorldZ < SeaZ && GroundZ < SeaZ && WorldZ >= GroundZ
+// so above the waterline the ground cannot change the answer. That reasoning is
+// still correct -- it is algebra, not a tolerance. It simply bought nothing.
+//
+// walk-capture-45 against walk-capture-46, one binary, cvar apart, quiet
+// stretch of each: the arm ENGAGED perfectly, 12 of 12 calls a frame taking the
+// short circuit, and the game thread moved 21.604 -> 21.511 ms, which is inside
+// the 2.8% repeatability. The sub-scopes said why, and they are the reason this
+// took one capture instead of a week:
+//
+//     UnderwaterQueryMs     8.103      <- the whole call
+//     UnderwaterFillMs      8.088      <- 99.8% of it
+//     UnderwaterSurfaceMs   0.013      <- the half I removed
+//
+// So the worldgen ground sample was never the cost. It is 0.013 ms across all
+// twelve calls, and a branch and a cvar to avoid it is dead weight. Removed
+// rather than left switched on, per this file's standing rule that an arm which
+// measures null gets retired with its record instead of accumulating.
+//
+// WHAT IS STILL TRUE AND STILL EXPENSIVE. This function costs 8.10 ms of a
+// 21.6 ms game thread -- 38% -- at a column 70.8 m above a 0.0 m sea level, and
+// all of it is in GetWaterFillAtWorld, which now carries its own split. The two
+// owners are AVoxelOceanActor::UpdateUnderwaterState (one call, ~4.1 ms) and
+// UVoxelRippleFieldSubsystem::AutoWatch (the rest, ~0.36 ms each). Disabling
+// the ripple feature entirely takes the game thread to 17.00 ms, which prices
+// the watcher and is NOT a proposal -- it removes a feature.
+//
+// Record: docs/measurements/water-query-split-2026-09-11/.
 bool UVoxelWaterSubsystem::IsUnderwaterAtWorld(const FVector& WorldUU) const
 {
-	if (GetWaterFillAtWorld(WorldUU) > 0)
+	CSV_SCOPED_TIMING_STAT(VoxelStream, UnderwaterQueryMs);
+	CSV_CUSTOM_STAT(VoxelStream, UnderwaterQueryCalls, 1, ECsvCustomStatOp::Accumulate);
 	{
-		return true;
+		// Kept: this split is what retired the arm above in one capture, and the
+		// same question will be asked again of whatever replaces it.
+		CSV_SCOPED_TIMING_STAT(VoxelStream, UnderwaterFillMs);
+		if (GetWaterFillAtWorld(WorldUU) > 0)
+		{
+			return true;
+		}
 	}
 	if (!Impl)
 	{
@@ -8599,6 +8698,7 @@ bool UVoxelWaterSubsystem::IsUnderwaterAtWorld(const FVector& WorldUU) const
 	// The NOW form (Phase A): swimming and submersion follow the tide. With
 	// voxel.Water.Tide 0 the quantised offset is exactly 0 and this is the
 	// static IsOpenSeaAtWorld to the bit.
+	CSV_SCOPED_TIMING_STAT(VoxelStream, UnderwaterSurfaceMs);
 	return IsOpenSeaNowAtWorld(WorldUU.Z, Impl->Terrain.GetSurfaceHeightUU(WorldUU.X, WorldUU.Y));
 }
 

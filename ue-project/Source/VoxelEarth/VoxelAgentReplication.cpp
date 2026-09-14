@@ -1,4 +1,5 @@
 #include "VoxelAgentReplication.h"
+#include "VoxelFrameProfiling.h"
 
 #include "Engine/World.h"
 #include "GameFramework/Pawn.h"
@@ -42,6 +43,7 @@ void AVoxelAgentReplicator::BeginPlay()
 
 void AVoxelAgentReplicator::Tick(float DeltaSeconds)
 {
+	CSV_SCOPED_TIMING_STAT(VoxelStream, AgentReplTickMs);
 	Super::Tick(DeltaSeconds);
 
 	if (!HasAuthority())

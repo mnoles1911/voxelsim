@@ -18,16 +18,32 @@ def inspect(manifest, log):
     if complete != [str(len(models))]:
         raise ValueError("Missing unique matching completed bake")
     checks = {}
-    for path, count, pairs in re.findall(
-        r"DetailAuthoredLOD preserved mesh=(\S+) lods=(\d+) authored/builtTriangles:([^\r\n]+)", text
+    # `nanite=` is optional so this reader still accepts logs from before the flag existed.
+    for path, count, nanite, pairs in re.findall(
+        r"DetailAuthoredLOD preserved mesh=(\S+) lods=(\d+)(?: nanite=(\d+))? authored/builtTriangles:([^\r\n]+)",
+        text,
     ):
         if path in checks:
             raise ValueError("Repeated persistent-build proof")
         values = re.findall(r" L(\d+)=(\d+)/(\d+)", pairs)
         if len(values) != int(count) or [int(v[0]) for v in values] != list(range(int(count))):
             raise ValueError("Incomplete LOD proof")
-        if any(a != b or int(a) <= 0 for _, a, b in values):
-            raise ValueError("Authored/built triangles differ")
+        built_nanite = nanite == "1"
+        for _, a, b in values:
+            authored, built = int(a), int(b)
+            if authored <= 0:
+                raise ValueError("Authored/built triangles differ")
+            # Same contract as the C++ guard in VoxelDetailAssetSubsystem.cpp: exact
+            # without Nanite, and with Nanite a near-absolute allowance that passes the
+            # fallback builder's degenerate cleanup (measured: exactly 2 triangles, one
+            # quad face, on every mesh) while still failing a decimated fallback
+            # (measured: 104678 -> 77950 when the fallback target was left on Auto).
+            slack = max(8, authored // 1000) if built_nanite else 0
+            if abs(built - authored) > slack:
+                raise ValueError(
+                    f"Authored/built triangles differ: authored={authored} built={built} "
+                    f"nanite={int(built_nanite)} slack={slack}"
+                )
         checks[path] = [int(a) for _, a, _ in values]
     if set(checks) != {r["object_path"] for r in models}:
         raise ValueError("Persistent-build proof does not cover every unique mesh")

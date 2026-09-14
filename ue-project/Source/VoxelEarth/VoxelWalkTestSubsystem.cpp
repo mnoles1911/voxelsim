@@ -11,6 +11,7 @@
 #include "VoxelMovementTuning.h"
 #include "VoxelWorldSubsystem.h"
 #include "VoxelDetailAssetSubsystem.h"
+#include "VoxelFrameProfiling.h"
 #include "voxelcore/assetfield.h"
 #include "voxelcore/amplifier.h"
 
@@ -151,6 +152,12 @@ void UVoxelWalkTestSubsystem::EnterPhase(EPhase Next)
 
 void UVoxelWalkTestSubsystem::Tick(float DeltaTime)
 {
+	// The capture DRIVER itself, named for the same reason as the 23 ticks in
+	// commit 662828f: every leg in the archive was timed with this running, so
+	// whatever it costs has been inside every game-thread number ever quoted
+	// for this project, unattributed. It is expected to be small; "expected" is
+	// exactly the claim that has been wrong most often here.
+	CSV_SCOPED_TIMING_STAT(VoxelStream, WalkTestTickMs);
 	if(EcologicalRoute){EcologicalRoute->Tick(GetWorld(),DeltaTime);return;}
 	if (!bArmed || Phase == EPhase::Done)
 	{
@@ -197,6 +204,24 @@ void UVoxelWalkTestSubsystem::Tick(float DeltaTime)
 		}
 		RunStartZ = Pawn->GetActorLocation().Z;
 		Pawn->SetWalkMode(true);
+		// THE PACE, which until now was never chosen here at all -- the walk
+		// harness left the dial at its default tier 4 (Jog, 4.5 m/s), which is
+		// why these captures read ~4.5 m/s while the ROUTE captures read 2.2:
+		// the route driver pins tier 2 and this one pinned nothing. Both are
+		// far under the 20 m/s the standing target is written for, and on foot
+		// the dial stops at 9.5 m/s, so -VoxelWalkSpeedTier is the on-foot half
+		// of that question. Absent, the tier is untouched and every existing
+		// capture stays comparable.
+		int32 RequestedTier = -1;
+		if (FParse::Value(FCommandLine::Get(), TEXT("VoxelWalkSpeedTier="), RequestedTier))
+		{
+			RequestedTier = FMath::Clamp(RequestedTier, 0, VoxelMovementTuning::kNumSpeedTiers - 1);
+			Mover->AdjustSpeedTier(RequestedTier - Mover->GetSpeedTierIndex());
+		}
+		UE_LOG(LogVoxelWalkTest, Log, TEXT("VoxelWalkTest SPEED_TIER index=%d name=%s dialMps=%.2f%s"),
+		       Mover->GetSpeedTierIndex(), VoxelMovementTuning::NameForTier(Mover->GetSpeedTierIndex()),
+		       Mover->GetDialSpeedUU() / 100.0,
+		       RequestedTier >= 0 ? TEXT(" (requested)") : TEXT(" (harness default)"));
 		EnterPhase(EPhase::Settle);
 		UE_LOG(LogVoxelWalkTest, Log, TEXT("VoxelWalkTest: walk mode on at z=%.1fm; gravity measured from here."),
 		       RunStartZ / 100.0);
